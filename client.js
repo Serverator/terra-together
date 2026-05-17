@@ -5,8 +5,9 @@ const require = makeRequire(import.meta.url);
 const WebSocket = require('ws');
 const actor = terra.file.terraActorEntity;
 const player = terra.file.playerModel;
-const char_sheet = terra.file.charSheet;
 const figure = terra.file.figureState;
+const Vec2 = terra.export.Vec2;
+const Vec3 = terra.export.Vec3;
 
 let client = null;
 let playerId = null;
@@ -28,12 +29,16 @@ class MultiplayerClient extends terra.export.Observable {
 		playerActors.clear();
 		playerUpdates.clear();
 
-		send({ type: "left_map", map: "some" });
+		let map = terra.export.g_game.map.active?.path;
+		if (map)
+			send({ type: "left_map", map });
 	}
 
 	// Create second actor on map start
 	onGameMapStart() {
-		send({ type: "join_map", map: "some" });
+
+		let map = terra.export.g_game.map.active?.path;
+		send({ type: "join_map", map });
 	}
 }
 
@@ -50,49 +55,47 @@ function joinServer(address = DEFAULT_HOST) {
 	client = new WebSocket(parseAddress(address));
 
 	client.on("open", () => {
-		console.log("Connected to server");
+		console.log("[TT Client] Connected to server");
 	});
 
 	client.on("message", (raw) => {
-		let msg;
-
 		try {
-			msg = JSON.parse(raw);
-		} catch {
-			console.warn("Invalid JSON from server");
+			let msg = JSON.parse(raw);
+
+			switch (msg.type) {
+				case "welcome":
+					console.log("Welcome from server!");
+					playerId = msg.id;
+					// for (const player of msg.players ?? []) {
+					// 	createPlayerActor(player.id, player.state);
+					// }
+					break;
+
+				case "update":
+					movePlayerActor(msg.id, msg.state);
+					break;
+
+				case "player_joined":
+					console.log(`[TT Client] Player ${msg.id} joined`);
+					movePlayerActor(msg.id, msg.state);
+					break;
+
+				case "player_left":
+					deletePlayerActor(msg.id);
+					console.log(`[TT Client] Player ${msg.id} left`);
+					break;
+
+				case "left_map":
+					console.log(`[TT Client] Player ${msg.id} left map '${msg.map}'`);
+					break;
+
+				case "join_map":
+					console.log(`[TT Client] Player ${msg.id} joined map '${msg.map}'`);
+					break;
+			}
+		} catch (err) {
+			console.warn("Error on client 'message':", err);
 			return;
-		}
-
-		switch (msg.type) {
-			case "welcome":
-				console.log("Welcome from server!");
-				playerId = msg.id;
-				for (const player of msg.players) {
-					createPlayerActor(player.id, player.state);
-				}
-				break;
-
-			case "update":
-				playerId = msg.id;
-				break;
-
-			case "player_joined":
-				console.log(`Player ${msg.id} joined`);
-				createPlayerActor(msg.id, msg.state);
-				break;
-
-			case "player_left":
-				playerActors.delete(msg.id);
-				console.log(`Player ${msg.id} left`);
-				break;
-
-			case "left_map":
-				console.log(`Player ${msg.id} left map ${msg.map}`);
-				break;
-
-			case "join_map":
-				console.log(`Player ${msg.id} joined map ${msg.map}`);
-				break;
 		}
 	});
 
@@ -110,8 +113,8 @@ function joinServer(address = DEFAULT_HOST) {
 }
 
 function leaveServer() {
-  if (!client) return console.log("Not connected.");
-  client.close();
+	if (!client) return console.log("Not connected.");
+	client.close();
 }
 
 function send(data) {
@@ -121,75 +124,80 @@ function send(data) {
 }
 
 function createPlayerActor(id, state) {
-	// Get Juno character from the character sheet
-	var char = char_sheet.Character.get("CHA:main#Juno");
-
 	// We are creating new Actor (NPC)
-	var new_actor = new actor.TerraActor();
+	var actor = new terra.export.TerraActor();
+
+	// Get character from the character sheet
+	var char = terra.export.Character.get(state.char);
+
+	// Set sprite of this actor
+	actor.setNpc(char, false);
 
 	// Copy position of our player
-	new_actor.core.setPos(player.g_player.entity.core.pos);
-
-	// Set sprite of this actor as Juno
-	new_actor.setNpc(char, false);
-
-	// Copy current animation state
-	if (player.g_player.entity.view.figState.anim) {
-		new_actor.view.figState.anim = player.g_player.entity.view?.figState?.anim || "idle";
-		new_actor.view.figState.time = player.g_player.entity.view.figState.time;
-	} else {
-		new_actor.view.figState.setAnim("idle", null);
+	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]));
+	if (actor.move?.vel) {
+		actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
 	}
 
+	// Copy current animation state
+	actor.view?.figState?.setAnim(state.animation || "idle", null);
+	actor.view?.figState?.setAnimTime(state.anim_time);
+
 	// Disable friction -- movement looks smoother
-	new_actor.move.friction.air = 0;
-	new_actor.move.friction.ground = 0;
+	if (actor.move?.friction) {
+		// actor.move.friction.air = 0;
+		// actor.move.friction.ground = 0;
+	}
 
 	// Face is the direction character is looking
-	new_actor.actor.face = player.g_player.entity.actor.face.clone();
-	new_actor.view.figState.faceAngles = player.g_player.entity.view.figState.faceAngles;
+	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), true);
 
 	// Clone weapons of Juno to the clone
 	// Maybe incorrect, but it works, ey?
-	new_actor.view.figState.addedFig = [];
-	for (const added of player.g_player.entity.view.figState.addedFig) {
-		var add_figure = new figure.FigureAddState();
-		add_figure.figure = added.figure;
-		add_figure.parent = new figure.FigureState(added.parent.view, added.figure, null);
-		new_actor.view.figState.addedFig.push(add_figure);
+	actor.view.figState.addedFig = [];
+	for (const added of state.figures) {
+		let figure = terra.export.Figure.get(added);
+		actor.view.figState.addFigure(figure);
 	}
 
 	// Inserts that entity in the world
-	terra.export.g_gState.addEntity(new_actor, true, false);
+	terra.export.g_gState.addEntity(actor, false, false);
 
-	playerActors.set(id, new_actor);
-	return new_actor;
+	playerActors.set(id, actor);
+	return actor;
 }
 
 function movePlayerActor(id, state) {
-	const playerActor = playerActors.get(id);
+	const actor = playerActors.get(id);
 
-	if (!playerActor) {
+	if (!actor) {
 		createPlayerActor(id, state);
 		return;
 	}
 
-	playerActor.core.setPos(state.position);
-	playerActor.move.vel = state.velocity;
-	playerActor.view.figState.anim = state.animation;
-	playerActor.view.figState.time = state.anim_time;
-	playerActor.actor.face = state.face_dir;
-	playerActor.view.figState.addedFig = state.figures;
+	if (!actor.core.isVisible()) {
+		actor.core.show();
+	}
+
+	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]));
+	if (actor.move?.vel) {
+		actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
+	}
+
+	actor.view?.figState?.setAnim(state.animation || "idle", null);
+	actor.view?.figState?.setAnimTime(state.anim_time);
+
+	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), true);
+
+	actor.view.figState.addedFig = [];
+	for (const added of state.figures) {
+		let figure = terra.export.Figure.get(added);
+		actor.view.figState.addFigure(figure);
+	}
 }
 
 function deletePlayerActor(id) {
-	const playerActor = playerActors.get(id);
-
-	if (playerActor) {
-
-		playerActor.core
-	}
-
+	playerActors.get(id)?.core?.hide();
 }
 
 function sendPlayerData() {
@@ -199,11 +207,15 @@ function sendPlayerData() {
 
 	let state = {}
 
+	state.char = terra.export.g_player.entity?.npc?.char?.cacheKey;
+
+	state.map = terra.export.g_game.map.active?.path;
+
 	state.position = player.g_player.entity.core.pos.clone().v;
 	state.velocity = player.g_player.entity.move.vel.clone().v;
 
 	// Copy current animation state
-	state.animation = player.g_player.entity.view.figState.anim?.name  || "idle";
+	state.animation = player.g_player.entity.view.figState.anim?.name || "idle";
 	state.anim_time = player.g_player.entity.view.figState.time;
 
 	// Copy the look direcition
@@ -227,4 +239,4 @@ function updateOtherPlayers() {
 	}
 }
 
-//# sourceURL=mods/multiplayer/client.js
+//# sourceURL=/mods/multiplayer/client.js

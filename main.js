@@ -6,4 +6,4 @@ import * as client from './client.js';
 server.startServer();
 client.joinServer();
 
-//# sourceURL=mods/multiplayer/main.js
+//# sourceURL=/mods/multiplayer/main.js

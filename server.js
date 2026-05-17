@@ -13,53 +13,48 @@ const playerData = new Map();
 const DEFAULT_PORT = 17005;
 
 function startServer(port = DEFAULT_PORT) {
-	if (server) return console.log("Server already running.");
+	if (server) return console.log("[TerraTogether] Server already running.");
 
 	server = new WebSocketServer({ port });
 
 	server.on('listening', () => {
-		console.log('TerraTogether server listening on ws://127.0.0.1:17505');
+		console.log('[TerraTogether] Server listening on ws://0.0.0.0:17505');
 	});
 
 	server.on('connection', (socket) => {
-		console.log('[+] Client connected');
 		const playerId = crypto.randomUUID();
+		console.log(`[TT Server] Client '${playerId}' connected`);
 		clientsSockets.set(socket, { id: playerId });
-
-		console.log(`Player connected`);
 
 		send(socket, { type: "welcome", id: playerId });
 
 		broadcast({ type: "player_joined", id: playerId }, socket);
 
 		socket.on('message', (raw) => {
-			let msg;
 			try {
-				msg = JSON.parse(raw);
-			} catch {
-				console.warn("Invalid JSON from player", playerId);
+				let msg = JSON.parse(raw);
+				
+				// Handle message types
+				switch (msg.type) {
+					case "update":
+						playerData.set(playerId, { state: msg.state, map: msg.map });
+						broadcast({ type: "update", id: playerId, state: msg.state }, socket);
+						break;
+
+					case "left_map":
+						broadcast({ type: "left_map", id: playerId, map: msg.map }, socket);
+						break;
+
+					case "join_map":
+						broadcast({ type: "join_map", id: playerId, map: msg.map }, socket);
+						break;
+
+					default:
+						console.warn("[TT Server] Unknown message type from '${playerId}':", msg.type);
+				}
+			} catch (err) {
+				console.warn(`[TT Server] Error when recieving message from '${playerId}':`, err);
 				return;
-			}
-
-			console.log(`Player ${playerId} sent:`, msg);
-
-			// Handle message types
-			switch (msg.type) {
-				case "update":
-					playerData.set(id, { state: msg.state, map: msg.map });
-					broadcast({ type: "update", id: playerId, state: msg.state }, socket);
-					break;
-
-				case "left_map":
-					broadcast({ type: "left_map", id: playerId, map: msg.map }, socket);
-					break;
-
-				case "join_map":
-					broadcast({ type: "join_map", id: playerId, map: msg.map }, socket);
-					break;
-
-				default:
-					console.warn("Unknown message type:", msg.type);
 			}
 		});
 
@@ -77,12 +72,19 @@ function startServer(port = DEFAULT_PORT) {
 		console.error(`Failed to start server: ${err.message}`);
 		server = null;
 	});
+
+	server.on("close", () => {
+		console.error(`[TT Server] Server closed`);
+		clientsSockets.clear();
+		server = null;
+	});
 }
 
 function stopServer() {
 	if (!server) return;
+	for (const [socket] of clientsSockets) socket.close();
 	clientsSockets.clear();
-	server.close(() => console.log("Server stopped."));
+	server.close();
 	server = null;
 }
 
@@ -107,4 +109,4 @@ window.addEventListener('beforeunload', () => {
 	stopServer()
 });
 
-//# sourceURL=mods/multiplayer/server.js
+//# sourceURL=/mods/multiplayer/server.js
