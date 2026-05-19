@@ -52,6 +52,7 @@ class WebSocketConnection extends EventEmitter {
 
 	parseRecievedData() {
 		while (this.buffer.length >= 2) {
+			const opcode = this.buffer[0] & 0x0f;
 			const masked = (this.buffer[1] & 0x80) !== 0;
 			let payloadLen = this.buffer[1] & 0x7f;
 			let offset = 2;
@@ -81,7 +82,9 @@ class WebSocketConnection extends EventEmitter {
 			}
 
 			this.buffer = this.buffer.slice(offset + payloadLen);
-			this.emit('message', payload.toString('utf8'));
+
+			if (opcode === 0x1)
+				this.emit('message', payload.toString('utf8'));
 		}
 	}
 }

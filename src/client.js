@@ -1,5 +1,7 @@
 export { joinServer, leaveServer, send }
 
+import { loadConfig } from "./helper.js";
+import { skins } from "./skin.js";
 
 const actor = terra.file.terraActorEntity;
 const player = terra.file.playerModel;
@@ -13,6 +15,7 @@ let playerId = null;
 const playerActors = new Map();
 const playerUpdates = new Map();
 
+let config = loadConfig();
 
 class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
@@ -49,7 +52,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 	client = new WebSocket(address);
 
 	client.on("open", () => {
-		console.log("[TT Client] Connected to server");
+		console.log("[TT Client] Connected to server");	
 	});
 
 	client.addEventListener("message", (event) => {
@@ -60,9 +63,6 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 				case "welcome":
 					console.log("Welcome from server!");
 					playerId = msg.id;
-					// for (const player of msg.players ?? []) {
-					// 	createPlayerActor(player.id, player.state);
-					// }
 					break;
 
 				case "update":
@@ -131,7 +131,7 @@ function createPlayerActor(id, state) {
 	// Set sprite of this actor
 	actor.setNpc(char, false);
 
-	let figure = terraTogether.figures[state.figure];
+	let figure = skins[state.figure].figure;
 	if (figure) {
 		actor.view?.setFigure(figure);
 	}
@@ -191,7 +191,7 @@ function movePlayerActor(id, state) {
 
 	let currentFigure = terra.export.g_player.entity?.view?.getFigure().name;
 	if (currentFigure != state.figure) {
-		let figure = terraTogether.figures[state.figure];
+		let figure = skins[state.figure].figure;
 		if (figure) {
 			actor.view?.setFigure(figure);
 		}
