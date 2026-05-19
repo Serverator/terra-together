@@ -15,7 +15,7 @@ let playerId = null;
 const playerActors = new Map();
 const playerUpdates = new Map();
 
-const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_HOST = "10.10.10.10";
 const DEFAULT_PORT = 17005;
 
 class MultiplayerClient extends terra.export.Observable {
@@ -36,6 +36,11 @@ class MultiplayerClient extends terra.export.Observable {
 
 	// Create second actor on map start
 	onGameMapStart() {
+		if (!client)
+			joinServer();
+
+		playerActors.clear();
+		playerUpdates.clear();
 
 		let map = terra.export.g_game.map.active?.path;
 		send({ type: "join_map", map });
@@ -124,14 +129,23 @@ function send(data) {
 }
 
 function createPlayerActor(id, state) {
+	if (!state?.char) {
+		return;
+	}
+	
 	// We are creating new Actor (NPC)
 	var actor = new terra.export.TerraActor();
-
+	
 	// Get character from the character sheet
 	var char = terra.export.Character.get(state.char);
 
 	// Set sprite of this actor
 	actor.setNpc(char, false);
+
+	let figure = terraTogether.figures[state.figure];
+	if (figure) {
+		actor.view?.setFigure(figure);
+	}
 
 	// Copy position of our player
 	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]));
@@ -168,6 +182,9 @@ function createPlayerActor(id, state) {
 }
 
 function movePlayerActor(id, state) {
+	if (!state)
+		return;
+	
 	const actor = playerActors.get(id);
 
 	if (!actor) {
@@ -175,8 +192,20 @@ function movePlayerActor(id, state) {
 		return;
 	}
 
+	if (!actor.core) {
+		return;
+	}
+
 	if (!actor.core.isVisible()) {
 		actor.core.show();
+	}
+
+	let currentFigure = terra.export.g_player.entity?.view?.getFigure().name;
+	if (currentFigure != state.figure) {
+		let figure = terraTogether.figures[state.figure];
+		if (figure) {
+			actor.view?.setFigure(figure);
+		}
 	}
 
 	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]));
@@ -208,6 +237,7 @@ function sendPlayerData() {
 	let state = {}
 
 	state.char = terra.export.g_player.entity?.npc?.char?.cacheKey;
+	state.figure = terra.export.g_player.entity?.view?.getFigure().name;
 
 	state.map = terra.export.g_game.map.active?.path;
 
@@ -239,4 +269,4 @@ function updateOtherPlayers() {
 	}
 }
 
-//# sourceURL=/mods/multiplayer/client.js
+//# sourceURL=/mods/terra-together/client.js

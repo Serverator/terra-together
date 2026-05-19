@@ -109,4 +109,4 @@ window.addEventListener('beforeunload', () => {
 	stopServer()
 });
 
-//# sourceURL=/mods/multiplayer/server.js
+//# sourceURL=/mods/terra-together/server.js
