@@ -1,8 +1,6 @@
 export { joinServer, leaveServer, send }
 
-const require = makeRequire(import.meta.url);
 
-const WebSocket = require('ws');
 const actor = terra.file.terraActorEntity;
 const player = terra.file.playerModel;
 const figure = terra.file.figureState;
@@ -15,8 +13,6 @@ let playerId = null;
 const playerActors = new Map();
 const playerUpdates = new Map();
 
-const DEFAULT_HOST = "10.10.10.10";
-const DEFAULT_PORT = 17005;
 
 class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
@@ -49,23 +45,16 @@ class MultiplayerClient extends terra.export.Observable {
 
 terra.addAddon(new MultiplayerClient(), { onGameMapStart: 35000 });
 
-function parseAddress(input) {
-	let addr = input || DEFAULT_HOST;
-	if (!addr.startsWith("ws://") && !addr.startsWith("wss://")) addr = "ws://" + addr;
-	if (!/:\d+$/.test(addr)) addr = `${addr}:${DEFAULT_PORT}`;
-	return addr;
-}
-
-function joinServer(address = DEFAULT_HOST) {
-	client = new WebSocket(parseAddress(address));
+function joinServer(address = 'ws://127.0.0.1:17005') {
+	client = new WebSocket(address);
 
 	client.on("open", () => {
 		console.log("[TT Client] Connected to server");
 	});
 
-	client.on("message", (raw) => {
+	client.addEventListener("message", (event) => {
 		try {
-			let msg = JSON.parse(raw);
+			let msg = JSON.parse(event.data);
 
 			switch (msg.type) {
 				case "welcome":
@@ -104,13 +93,13 @@ function joinServer(address = DEFAULT_HOST) {
 		}
 	});
 
-	client.on("close", () => {
+	client.addEventListener("close", () => {
 		console.log("Disconnected from server.");
 		client = null;
 		playerId = null;
 	});
 
-	client.on("error", (err) => {
+	client.addEventListener("error", (err) => {
 		console.error("Connection error:", err.message);
 		client = null;
 		playerId = null;
@@ -237,7 +226,7 @@ function sendPlayerData() {
 	let state = {}
 
 	state.char = terra.export.g_player.entity?.npc?.char?.cacheKey;
-	state.figure = terra.export.g_player.entity?.view?.getFigure().name;
+	state.figure = terra.export.g_player.entity?.view?.getFigure()?.name;
 
 	state.map = terra.export.g_game.map.active?.path;
 
@@ -245,15 +234,15 @@ function sendPlayerData() {
 	state.velocity = player.g_player.entity.move.vel.clone().v;
 
 	// Copy current animation state
-	state.animation = player.g_player.entity.view.figState.anim?.name || "idle";
-	state.anim_time = player.g_player.entity.view.figState.time;
+	state.animation = player.g_player.entity.view.figState?.anim?.name || "idle";
+	state.anim_time = player.g_player.entity.view.figState?.time;
 
 	// Copy the look direcition
 	state.face_dir = player.g_player.entity.actor.face.clone().v;
 
 	// Clone weapons of Juno to the clone
 	state.figures = [];
-	for (const added of player.g_player.entity.view.figState.addedFig) {
+	for (const added of player.g_player.entity.view.figState?.addedFig ?? []) {
 		state.figures.push(added.figure.cacheKey);
 	}
 

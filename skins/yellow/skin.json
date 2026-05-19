@@ -1,0 +1,6 @@
+{
+	"id": "yellow",
+	"name": "Yellow Juno",
+	"character": "CHA:main#Juno", 
+	"sprite_file": "juno_y.png"
+}

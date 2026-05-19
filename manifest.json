@@ -2,5 +2,6 @@
 	"version": "0.0.1",
 	"name": "Multiplayer",
 	"author": "Sam Leeway",
+	"main": "src/main.js",
 	"priority": 10
 }

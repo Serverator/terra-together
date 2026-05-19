@@ -1,0 +1,12 @@
+{
+	"client": {
+		"username": "Player",
+		"server_address": "127.0.0.1",
+		"port": 17005
+	},
+	"server": {
+		"enabled": true,
+		"host": "127.0.0.1",
+		"port": 17005
+	}
+}

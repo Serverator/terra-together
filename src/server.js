@@ -1,8 +1,6 @@
 export { startServer, stopServer, send, broadcast };
 
-// Make local requires in CommonJS working
-const require = makeRequire(import.meta.url);
-const { WebSocketServer } = require('ws');
+import { WebSocketServer } from "./ws.js";
 
 let server = null;
 const clientsSockets = new Map();
@@ -10,15 +8,13 @@ const clientsSockets = new Map();
 // Server need to store current location of players to send to new players
 const playerData = new Map();
 
-const DEFAULT_PORT = 17005;
-
-function startServer(port = DEFAULT_PORT) {
+function startServer(host = '0.0.0.0', port = 17005) {
 	if (server) return console.log("[TerraTogether] Server already running.");
 
-	server = new WebSocketServer({ port });
+	server = new WebSocketServer({ port, host });
 
 	server.on('listening', () => {
-		console.log('[TerraTogether] Server listening on ws://0.0.0.0:17505');
+		console.log(`[TerraTogether] Server listening on ws://${host}:${port}`);
 	});
 
 	server.on('connection', (socket) => {
