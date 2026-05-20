@@ -170,68 +170,9 @@ function send(data) {
 	}
 }
 
-function createPlayerActor(id, state) {
-	if (!state?.char) {
-		return;
-	}
-	
+function createPlayerActor(id) {
 	// We are creating new Actor (NPC)
 	var actor = new terra.export.TerraActor();
-	
-	// Get character from the character sheet
-	var char = terra.export.Character.get(state.char);
-
-	// Set sprite of this actor
-	actor.setNpc(char, false);
-
-	if (state.char == "CHA:main#Juno") {	
-		let figure = skins[state.figure].figure;
-		if (figure) {
-			actor.view?.setFigure(figure);
-		}
-	}
-
-	// Copy position of our player
-	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]));
-	if (actor.move?.vel) {
-		if (state.scene == "RUNNING") {
-			actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
-		} else {
-			actor.move.vel = new Vec3(0, 0, 0);
-		}
-	}
-
-	// Copy current animation state
-	actor.view?.figState?.setAnim(state.animation || "idle", null);
-	actor.view?.figState?.setAnimTime(state.anim_time);
-
-	// Disable friction -- movement looks smoother
-	if (actor.move?.friction) {
-		// actor.move.friction.air = 0;
-		// actor.move.friction.ground = 0;
-	}
-
-	if (actor.view?.figState) {	
-		if (state.scene == "RUNNING") {
-			actor.view.figState.animSpeed = 1;
-		} else {
-			actor.view.figState.animSpeed = 0;
-		}
-	}
-
-	// Face is the direction character is looking
-	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), true);
-
-	// Clone weapons of Juno to the clone
-	// Maybe incorrect, but it works, ey?
-	actor.view.figState.addedFig = [];
-	for (const added of state.figures) {
-		let figure = terra.export.Figure.get(added);
-		actor.view.figState.addFigure(figure);
-	}
-	
-	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path)
-		actor.core?.hide(true);
 
 	// Inserts that entity in the world
 	terra.export.g_gState.addEntity(actor, false, false);
@@ -244,11 +185,10 @@ function movePlayerActor(id, state) {
 	if (!state)
 		return;
 	
-	const actor = playerActors.get(id);
+	let actor = playerActors.get(id);
 
 	if (!actor) {
-		createPlayerActor(id, state);
-		return;
+		actor = createPlayerActor(id);
 	}
 
 	if (!actor.core) {
@@ -260,6 +200,12 @@ function movePlayerActor(id, state) {
 		return;
 	} else {
 		actor.core?.show(false);
+	}
+
+	if (state.char && actor.npc?.char?.path != state.char) {	
+		// Get character from the character sheet
+		var char = terra.export.Character.get(state.char);
+		actor.setNpc(char, false);
 	}
 
 	if (state.char == "CHA:main#Juno") {
