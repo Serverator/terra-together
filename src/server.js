@@ -33,16 +33,20 @@ function startServer(host = '0.0.0.0', port = 17005) {
 				// Handle message types
 				switch (msg.type) {
 					case "update":
-						playerData.set(playerId, { state: msg.state, map: msg.map });
+						playerData.set(playerId, msg.state);
 						broadcast({ type: "update", id: playerId, state: msg.state }, socket);
 						break;
 
-					case "left_map":
-						broadcast({ type: "left_map", id: playerId, map: msg.map }, socket);
+					case "scene_changed":
+						broadcast({ type: "scene_changed", id: playerId, scene: msg.scene }, socket);
 						break;
 
 					case "join_map":
 						broadcast({ type: "join_map", id: playerId, map: msg.map }, socket);
+						for (const [id, state] of playerData) {
+							if (state.scene == "MENU" && playerId != id && msg.map == state.map)
+								send(socket, { type: "update", id, state });
+						}
 						break;
 
 					default:

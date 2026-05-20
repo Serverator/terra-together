@@ -8,6 +8,8 @@ let skins = {};
 let skinOrder = [];
 
 function changeSkin(id) {
+	if (terra.export.g_player.entity?.npc?.char?.path != "CHA:main#Juno") return;
+	
 	let skinName = skinOrder[id] ?? "default";
 	let skin = skins[skinName] ?? skins.default;
 	terra.export.g_player.entity?.view?.setFigure(skin.figure);
