@@ -177,6 +177,13 @@ function createPlayerActor(id) {
 	// Inserts that entity in the world
 	terra.export.g_gState.addEntity(actor, false, false);
 
+	if (actor.actor)
+		actor.actor.phaseOn = false;
+
+	actor.move?.mainColl?.setType(terra.export.COLL_TYPE.ACTOR);
+
+	actor.move.misc.groundConnect |= terra.export.COLL_GROUND_FLAGS.NO_PUSH;
+
 	playerActors.set(id, actor);
 	return actor;
 }
