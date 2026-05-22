@@ -41,6 +41,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						broadcast({ type: "scene_changed", id: playerId, scene: msg.scene }, socket);
 						break;
 
+					case "actor_fx":
+						broadcast({ type: "actor_fx", id: playerId, actorFx: msg.actorFx }, socket);
+						break;
+
 					case "join_map":
 						broadcast({ type: "join_map", id: playerId, map: msg.map }, socket);
 						for (const [id, state] of playerData) {

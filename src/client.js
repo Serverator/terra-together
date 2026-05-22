@@ -23,10 +23,15 @@ window.terraTogether.playerActors = playerActors;
 
 let config = loadConfig();
 
+let fxQueue = [];
+
 class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
-		sendPlayerData();
 		updateOtherPlayers();
+	}
+
+	onPostUpdate() {
+		sendPlayerData();
 	}
 
 	// When entering new map clean up the reference
@@ -51,6 +56,26 @@ class MultiplayerClient extends terra.export.Observable {
 
 		let map = terra.export.g_game.map.active?.path;
 		send({ type: "join_map", map });
+
+		let player = terra.export.g_player.entity;
+		if (player?.actorExt?.actorFx) {
+			let actorFx = player.actorExt.actorFx;
+
+			if (!actorFx._injected) {
+				let originalOnPlayerFx = actorFx.onActorFx;
+				player.actorExt.actorFx.onActorFx = function (...args) {
+					const result = originalOnPlayerFx.apply(player.actorExt.actorFx, args);
+					const FX_TYPE = terra.export.ACTOR_FX_TYPE;
+					if (args[1] != FX_TYPE.POST_MOVE)
+						fxQueue.push({ type: args[1], vary: args[2] });
+					return result;
+				};
+				console.debug("Player FX injected!")
+				actorFx._injected = true;
+			}
+
+
+		}
 	}
 
 	onFocusChange(focused) {
@@ -70,8 +95,8 @@ class MultiplayerClient extends terra.export.Observable {
 		terra.export.System.prototype.setWindowFocus = function (...args) {
 			const result = originalsetWindowFocus.apply(this, args);
 			focusChange(!args[0]);
-			return result; 
-  		};
+			return result;
+		};
 	}
 
 	onSceneStateEvent(event) {
@@ -90,7 +115,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 	client = new WebSocket(address);
 
 	client.on("open", () => {
-		console.log("[TT Client] Connected to server");	
+		console.log("[TT Client] Connected to server");
 	});
 
 	client.addEventListener("message", (event) => {
@@ -184,6 +209,31 @@ function createPlayerActor(id) {
 
 	actor.move.misc.groundConnect |= terra.export.COLL_GROUND_FLAGS.NO_PUSH;
 
+	actor.actorExt.actorFx.dust = terra.export.g_fxConnect.effects.dust.entries.ActorM;
+	actor.actorExt.actorFx.sound = terra.export.g_fxConnect.sounds.actor.entries.Cloth1;
+
+	// Client-side stepping sound/fx is really inconsistent for some reason
+	// So here we disable `onActorFx` to disable that client-side behaviour for player actors
+	// Getting them from the server is more consistent, but visual fx still gets lost sometimes
+	// TODO: Find out why and properly implement
+	let originalOnPostMove = actor.actor.onPostMove;
+	actor.actor.onPostMove = function (...args) {
+		const originalOnActorFx = this.fxCallback.onActorFx;
+
+		this.fxCallback.onActorFx = function (core, type, vary) {
+			if (type === terra.export.ACTOR_FX_TYPE.STEP || type === terra.export.ACTOR_FX_TYPE.STEP_2) {
+				return;
+			}
+			return originalOnActorFx.call(this, core, type, vary);
+		};
+
+		try {
+			return originalOnPostMove.apply(this, args);
+		} finally {
+			this.fxCallback.onActorFx = originalOnActorFx;
+		}
+	};
+
 	playerActors.set(id, actor);
 	return actor;
 }
@@ -191,7 +241,7 @@ function createPlayerActor(id) {
 function movePlayerActor(id, state) {
 	if (!state)
 		return;
-	
+
 	let actor = playerActors.get(id);
 
 	if (!actor) {
@@ -202,14 +252,14 @@ function movePlayerActor(id, state) {
 		return;
 	}
 
-	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path) {	
+	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path) {
 		actor.core?.hide(false);
 		return;
 	} else {
 		actor.core?.show(false);
 	}
 
-	if (state.char && actor.npc?.char?.path != state.char) {	
+	if (state.char && actor.npc?.char?.path != state.char) {
 		// Get character from the character sheet
 		var char = terra.export.Character.get(state.char);
 		actor.setNpc(char, false);
@@ -225,7 +275,7 @@ function movePlayerActor(id, state) {
 		}
 	}
 
-	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]));
+	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]), true, true);
 	if (actor.move?.vel) {
 		if (state.scene == "RUNNING") {
 			actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
@@ -234,11 +284,17 @@ function movePlayerActor(id, state) {
 		}
 	}
 
-	if (actor.view?.figState) {	
+	if (actor.view?.figState) {
 		if (state.scene == "RUNNING") {
 			actor.view.figState.animSpeed = 1;
 		} else {
 			actor.view.figState.animSpeed = 0;
+		}
+	}
+
+	if (actor.actorExt.actorFx) {
+		for (const fx of state.actorFx ?? []) {
+			actor.actorExt.actorFx.onActorFx(actor.core, fx.type, fx.vary);
 		}
 	}
 
@@ -274,7 +330,7 @@ function sendPlayerData(forceSend = false, scene = null) {
 	} else {
 		pausedSent = false;
 	}
-		
+
 	let state = {}
 
 	state.char = g_player.entity?.npc?.char?.path;
@@ -300,6 +356,10 @@ function sendPlayerData(forceSend = false, scene = null) {
 		state.figures.push(added.figure.cacheKey);
 	}
 
+	// Send effect data
+	state.actorFx = [...fxQueue];
+	fxQueue = [];
+
 	send({ type: "update", state });
 }
 
@@ -321,11 +381,13 @@ function updateOtherPlayers() {
 			let actor = playerActors.get(id);
 			if (!actor) return;
 
-			if (actor.view?.figState) 
+			if (actor.view?.figState)
 				actor.view.figState.animSpeed = 0;
 
 			if (actor.move?.vel)
 				actor.move.vel = new Vec3(0, 0, 0);
+
+			actor.move.acceleration = 0;
 		}
 	}
 }
