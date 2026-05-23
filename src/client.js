@@ -205,6 +205,8 @@ function createPlayerActor(id) {
 	if (actor.actor)
 		actor.actor.phaseOn = false;
 
+	actor.terraTogether = {};
+
 	actor.move?.mainColl?.setType(terra.export.COLL_TYPE.ACTOR);
 
 	actor.move.misc.groundConnect |= terra.export.COLL_GROUND_FLAGS.NO_PUSH;
@@ -303,11 +305,51 @@ function movePlayerActor(id, state) {
 
 	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), false);
 
-	actor.view.figState.addedFig = [];
-	for (const added of state.figures) {
-		let figure = terra.export.Figure.get(added);
-		actor.view.figState.addFigure(figure);
+	updateWeaponState(actor, state.weapon)
+}
+
+
+function updateWeaponState(actor, newWeapon) {
+	actor.terraTogether.weapon ??= {};
+	let weaponState = actor.terraTogether.weapon;
+	let playerFx = terra.export.g_player?.entity?.player?.fx;
+	let weapon = terra.export.g_player?.combat?.weapons?.get(newWeapon.weapon);
+
+	if (!weapon) {
+		if (weaponState.attach) {
+			if (!weaponState.back && !skipFade) {
+				const fx = terra.export.g_combat.hyperMode ? playerFx.weaponFrameRepeatHyper : playerFx.weaponFrameRepeat;
+				terra.export.FrameRepeatEntity.get(actor, fx).start();
+			}
+			weaponState.timer = 0;
+			actor.view.figState.removeFigure(weaponState.attach);
+			weaponState.current = null;
+			weaponState.attach = null;
+		}
+		return;
 	}
+
+	let targetWeapon = weapon.config.getFigure(newWeapon.back);
+	let swapped = false;
+	if (!weaponState.attach || weaponState.attach.figure != targetWeapon) {
+		if (weaponState.attach)
+			actor.view.figState.removeFigure(weaponState.attach);
+		weaponState.attach = actor.view.figState.addFigure(targetWeapon);
+		swapped = true;
+	}
+	if (swapped || newWeapon.back != weaponState.back || (!newWeapon.back && weaponState.timer > 0)) {
+		terra.export.FxEntity.clearEntity(actor.core, "weaponFade");
+		const fx = newWeapon.back ? playerFx.weaponShowBack : playerFx.weaponShow;
+		fx.spawnEntity(actor, terra.export.ENT_ALIGN.NODE_WEAPON_R).setPart(terra.export.FIGURE_PART.PART_7).setIgnoreSlowdown(0.5).setGroup("weaponFade").start();
+		weaponState.timer = 0;
+	}
+
+	if (weaponState.timer > terra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE && newWeapon.timerterra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE) {
+		playerFx.weaponHide.spawnEntity(actor, terra.export.ENT_ALIGN.NODE_WEAPON_R).setPart(terra.export.FIGURE_PART.PART_7).setGroup("weaponFade").start();
+	}
+	weaponState.current = weapon;
+	weaponState.back = newWeapon.back;
+	weaponState.timer = newWeapon.timer;
 }
 
 // Send only one paused state
@@ -349,6 +391,9 @@ function sendPlayerData(forceSend = false, scene = null) {
 
 	// Copy the look direcition
 	state.face_dir = g_player.entity?.actor?.face?.clone().v;
+
+	let weapon = g_player.entity?.player?.weapon;
+	state.weapon = { weapon: weapon?.current?.name, back: weapon?.back ?? false, timer: weapon?.timer ?? 0 };
 
 	// Clone weapons of Juno to the clone
 	state.figures = [];
