@@ -23,7 +23,9 @@ window.terraTogether.playerActors = playerActors;
 
 let config = loadConfig();
 
-let fxQueue = [];
+let actorFxQueue = [];
+let globalFxQueue = [];
+let clearFxQueue = [];
 
 class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
@@ -67,7 +69,7 @@ class MultiplayerClient extends terra.export.Observable {
 					const result = originalOnPlayerFx.apply(player.actorExt.actorFx, args);
 					const FX_TYPE = terra.export.ACTOR_FX_TYPE;
 					if (args[1] != FX_TYPE.POST_MOVE)
-						fxQueue.push({ type: args[1], vary: args[2] });
+						actorFxQueue.push({ type: args[1], vary: args[2] });
 					return result;
 				};
 				console.debug("Player FX injected!")
@@ -97,6 +99,40 @@ class MultiplayerClient extends terra.export.Observable {
 			focusChange(!args[0]);
 			return result;
 		};
+
+		// Add observer to spawned effects
+		let originalFxStart = terra.export.FxEntity.prototype.start;
+		terra.export.FxEntity.prototype.start = function (...args) {
+			if (this.target?.entity && this.target.entity == terra.export.g_player.entity) {
+				let fx = {
+					effect: this.effect?.cacheKey,
+					// TODO: Loops are broken right now
+					duration: args[0] == -1 ? 0 : args[0] ?? 0,
+					delay: this.delay,
+					group: this.attachGroup,
+					looped: this.looped,
+					part: terra.export.FIGURE_PART[this.part],
+					alignment: terra.export.ENT_ALIGN[this.target.alignment]
+				};
+				globalFxQueue.push(fx)
+			}
+			return originalFxStart.apply(this, args);
+		};
+
+		// Add observer to despawn effects
+		// TODO: Use general .clear() method somehow
+		let originalClearEntity = terra.export.FxEntity.clearEntity;
+		terra.export.FxEntity.clearEntity = function (...args) {
+			if (args[0] && args[0] == terra.export.g_player.entity?.core) {
+				let clearFx = {
+					group: args[1],
+					delay: args[2] ?? 0,
+					softStop: args[3] ?? false
+				};
+				clearFxQueue.push(clearFx)
+			}
+			return originalClearEntity.apply(this, args);
+		};
 	}
 
 	onSceneStateEvent(event) {
@@ -111,6 +147,23 @@ class MultiplayerClient extends terra.export.Observable {
 
 terra.addAddon(new MultiplayerClient(), { onGameMapStart: 35000, onLoopStart: 35000 });
 
+function updatePlayerState(id, state) {
+	let scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
+	let lastUpdate = playerUpdates.get(id);
+
+	if (lastUpdate && scene == "RUNNING") {
+		for (const fx of lastUpdate.globalFx ?? []) {
+			state.globalFx.push(fx);
+		}
+
+		for (const fx of lastUpdate.clearFx ?? []) {
+			state.clearFx.push(fx);
+		}
+	}
+	
+	playerUpdates.set(id, state);
+}
+
 function joinServer(address = 'ws://127.0.0.1:17005') {
 	client = new WebSocket(address);
 
@@ -124,17 +177,17 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 
 			switch (msg.type) {
 				case "welcome":
-					console.log("Welcome from server!");
+					console.log("[TT Client] Welcome from server!");
 					playerId = msg.id;
 					break;
 
 				case "update":
-					playerUpdates.set(msg.id, msg.state);
+					updatePlayerState(msg.id, msg.state);
 					break;
 
 				case "player_joined":
 					console.log(`[TT Client] Player ${msg.id} joined`);
-					playerUpdates.set(msg.id, msg.state);
+					updatePlayerState(msg.id, msg.state);
 					break;
 
 				case "scene_changed":
@@ -234,8 +287,6 @@ function createPlayerActor(id) {
 			};
 		}
 
-
-
 		try {
 			return originalOnPostMove.apply(this, args);
 		} finally {
@@ -296,10 +347,32 @@ function movePlayerActor(id, state) {
 
 	setActorTimeFactor(actor, state.timeFactor);
 
-	if (actor.actorExt.actorFx) {
-		for (const fx of state.actorFx ?? []) {
-			actor.actorExt.actorFx.onActorFx(actor.core, fx.type, fx.vary);
-		}
+	// if (actor.actorExt.actorFx) {
+	// 	for (const fx of state.actorFx ?? []) {
+	// 		actor.actorExt.actorFx.onActorFx(actor.core, fx.type, fx.vary);
+	// 	}
+	// }
+
+	for (const fxState of state.globalFx ?? []) {
+		if (!fxState.effect)
+			continue;
+		
+		let effect = terra.export.Effect.get(fxState.effect);
+
+		if (!effect)
+			continue;
+
+		let fx = effect.spawnEntity(actor, terra.export.ENT_ALIGN[fxState.alignment]);
+
+		fx.setDelay(fxState.delay ?? 0);
+		fx.setPart(terra.export.FIGURE_PART[fxState.part])
+		fx.looped = fxState.looped ?? false;
+		fx.attachGroup = fxState.group;
+		fx.start(fxState.duration);
+	}
+
+	for (const clearFx of state.clearFx ?? []) {
+		terra.export.FxEntity.clearEntity(actor.core, clearFx.group, clearFx.delay, clearFx.softStop);
 	}
 
 	actor.view?.figState?.setAnim(state.animation || "idle", null);
@@ -416,8 +489,14 @@ function sendPlayerData(forceSend = false, scene = null) {
 	state.weapon = { weapon: weapon?.current?.name, back: weapon?.back ?? false, timer: weapon?.timer ?? 0 };
 
 	// Send effect data
-	state.actorFx = [...fxQueue];
-	fxQueue = [];
+	state.actorFx = [...actorFxQueue];
+	actorFxQueue = [];
+
+	state.globalFx = [...globalFxQueue];
+	globalFxQueue = [];
+
+	state.clearFx = [...clearFxQueue];
+	clearFxQueue = [];
 
 	send({ type: "update", state });
 }
