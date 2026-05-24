@@ -200,7 +200,7 @@ function createPlayerActor(id) {
 	var actor = new terra.export.TerraActor();
 
 	// Inserts that entity in the world
-	terra.export.g_gState.addEntity(actor, false, false);
+	terra.export.g_gState.addEntity(actor, true, false);
 
 	if (actor.actor)
 		actor.actor.phaseOn = false;
@@ -249,8 +249,11 @@ function movePlayerActor(id, state) {
 
 	let actor = playerActors.get(id);
 
+	let justCreated = false;
+
 	if (!actor) {
 		actor = createPlayerActor(id);
+		justCreated = true;
 	}
 
 	if (!actor.core) {
@@ -258,16 +261,16 @@ function movePlayerActor(id, state) {
 	}
 
 	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path) {
-		actor.core?.hide(false);
+		actor.core?.hide(justCreated);
 		return;
 	} else {
-		actor.core?.show(false);
+		actor.core?.show(justCreated);
 	}
 
 	if (state.char && actor.npc?.char?.path != state.char) {
 		// Get character from the character sheet
 		var char = terra.export.Character.get(state.char);
-		actor.setNpc(char, false);
+		actor.setNpc(char, justCreated);
 	}
 
 	if (state.char == "CHA:main#Juno") {
@@ -282,16 +285,10 @@ function movePlayerActor(id, state) {
 
 	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]), true, true);
 	if (actor.move?.vel) {
-		if (state.scene == "RUNNING") {
-			actor.move.vel = new Vec3(state.velocity[0] * state.timeFactor, state.velocity[1] * state.timeFactor, state.velocity[2] * state.timeFactor);
-		} else {
-			actor.move.vel = new Vec3(0, 0, 0);
-		}
+		actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
 	}
 
-	if (actor.view?.figState) {
-		actor.view.figState.animSpeed = state.timeFactor;
-	}
+	setActorTimeFactor(actor, state.timeFactor);
 
 	if (actor.actorExt.actorFx) {
 		for (const fx of state.actorFx ?? []) {
@@ -302,9 +299,22 @@ function movePlayerActor(id, state) {
 	actor.view?.figState?.setAnim(state.animation || "idle", null);
 	actor.view?.figState?.setAnimTime(state.anim_time);
 
-	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), false);
+	let rotateInstantly = terra.export.g_scene?.currentState == SCENE_STATE.MENU || justCreated;
+	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), rotateInstantly);
 
 	updateWeaponState(actor, state.weapon)
+}
+
+function setActorTimeFactor(actor, time) {
+	if (actor.core?.time) {
+		actor.core.time.factor = time;
+		actor.core.time.logicFactor = time;
+	}
+
+	if (actor.move?.influencer) {
+		actor.move.influencer.globalInvTime = time;
+		actor.move.influencer.globalInvLogic = time;
+	}
 }
 
 
@@ -339,7 +349,7 @@ function updateWeaponState(actor, newWeapon) {
 	if (swapped || newWeapon.back != weaponState.back || (!newWeapon.back && weaponState.timer > 0)) {
 		terra.export.FxEntity.clearEntity(actor.core, "weaponFade");
 		const fx = newWeapon.back ? playerFx.weaponShowBack : playerFx.weaponShow;
-		fx.spawnEntity(actor, terra.export.ENT_ALIGN.NODE_WEAPON_R).setPart(terra.export.FIGURE_PART.PART_7).setIgnoreSlowdown(0.5).setGroup("weaponFade").start();
+		fx.spawnEntity(actor, terra.export.ENT_ALIGN.NODE_WEAPON_R).setPart(terra.export.FIGURE_PART.PART_7).setGroup("weaponFade").start();
 		weaponState.timer = 0;
 	}
 
@@ -424,13 +434,7 @@ function updateOtherPlayers() {
 			let actor = playerActors.get(id);
 			if (!actor) return;
 
-			if (actor.view?.figState)
-				actor.view.figState.animSpeed = 0;
-
-			if (actor.move?.vel)
-				actor.move.vel = new Vec3(0, 0, 0);
-
-			actor.move.acceleration = 0;
+			setActorTimeFactor(actor, 0);
 		}
 	}
 }
