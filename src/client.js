@@ -211,6 +211,9 @@ function createPlayerActor(id) {
 
 	actor.move.misc.groundConnect |= terra.export.COLL_GROUND_FLAGS.NO_PUSH;
 
+	actor.move.friction.air = 0;
+	actor.move.friction.ground = 0;
+
 	actor.actorExt.actorFx.dust = terra.export.g_fxConnect.effects.dust.entries.ActorM;
 	actor.actorExt.actorFx.sound = terra.export.g_fxConnect.sounds.actor.entries.Cloth1;
 
@@ -280,18 +283,14 @@ function movePlayerActor(id, state) {
 	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]), true, true);
 	if (actor.move?.vel) {
 		if (state.scene == "RUNNING") {
-			actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
+			actor.move.vel = new Vec3(state.velocity[0] * state.timeFactor, state.velocity[1] * state.timeFactor, state.velocity[2] * state.timeFactor);
 		} else {
 			actor.move.vel = new Vec3(0, 0, 0);
 		}
 	}
 
 	if (actor.view?.figState) {
-		if (state.scene == "RUNNING") {
-			actor.view.figState.animSpeed = 1;
-		} else {
-			actor.view.figState.animSpeed = 0;
-		}
+		actor.view.figState.animSpeed = state.timeFactor;
 	}
 
 	if (actor.actorExt.actorFx) {
@@ -357,23 +356,28 @@ let pausedSent = false;
 
 function sendPlayerData(forceSend = false, scene = null) {
 	let g_player = terra.export.g_player;
+	let g_system = terra.export.g_system;
+
 	if (!scene)
 		scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 
+	// No not send current state if not in game
 	if (scene == "INIT" || scene == "TITLE" || scene == "LOADING" || g_player.entity == null)
 		return;
+	
+	let state = {}
 
-	if (scene == "MENU") {
-		if (pausedSent && !forceSend) {
-			return;
-		} else {
-			pausedSent = true;
-		}
+	// Time factor of this client
+	let timeFactor = g_system.loopPaused ? 0 : g_system.timeFactor.world; 
+
+	if (timeFactor === 0) {
+		if (pausedSent && !forceSend) return;
+		pausedSent = true;
 	} else {
 		pausedSent = false;
 	}
 
-	let state = {}
+	state.timeFactor = timeFactor;
 
 	state.char = g_player.entity?.npc?.char?.path;
 	state.figure = g_player.entity?.view?.getFigure()?.name;
@@ -394,12 +398,6 @@ function sendPlayerData(forceSend = false, scene = null) {
 
 	let weapon = g_player.entity?.player?.weapon;
 	state.weapon = { weapon: weapon?.current?.name, back: weapon?.back ?? false, timer: weapon?.timer ?? 0 };
-
-	// Clone weapons of Juno to the clone
-	state.figures = [];
-	for (const added of g_player.entity?.view?.figState?.addedFig ?? []) {
-		state.figures.push(added.figure.cacheKey);
-	}
 
 	// Send effect data
 	state.actorFx = [...fxQueue];
