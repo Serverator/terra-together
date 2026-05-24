@@ -24,6 +24,11 @@ function startServer(host = '0.0.0.0', port = 17005) {
 
 		send(socket, { type: "welcome", id: playerId });
 
+		for (const [id, state] of playerData) {
+			if (state.scene == "MENU" && playerId != id && msg.map == state.map)
+				send(socket, { type: "update", id, state });
+		}
+
 		broadcast({ type: "player_joined", id: playerId }, socket);
 
 		socket.on('message', (raw) => {
@@ -65,11 +70,16 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		socket.on("close", () => {
 			clientsSockets.delete(socket);
 			playerData.delete(playerId);
-			console.log(`Player ${playerId} disconnected. Total: ${clientsSockets.size}`);
+			console.log(`Player ${playerId} disconnected. Total: Disconnect`);
 			broadcast({ type: "player_left", id: playerId });
 		});
 
-		socket.on("error", (err) => console.error(`Player ${playerId} error:`, err));
+		socket.on("error", (err) => {
+			clientsSockets.delete(socket);
+			playerData.delete(playerId);
+			console.log(`Player ${playerId} crashed. Reason: ${err}`);
+			broadcast({ type: "player_left", id: playerId });
+		});
 	});
 
 	server.on("error", (err) => {

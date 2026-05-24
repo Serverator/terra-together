@@ -1,16 +1,15 @@
 
-export { SkinManager, skins, skinOrder }
+export { SkinManager, skins }
 
 const fs = require("fs");
 const path = require("path");
 
 let skins = {};
-let skinOrder = [];
 
 function changeSkin(id) {
 	if (terra.export.g_player.entity?.npc?.char?.path != "CHA:main#Juno") return;
 	
-	let skinName = skinOrder[id] ?? "default";
+	let skinName = id ?? "default";
 	let skin = skins[skinName] ?? skins.default;
 	terra.export.g_player.entity?.view?.setFigure(skin.figure);
 }
@@ -20,7 +19,6 @@ const SKIN_DIR = "./mods/terra-together/skins";
 function loadSkins() {
 	let defaultFigure = terra.export.Figure.get("FIG:char.player.juno#default");
 	skins.default = { name: "Default", figure: defaultFigure };
-	skinOrder.push("default");
 
 	let i = 0;
 	
@@ -45,7 +43,6 @@ function loadSkins() {
 			i += 1;
 
 			skins[id] = { name: manifest.name ?? manifest.id, figure };
-			skinOrder.push(id);
 		} catch (err) {
 			console.warn(`[TerraTogether] Failed to load skin in ${folderPath}:`, err);
 		}
@@ -54,26 +51,45 @@ function loadSkins() {
 
 class SkinManager extends terra.export.Observable {
 	onGameMapStart() {
-		let skinId = terra.export.g_options.get("tt-skin") ?? 0;
+		let skinId = terra.export.g_options.get("tt-skin") ?? "default";
 		changeSkin(skinId);
 	}
 
 	onOptionEvent(event, key) {
 		if (key = 'tt-skin') {
-			let skinId = terra.export.g_options.get("tt-skin") ?? 0;
+			let skinId = terra.export.g_options.get("tt-skin") ?? "default";
 			changeSkin(skinId);
 		}
 	}
 
+	onAddonInit() {
+		terra.export.g_options.listProviders.set("tt-skin", this);
+		terra.export.g_options.observers.push(this);
+	}
+
+	getOptionList(values) {
+        for (let key in skins) {
+            values.push(key);
+        }
+		return "default";
+	}
+
+	getOptionLabels(labels) {
+		for (let key in skins) {
+			let skin = skins[key];
+            labels.push(skin.name);
+        }
+    }
+
 	onLoopStart() {
 		loadSkins();
 		
-		let optionManager = terra.export.g_options;
+		let g_options = terra.export.g_options;
 
 		let skinList = [];
 
-		for (const skinName of skinOrder) {
-			let skin = skins[skinName];
+		for (const name in skins) {
+			let skin = skins[name];
 			skinList.push({ en_US: skin.name });
 		}
 
@@ -84,20 +100,17 @@ class SkinManager extends terra.export.Observable {
 			description: { en_US: "Select your skin. It will be visible to other players. \n\n{c:2}Note{c}: Currently skins only apply to Juno. If you add your own skins, they will not sync between players (yet), so make sure all players have the same skins installed." },
 			type: {
 				default: 0,
-				list: skinList,
+				external: "tt-skin",
+				list: [],
 				type: 'RADIO_GROUP'
 			}
 		};
 		let skinOption = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-skin", skinOptionData);
 
-		optionManager.settings["tt-skin"] = skinOption;
-		// TODO: Options do not save for some reason
-		optionManager.restore("tt-skin");
-
-		terra.export.g_options.observers.push(this);
+		g_options.settings["tt-skin"] = skinOption;
 	}
 }
 
-terra.addAddon(new SkinManager(), { onLoopStart: 34500, onGameMapStart: 35000 });
+terra.addAddon(new SkinManager(), { onAddonInit: 35000, onLoopStart: -10000, onGameMapStart: 35000 });
 
 //# sourceURL=/mods/terra-together/skin.js
