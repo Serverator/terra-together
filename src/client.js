@@ -317,7 +317,7 @@ function updateWeaponState(actor, newWeapon) {
 
 	if (!weapon) {
 		if (weaponState.attach) {
-			if (!weaponState.back && !skipFade) {
+			if (!weaponState.back) {
 				const fx = terra.export.g_combat.hyperMode ? playerFx.weaponFrameRepeatHyper : playerFx.weaponFrameRepeat;
 				terra.export.FrameRepeatEntity.get(actor, fx).start();
 			}
@@ -344,7 +344,7 @@ function updateWeaponState(actor, newWeapon) {
 		weaponState.timer = 0;
 	}
 
-	if (weaponState.timer > terra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE && newWeapon.timerterra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE) {
+	if (weaponState.timer > terra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE && newWeapon.timer <= terra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE) {
 		playerFx.weaponHide.spawnEntity(actor, terra.export.ENT_ALIGN.NODE_WEAPON_R).setPart(terra.export.FIGURE_PART.PART_7).setGroup("weaponFade").start();
 	}
 	weaponState.current = weapon;
