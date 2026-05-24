@@ -223,19 +223,25 @@ function createPlayerActor(id) {
 	// TODO: Find out why and properly implement
 	let originalOnPostMove = actor.actor.onPostMove;
 	actor.actor.onPostMove = function (...args) {
-		const originalOnActorFx = this.fxCallback.onActorFx;
+		const originalOnActorFx = this.fxCallback?.onActorFx;
 
-		this.fxCallback.onActorFx = function (core, type, vary) {
-			if (type === terra.export.ACTOR_FX_TYPE.STEP || type === terra.export.ACTOR_FX_TYPE.STEP_2) {
-				return;
-			}
-			return originalOnActorFx.call(this, core, type, vary);
-		};
+		if (originalOnActorFx) {
+			this.fxCallback.onActorFx = function (core, type, vary) {
+				if (type === terra.export.ACTOR_FX_TYPE.STEP || type === terra.export.ACTOR_FX_TYPE.STEP_2) {
+					return;
+				}
+				return originalOnActorFx.call(this, core, type, vary);
+			};
+		}
+
+
 
 		try {
 			return originalOnPostMove.apply(this, args);
 		} finally {
-			this.fxCallback.onActorFx = originalOnActorFx;
+			if (originalOnActorFx) {
+				this.fxCallback.onActorFx = originalOnActorFx;
+			}
 		}
 	};
 
