@@ -26,6 +26,7 @@ let config = loadConfig();
 let actorFxQueue = [];
 let globalFxQueue = [];
 let clearFxQueue = [];
+let windboxQueue = [];
 
 class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
@@ -72,7 +73,6 @@ class MultiplayerClient extends terra.export.Observable {
 						actorFxQueue.push({ type: args[1], vary: args[2] });
 					return result;
 				};
-				console.debug("Player FX injected!")
 				actorFx._injected = true;
 			}
 
@@ -98,6 +98,31 @@ class MultiplayerClient extends terra.export.Observable {
 			const result = originalsetWindowFocus.apply(this, args);
 			focusChange(!args[0]);
 			return result;
+		};
+
+		// Send windbox data
+		let originalStart = terraTogether.steps.SPAWN_WINDBOX.prototype.start;
+		terraTogether.steps.SPAWN_WINDBOX.prototype.start = function (...args) {
+			let context = args[0];
+			if (context && context?.entity == terra.export.g_player.entity) {
+				let dts = this.displacementTypeSettings;
+				let windbox = {
+					displacementTypeSettings: {
+						directionAxes: dts.directionAxes.clone().v,
+						directionOrigin: dts.directionOrigin.clone().v,
+						gradient: dts.gradient,
+						gradientAxes: dts.gradientAxes.clone().v,
+						gradientOrigin: dts.gradientOrigin.clone().v,
+						perpendicular: dts.perpendicular
+					},
+					displacementSettings: structuredClone({ ...this.displacementSettings }),
+					handleTiming: structuredClone({ ...this.handleTiming }),
+					followTarget: this.followTarget,
+					alignment: terra.export.ENT_ALIGN[this.target.alignment]
+				};
+				windboxQueue.push(windbox);
+			}
+			return originalStart.apply(this, args);
 		};
 
 		// Add observer to spawned effects
@@ -177,7 +202,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 
 			switch (msg.type) {
 				case "welcome":
-					console.log("[TT Client] Welcome from server!");
+					console.log("[TT Client] Connected to the server");
 					playerId = msg.id;
 					break;
 
@@ -347,11 +372,11 @@ function movePlayerActor(id, state) {
 
 	setActorTimeFactor(actor, state.timeFactor);
 
-	// if (actor.actorExt.actorFx) {
-	// 	for (const fx of state.actorFx ?? []) {
-	// 		actor.actorExt.actorFx.onActorFx(actor.core, fx.type, fx.vary);
-	// 	}
-	// }
+	if (actor.actorExt.actorFx) {
+		for (const fx of state.actorFx ?? []) {
+			actor.actorExt.actorFx.onActorFx(actor.core, fx.type, fx.vary);
+		}
+	}
 
 	for (const fxState of state.globalFx ?? []) {
 		if (!fxState.effect)
@@ -369,6 +394,28 @@ function movePlayerActor(id, state) {
 		fx.looped = fxState.looped ?? false;
 		fx.attachGroup = fxState.group;
 		fx.start(fxState.duration);
+	}
+
+	for (const windbox of state.windboxes ?? []) {
+		let handle = terra.export.g_windboxManager.add();
+
+		let dts = windbox.displacementTypeSettings;
+		let displacementTypeSettings = {
+			gradient: dts.gradient,
+			perpendicular: dts.perpendicular,
+			directionAxes: new Vec2(dts.directionAxes[0], dts.directionAxes[1]),
+			directionOrigin: new Vec2(dts.directionOrigin[0], dts.directionOrigin[1]),
+			gradientAxes: new Vec2(dts.gradientAxes[0], dts.gradientAxes[1]),
+			gradientOrigin: new Vec2(dts.gradientOrigin[0], dts.gradientOrigin[1]),
+		};
+		
+        handle.setDisplacementType(displacementTypeSettings);
+        handle.setDisplacementSettings(windbox.displacementSettings);
+		handle.setTimingData(windbox.handleTiming);
+		let target = new terra.export.Target();
+		target.setEntity(actor, terra.export.ENT_ALIGN[windbox.alignment]);
+        handle.setTarget(target, windbox.followTarget);
+        handle.setToTargetPosition();
 	}
 
 	for (const clearFx of state.clearFx ?? []) {
@@ -497,6 +544,9 @@ function sendPlayerData(forceSend = false, scene = null) {
 
 	state.clearFx = [...clearFxQueue];
 	clearFxQueue = [];
+
+	state.windboxes = [...windboxQueue];
+	windboxQueue = [];
 
 	send({ type: "update", state });
 }

@@ -39,6 +39,9 @@ class Multiplayer extends terra.export.Observable {
 
 	onAddonInit() {
 		terra.export.g_options.observers.push(this);
+
+		let stepArray = terra.export.GAME_CONF.FEATURES.flatMap(f => f.steps ?? []).flat();
+		terraTogether.steps = Object.fromEntries(stepArray.map(step => [step.key, step]));
 	}
 
 	onLoopStart() {		
@@ -94,7 +97,7 @@ class SettingsTab extends terra.export.Observable {
 	}
 }
 
-terra.addAddon(new Multiplayer(), { onAddonInit: 35000, onLoopStart: -10000, onGameMapStart: 35000 });
+terra.addAddon(new Multiplayer(), { onAddonInit: -10000, onLoopStart: -10000, onGameMapStart: 35000 });
 terra.addAddon(new SettingsTab(), { onLoopStart: 40000 });
 
 //# sourceURL=/mods/terra-together/main.js
