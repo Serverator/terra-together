@@ -36,7 +36,11 @@ function loadSkins() {
 			let figure = terra.export.Figure.getFromSheet(skins.default, id);
 			let sheet = terra.export.SpriteSheet.get("map", `../mods/terra-together/skins/${folder}/${manifest.sprite_file}`);
 
+			figure.allAnims = skins.default.figure.allAnims;
+			figure.animAdd = skins.default.figure.animAdd;
 			figure.info = skins.default.figure.info;
+
+
 			figure.spriteSheets.juno = sheet;
 			figure.skin_name = id;
 
