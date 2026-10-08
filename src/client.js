@@ -14,15 +14,16 @@ let client = null;
 let playerId = null;
 
 const playerActors = new Map();
+
+window.terraTogether ??= {};
+window.terraTogether.playerActors = playerActors;
+
 const playerUpdates = new Map();
 const playerActions = new Map();
 
-window.terraTogether ??= {};
-
-window.terraTogether.playerActors = playerActors;
-
 let config = loadConfig();
 
+const playerEvents = [];
 let actorFxQueue = [];
 let globalFxQueue = [];
 let clearFxQueue = [];
@@ -120,7 +121,8 @@ class MultiplayerClient extends terra.export.Observable {
 					followTarget: this.followTarget,
 					alignment: terra.export.ENT_ALIGN[this.target.alignment]
 				};
-				windboxQueue.push(windbox);
+				if (client)
+					windboxQueue.push(windbox);
 			}
 			return originalStart.apply(this, args);
 		};
@@ -132,23 +134,24 @@ class MultiplayerClient extends terra.export.Observable {
 				let fx = {
 					effect: this.effect?.cacheKey,
 					// TODO: Loops are broken right now
-					duration: args[0] == -1 ? 0 : args[0] ?? 0,
+					duration: args[0],
 					delay: this.delay,
 					group: this.attachGroup,
 					looped: this.looped,
 					part: terra.export.FIGURE_PART[this.part],
 					alignment: terra.export.ENT_ALIGN[this.target.alignment]
 				};
-				globalFxQueue.push(fx)
+				if (client)
+					globalFxQueue.push(fx)
 			}
 			return originalFxStart.apply(this, args);
 		};
 
 		// Add observer to despawn effects
 		// TODO: Use general .clear() method somehow
-		let originalClearEntity = terra.export.FxEntity.clearEntity;
-		terra.export.FxEntity.clearEntity = function (...args) {
-			if (args[0] && args[0] == terra.export.g_player.entity?.core) {
+		let originalClearList = terra.export.FxEntity.clearList;
+		terra.export.FxEntity.clearList = function (...args) {
+			if (args[0] && args[0] == terra.export.g_player.entity?.core?.broadcast) {
 				let clearFx = {
 					group: args[1],
 					delay: args[2] ?? 0,
@@ -156,7 +159,7 @@ class MultiplayerClient extends terra.export.Observable {
 				};
 				clearFxQueue.push(clearFx)
 			}
-			return originalClearEntity.apply(this, args);
+			return originalClearList.apply(this, args);
 		};
 	}
 
@@ -183,6 +186,10 @@ function updatePlayerState(id, state) {
 
 		for (const fx of lastUpdate.clearFx ?? []) {
 			state.clearFx.push(fx);
+		}
+
+		for (const fx of lastUpdate.windboxes ?? []) {
+			state.windboxes.push(fx);
 		}
 	}
 	
@@ -419,7 +426,8 @@ function movePlayerActor(id, state) {
 	}
 
 	for (const clearFx of state.clearFx ?? []) {
-		terra.export.FxEntity.clearEntity(actor.core, clearFx.group, clearFx.delay, clearFx.softStop);
+		if (!actor.core) break;
+		terra.export.FxEntity.clearList(actor.core.broadcast, clearFx.group, clearFx.delay, clearFx.softStop);
 	}
 
 	actor.view?.figState?.setAnim(state.animation || "idle", null);
