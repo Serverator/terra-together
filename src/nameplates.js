@@ -13,11 +13,21 @@ const Vec3 = terra.export.Vec3;
 
 const NAMEPLATE_OPTION = "tt-nameplates";
 const USERNAME_OPTION = "tt-username";
+const NAMEPLATE_SCALE_OPTION = "tt-nameplate-scale";
 const NAMEPLATE_FONT_SIZE = terra.export.FONT_SIZE.SMALL;
 const NAMEPLATE_OUTLINE = terra.export.FONT_OUTLINE.ON;
 const NAMEPLATE_FONT_ALIGN = terra.export.FONT_ALIGN.CENTER;
-const NAMEPLATE_SCALE = 0.8;
-const NAMEPLATE_HEAD_OFFSET = 0.4;
+const NAMEPLATE_HEAD_OFFSET = 0.3;
+
+// Radio index -> scale. Order must match the "Nameplate Scale" option list
+// (Small / Normal / Large) in settings.js.
+const NAMEPLATE_SCALES = [0.5, 1.0, 1.5];
+const NAMEPLATE_SCALE_DEFAULT = 1.0;
+
+function getNameplateScale() {
+	const index = terra.export.g_options?.get(NAMEPLATE_SCALE_OPTION);
+	return NAMEPLATE_SCALES[index] ?? NAMEPLATE_SCALE_DEFAULT;
+}
 
 const NAMEPLATE_SELF_ID = "__tt_self__";
 const NAMEPLATE_HIDDEN_X = -100000;
@@ -73,7 +83,7 @@ class NameplateGui extends terra.export.GuiElement {
 		});
 		text.setAlign(terra.export.GUI_ALIGN_X.LEFT, terra.export.GUI_ALIGN_Y.TOP);
 		text.setPivot(0, 0);
-		text.hook.scale = NAMEPLATE_SCALE;
+		text.hook.scale = getNameplateScale();
 		const entry = { text, name: null };
 		this.entries.set(id, entry);
 		this.addChild(text);
@@ -100,10 +110,12 @@ class NameplateGui extends terra.export.GuiElement {
 		}
 
 		const text = entry.text;
+		const scale = getNameplateScale();
+		text.hook.scale = scale;
 		text.hook.transformToMapPos(pos, true);
 		// Pivot is the top-left corner, so scale is applied about it directly.
-		text.hook.pos.x -= text.hook.size.x * NAMEPLATE_SCALE * 0.5;
-		text.hook.pos.y -= text.hook.size.y * NAMEPLATE_SCALE;
+		text.hook.pos.x -= text.hook.size.x * scale * 0.5;
+		text.hook.pos.y -= text.hook.size.y * scale;
 	}
 
 	update() {

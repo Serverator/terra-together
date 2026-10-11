@@ -86,35 +86,40 @@ class SkinManager extends terra.export.Observable {
     }
 
 	onLoopStart() {
-		loadSkins();
 		
-		let g_options = terra.export.g_options;
-
-		let skinList = [];
-
-		for (const name in skins) {
-			let skin = skins[name];
-			skinList.push({ en_US: skin.name });
-		}
-
-		let skinOptionData = {
-			category: "MODS",
-			header: "Terra Together",
-			label: { en_US: "Skin" },
-			description: { en_US: "Select your skin. It will be visible to other players. \n\n{c:2}Note{c}: Currently skins only apply to Juno. If you add your own skins, they will not sync between players (yet), so make sure all players have the same skins installed." },
-			type: {
-				default: 0,
-				external: "tt-skin",
-				list: [],
-				type: 'RADIO_GROUP'
-			}
-		};
-		let skinOption = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-skin", skinOptionData);
-
-		g_options.settings["tt-skin"] = skinOption;
 	}
 }
 
+function createSkinSetting() {
+	loadSkins();
+	
+	let g_options = terra.export.g_options;
+
+	let skinList = [];
+
+	for (const name in skins) {
+		let skin = skins[name];
+		skinList.push({ en_US: skin.name });
+	}
+
+	let skinOptionData = {
+		category: "MULTIPLAYER",
+		label: { en_US: "Skin" },
+		description: { en_US: "Select your skin. It will be visible to other players. \n\n{c:2}Note{c}: Currently skins only apply to Juno. If you add your own skins, they will not sync between players (yet), so make sure all players have the same skins installed." },
+		type: {
+			default: 0,
+			external: "tt-skin",
+			list: [],
+			type: 'RADIO_GROUP'
+		}
+	};
+	let skinOption = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-skin", skinOptionData);
+
+	g_options.settings["tt-skin"] = skinOption;
+}
+
 terra.addAddon(new SkinManager(), { onAddonInit: 35000, onLoopStart: -10000, onGameMapStart: 35000 });
+
+export { createSkinSetting }
 
 //# sourceURL=/mods/terra-together/skin.js

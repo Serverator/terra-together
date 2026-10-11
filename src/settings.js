@@ -7,6 +7,7 @@
 
 import { createTextOption, createButtonOption } from "./option-types.js";
 import * as server from "./server.js";
+import { createSkinSetting } from "./skin.js";
 
 // The options category. Doubles as the Options-menu tab key, so the settings
 // below and the tab all use the same string.
@@ -31,13 +32,15 @@ export function createModSettings() {
 		type: { default: "", maxLength: 24, placeholder: "Username" }
 	});
 
+	createSkinSetting()
+
 	let nameplateData = {
 		category: CATEGORY,
 		local: true,
 		label: { en_US: "Player Nameplates" },
 		description: { en_US: "Show player usernames above characters." },
 		type: {
-			default: 2,
+			default: 1,
 			list: [
 				{ en_US: "Off" },
 				{ en_US: "Others" },
@@ -46,14 +49,34 @@ export function createModSettings() {
 			type: 'RADIO_GROUP'
 		}
 	};
-	
+
 	let nameplates = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-nameplates", nameplateData);
 	g_options.settings["tt-nameplates"] = nameplates;
 	if (g_options.values["tt-nameplates"] === undefined)
 		g_options.values["tt-nameplates"] = nameplateData.type.default;
 
+	let nameplateScaleData = {
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Nameplate Scale" },
+		description: { en_US: "Size of player nameplates." },
+		type: {
+			default: 1,
+			list: [
+				{ en_US: "Small" },
+				{ en_US: "Normal" },
+				{ en_US: "Large" }
+			],
+			type: 'RADIO_GROUP'
+		}
+	};
+	let nameplateScale = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-nameplate-scale", nameplateScaleData);
+	g_options.settings["tt-nameplate-scale"] = nameplateScale;
+	if (g_options.values["tt-nameplate-scale"] === undefined)
+		g_options.values["tt-nameplate-scale"] = nameplateScaleData.type.default;
+
 	// === Connection ===
-	
+
 	createTextOption("tt-server-address", {
 		header: "Connection",
 		category: CATEGORY,
@@ -98,7 +121,7 @@ export function createModSettings() {
 	};
 	let alwaysFocused = new (terra.export.OptionTypeBuilder.builders.get('CHECKBOX'))("tt-always-focused", alwaysFocusedData);
 	g_options.settings["tt-always-focused"] = alwaysFocused;
-	
+
 	let hidePartyData = {
 		category: CATEGORY,
 		label: { en_US: "Hide Party" },
