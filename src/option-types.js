@@ -1,0 +1,436 @@
+// Adds two new option ("setting") types to the game's Options menu:
+//
+//   TEXT   - a focusable/editable text field. Its value is a plain string and
+//            behaves like every other option (persists via the option/storage
+//            system, fires OPTION_EVENT.CHANGED, shows up in the info panel).
+//   BUTTON - a clickable button. Pressing it runs a JS callback supplied by a
+//            mod, so anything a mod can do can be triggered from a setting.
+//
+// The game registers option types in two places, both keyed by a string type:
+//   * OptionTypeBuilder    -> the data model   (engine/options/option.js)
+//   * OptionGuiTypeBuilder -> the menu renderer (…/options/types/option-type-base.js)
+// Neither is in the game's OPTION_TYPE enum, so we add both sides ourselves and
+// register them here. Registration is idempotent.
+//
+// Usage from a mod (usually inside `onLoopStart`):
+//
+//   import { createTextOption, createButtonOption } from "./option-types.js";
+//
+//   createTextOption("tt-username", {
+//       category: "MODS",
+//       local: true,
+//       label: { en_US: "Player Name" },
+//       description: { en_US: "Sent to the server." },
+//       type: { default: "Player", maxLength: 24, placeholder: "Anonymous" },
+//   });
+//
+//   createButtonOption("tt-reconnect", {
+//       category: "MODS",
+//       label: { en_US: "Reconnect" },
+//       description: { en_US: "Reconnects using the settings above." },
+//       type: { text: { en_US: "Reconnect" }, width: 140 },
+//   }, () => connectUsingOptions());
+
+export {
+	registerOptionTypes,
+	createTextOption,
+	createButtonOption,
+	setButtonHandler,
+	OptionText,
+	OptionButton,
+	OptionTextGui,
+	OptionButtonGui,
+}
+
+const g = terra.export;
+
+const ALIGN_X = g.GUI_ALIGN_X;
+const ALIGN_Y = g.GUI_ALIGN_Y;
+
+// Callbacks for BUTTON options, keyed by option key. A mod can either pass the
+// callback to createButtonOption() or register it later with setButtonHandler().
+const buttonHandlers = new Map();
+
+let registered = false;
+
+// ───────────────────────────── data model ─────────────────────────────
+
+class OptionText extends g.Option {
+	constructor(key, data) {
+		super(key, data);
+		this.maxLength = this.config.maxLength || 0;
+		this.placeholder = g.LangEntry.getText(this.config.placeholder, true) || "";
+	}
+	get default() {
+		const value = this.config.default;
+		return value === undefined || value === null ? "" : value;
+	}
+	getDefaultText() {
+		// Shown as "Default value" in the info panel.
+		return g.LangEntry.getText(this.config.default, true) || "";
+	}
+	isValid(value) {
+		if (typeof value !== "string")
+			return false;
+		if (this.maxLength > 0 && value.length > this.maxLength)
+			return false;
+		return true;
+	}
+}
+OptionText.type = "TEXT";
+
+class OptionButton extends g.Option {
+	constructor(key, data) {
+		super(key, data);
+		this.buttonWidth = this.config.width || 0;
+		this.onPress = null;
+		// Optional predicate: () => boolean. When it returns false the button is
+		// rendered inactive and cannot be pressed. Assign it after creation.
+		this.isEnabled = null;
+	}
+	getDefaultText() {
+		// Buttons have no meaningful default value to show in the info panel.
+		return null;
+	}
+	getButtonText() {
+		if (!this.getEnabled() && this.config.disabledText)
+			return g.LangEntry.getText(this.config.disabledText, true) || this.config.text || "OK";
+		return g.LangEntry.getText(this.config.text, true) || "OK";
+	}
+	getEnabled() {
+		return typeof this.isEnabled === "function" ? !!this.isEnabled() : true;
+	}
+}
+OptionButton.type = "BUTTON";
+
+// ───────────────────────────── menu renderer ─────────────────────────────
+
+class OptionTextGui extends g.OptionTypeGui {
+	constructor(row, option) {
+		super(row, option);
+		this.editing = false;
+		this.editText = "";
+		this.caret = 0;
+		this.caretOn = true;
+		this.caretTimer = 0;
+		this.focused = false;
+
+		this.onKeyDown = this.onKeyDown.bind(this);
+		this.onWindowMouseDown = this.onWindowMouseDown.bind(this);
+
+		this.background = new g.ColorGui(new g.Color("#2b2826"));
+		this.background.setAlign(ALIGN_X.CENTER, ALIGN_Y.CENTER);
+		this.addChild(this.background);
+
+		this.text = new g.TextGui("", { size: g.FONT_SIZE.MEDIUM });
+		this.text.setAlign(ALIGN_X.CENTER, ALIGN_Y.CENTER);
+		this.text.setPos(0, -1);
+		this.addChild(this.text);
+
+		this.refresh();
+	}
+
+	setSize(x, y) {
+		super.setSize(x, y);
+		this.background.setSize(Math.max(0, x - 8), Math.max(0, y - 8));
+		this.text.setMaxWidth(Math.max(0, x - 16));
+		this.refresh();
+	}
+
+	update() {
+		if (!this.editing)
+			return;
+		// Blink the caret roughly twice a second.
+		this.caretTimer += g.g_tick.gui;
+		if (this.caretTimer >= 0.5) {
+			this.caretTimer = 0;
+			this.caretOn = !this.caretOn;
+			this.refresh();
+		}
+	}
+
+	refresh() {
+		if (this.editing) {
+			const caret = this.caretOn ? "|" : " ";
+			this.text.setText(this.editText.slice(0, this.caret) + caret + this.editText.slice(this.caret));
+			this.text.setDecorator(this.focused ? g.ColorDecorator.GREEN : g.ColorDecorator.MENU);
+			return;
+		}
+		const value = g.g_options.get(this.key);
+		if (value === undefined || value === null || value === "") {
+			this.text.setText(this.option.placeholder || "<empty>");
+			this.text.setDecorator(g.ColorDecorator.GREY);
+		}
+		else {
+			this.text.setText(String(value));
+			this.text.setDecorator(g.ColorDecorator.MENU);
+		}
+	}
+
+	startEditing() {
+		if (this.editing)
+			return;
+		const value = g.g_options.get(this.key);
+		this.editText = (value === undefined || value === null) ? "" : String(value);
+		this.caret = this.editText.length;
+		this.editing = true;
+		this.caretOn = true;
+		this.caretTimer = 0;
+		// Freeze menu navigation and capture keystrokes before the game's own
+		// window-level (bubble phase) keydown handler sees them.
+		g.g_input.ignoreKeyboard = true;
+		// Drop any actions still held (e.g. the confirm press that opened editing)
+		// so they don't repeat while typing.
+		g.g_input.clearActions();
+		window.addEventListener("keydown", this.onKeyDown, true);
+		window.addEventListener("mousedown", this.onWindowMouseDown, true);
+		g.g_menuSFX.confirmMedium();
+		this.refresh();
+	}
+
+	stopEditing(commit) {
+		if (!this.editing)
+			return;
+		this.editing = false;
+		window.removeEventListener("keydown", this.onKeyDown, true);
+		window.removeEventListener("mousedown", this.onWindowMouseDown, true);
+		g.g_input.ignoreKeyboard = false;
+		if (commit && g.g_options.get(this.key) !== this.editText)
+			g.g_options.set(this.key, this.editText);
+		this.refresh();
+	}
+
+	resetCaretBlink() {
+		this.caretOn = true;
+		this.caretTimer = 0;
+		this.refresh();
+	}
+
+	onKeyDown(event) {
+		if (!this.editing)
+			return;
+		event.stopPropagation();
+		event.preventDefault();
+		const key = event.key;
+
+		switch (key) {
+			case "Escape":
+				this.stopEditing(false);
+				g.g_menuSFX.pageBackward();
+				return;
+			case "Enter":
+				this.stopEditing(true);
+				g.g_menuSFX.confirmMedium();
+				return;
+			case "Backspace":
+				if (this.caret > 0) {
+					this.editText = this.editText.slice(0, this.caret - 1) + this.editText.slice(this.caret);
+					this.caret--;
+				}
+				return this.resetCaretBlink();
+			case "Delete":
+				this.editText = this.editText.slice(0, this.caret) + this.editText.slice(this.caret + 1);
+				return this.resetCaretBlink();
+			case "ArrowLeft":
+				this.caret = Math.max(0, this.caret - 1);
+				return this.resetCaretBlink();
+			case "ArrowRight":
+				this.caret = Math.min(this.editText.length, this.caret + 1);
+				return this.resetCaretBlink();
+			case "Home":
+				this.caret = 0;
+				return this.resetCaretBlink();
+			case "End":
+				this.caret = this.editText.length;
+				return this.resetCaretBlink();
+		}
+
+		if (event.ctrlKey || event.metaKey || event.altKey)
+			return;
+		if (key.length !== 1)
+			return;
+		if (this.option.maxLength > 0 && this.editText.length >= this.option.maxLength)
+			return;
+		this.editText = this.editText.slice(0, this.caret) + key + this.editText.slice(this.caret);
+		this.caret++;
+		this.resetCaretBlink();
+	}
+
+	onWindowMouseDown() {
+		// Clicking anywhere ends editing (the click itself still goes through).
+		this.stopEditing(true);
+	}
+
+	onValidate() {
+		if (!this.editing)
+			this.refresh();
+	}
+
+	onAttach() {
+		this.refresh();
+	}
+
+	onRowFocusGain() {
+		this.focused = true;
+		this.refresh();
+	}
+
+	onRowFocusLost() {
+		this.focused = false;
+		this.stopEditing(true);
+	}
+
+	onConfirmPressed() {
+		this.startEditing();
+	}
+
+	onMouseInteract(mouseOver, clicked) {
+		if (clicked && !this.editing)
+			this.startEditing();
+	}
+
+	onLeftRightInput(direction) { }
+
+	hasFocus() {
+		return this.editing;
+	}
+
+	canLeaveFocus() {
+		return !this.editing;
+	}
+
+	getMouseFocusButtons() {
+		return null;
+	}
+}
+OptionTextGui.type = "TEXT";
+
+class OptionButtonGui extends g.OptionTypeGui {
+	constructor(row, option) {
+		super(row, option);
+		this.button = new g.TextButton(option.getButtonText(), {
+			type: g.BUTTON_TYPES.GROUP_SINGLE,
+			cutDirHorz: g.NP_CUT_DIR.NONE,
+			width: option.buttonWidth || 120,
+			minWidth: 60,
+		});
+		this.button.setAlign(ALIGN_X.CENTER, ALIGN_Y.CENTER);
+		this.button.onButtonPress = () => this.press();
+		this.addChild(this.button);
+		this.refreshEnabled();
+	}
+
+	// Re-reads the option's enabled predicate and applies it to the button, both
+	// visually (inactive/grayscale) and behaviourally (the interact system refuses
+	// to activate an inactive gui, playing the "blocked" sound instead).
+	refreshEnabled() {
+		const enabled = this.option.getEnabled();
+		this.button.setActive(enabled);
+		if (!enabled)
+			this.button.setPressed(false);
+		this.button.setText(this.option.getButtonText(), true);
+	}
+
+	press() {
+		if (!this.option.getEnabled()) {
+			g.g_menuSFX.blocked();
+			return;
+		}
+		g.g_menuSFX.confirmMedium();
+		const handler = this.option.onPress || buttonHandlers.get(this.key);
+		if (typeof handler === "function") {
+			try {
+				handler(this.option, this.key);
+			}
+			catch (err) {
+				console.error(`[TerraTogether] BUTTON option '${this.key}' handler failed:`, err);
+			}
+		}
+		// The handler may have changed the enabled state (e.g. hosting started).
+		this.refreshEnabled();
+	}
+
+	onValidate() {
+		this.refreshEnabled();
+	}
+
+	onConfirmPressed() {
+		// Mouse clicks are delivered straight to the button via onButtonPress.
+		if (g.g_input.mouseGuiActive)
+			return;
+		this.press();
+	}
+
+	onRowFocusGain() {
+		if (g.g_input.mouseGuiActive)
+			return;
+		this.button.focusGained();
+	}
+
+	onRowFocusLost() {
+		this.button.focusLost();
+	}
+
+	getMouseFocusButtons() {
+		return [{ index: 1, gui: this.button }];
+	}
+
+	hasFocus() {
+		return this.button.focus;
+	}
+}
+OptionButtonGui.type = "BUTTON";
+
+// ───────────────────────────── helpers ─────────────────────────────
+
+/** Registers both halves of the new option types. Safe to call repeatedly. */
+function registerOptionTypes() {
+	if (registered)
+		return;
+	registered = true;
+	g.OptionTypeBuilder.register(OptionText);
+	g.OptionTypeBuilder.register(OptionButton);
+	g.OptionGuiTypeBuilder.register(OptionTextGui);
+	g.OptionGuiTypeBuilder.register(OptionButtonGui);
+	// Mirror the game, which seeds g_options.types from its OPTION_TYPE enum.
+	for (const type of ["TEXT", "BUTTON"])
+		if (!g.g_options.types[type])
+			g.g_options.addType(type);
+}
+
+/**
+ * Registers a button handler by option key. Useful when the option is created
+ * elsewhere (e.g. from data) or when the callback is defined later.
+ */
+function setButtonHandler(key, handler) {
+	buttonHandlers.set(key, handler);
+}
+
+function addSetting(key, option) {
+	const options = g.g_options;
+	options.settings[key] = option;
+	// Preserve a value restored from localStorage / a save, otherwise use default.
+	if (options.values[key] === undefined || options.values[key] === null)
+		options.values[key] = option.default;
+	return option;
+}
+
+/** Creates a TEXT setting. `data.type` may carry `default`, `maxLength`, `placeholder`. */
+function createTextOption(key, data) {
+	registerOptionTypes();
+	data.type = { ...(data.type || {}), type: "TEXT" };
+	return addSetting(key, g.OptionTypeBuilder.build("TEXT", key, data));
+}
+
+/**
+ * Creates a BUTTON setting. `onPress(option, key)` runs when the button is
+ * pressed; omit it and call setButtonHandler(key, fn) instead.
+ */
+function createButtonOption(key, data, onPress) {
+	registerOptionTypes();
+	data.type = { ...(data.type || {}), type: "BUTTON" };
+	const option = g.OptionTypeBuilder.build("BUTTON", key, data);
+	if (typeof onPress === "function")
+		option.onPress = onPress;
+	return addSetting(key, option);
+}

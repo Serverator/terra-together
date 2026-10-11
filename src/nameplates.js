@@ -9,11 +9,10 @@
 // The player id -> actor / username data lives in client.js and is shared via
 // `window.terraTogether`.
 
-import { loadConfig } from "./helper.js";
-
 const Vec3 = terra.export.Vec3;
 
 const NAMEPLATE_OPTION = "tt-nameplates";
+const USERNAME_OPTION = "tt-username";
 const NAMEPLATE_FONT_SIZE = terra.export.FONT_SIZE.SMALL;
 const NAMEPLATE_OUTLINE = terra.export.FONT_OUTLINE.ON;
 const NAMEPLATE_FONT_ALIGN = terra.export.FONT_ALIGN.CENTER;
@@ -23,15 +22,12 @@ const NAMEPLATE_HEAD_OFFSET = 0.4;
 const NAMEPLATE_SELF_ID = "__tt_self__";
 const NAMEPLATE_HIDDEN_X = -100000;
 
-const config = loadConfig();
 const nameplateWorld = new Vec3();
 
-let nameplateLogged = false;
-
-// Always render *something*: missing/empty names fall back to "Player".
+// Empty/whitespace nicknames have no nameplate at all.
 function getNameplateText(name) {
 	const trimmed = name == null ? "" : String(name).trim();
-	return trimmed === "" ? "Player" : trimmed;
+	return trimmed === "" ? null : trimmed;
 }
 
 // World position just above the character, based on the stable collision box
@@ -88,6 +84,10 @@ class NameplateGui extends terra.export.GuiElement {
 		const entry = this.entries.get(id) ?? this.createEntry(id);
 
 		const label = getNameplateText(name);
+		if (label == null) {
+			entry.text.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
+			return;
+		}
 		if (entry.name !== label) {
 			entry.name = label;
 			entry.text.setText(label);
@@ -107,11 +107,6 @@ class NameplateGui extends terra.export.GuiElement {
 	}
 
 	update() {
-		if (!nameplateLogged) {
-			nameplateLogged = true;
-			console.log("[TerraTogether] Nameplate GUI active");
-		}
-
 		const actors = window.terraTogether?.playerActors;
 		const names = window.terraTogether?.playerNames;
 		const active = new Set();
@@ -128,7 +123,7 @@ class NameplateGui extends terra.export.GuiElement {
 				}
 				if (mode >= 2) {
 					active.add(NAMEPLATE_SELF_ID);
-					this.updateEntry(NAMEPLATE_SELF_ID, terra.export.g_player?.entity, config?.client?.username);
+					this.updateEntry(NAMEPLATE_SELF_ID, terra.export.g_player?.entity, terra.export.g_options?.get(USERNAME_OPTION));
 				}
 			}
 		}

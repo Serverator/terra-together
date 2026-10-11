@@ -1,49 +1,26 @@
-export { createOption, loadConfig }
+export { createOption }
 
-const fs = require("fs");
-
-let config = null;
-
-function loadConfig() {
-	if (config)
-		return config;
-	
-	try {
-		const raw = fs.readFileSync("./mods/terra-together/config.json", 'utf8');
-		return JSON.parse(raw);
-	} catch (err) {
-		if (err.code === 'ENOENT') {
-			console.log('[TerraTogether] No config.json found, using defaults.');
-		} else {
-			console.warn('[TerraTogether] Failed to read config.json:', err.message);
-		}
-		// Use default config
-		return {
-			client: {
-				username: "Player",
-				server_address: "127.0.0.1",
-				port: 17005
-			},
-			server: {
-				enabled: false,
-				port: 17005
-			}
-		};
-	}
-}
+import { registerOptionTypes } from "./option-types.js";
 
 /** Helper function to create new options in the game menu
 
 Should run in `onLoopStart` */
 function createOption(id, data, type) {
-	let builder = terra.export.OptionTypeBuilder.builders.get(type);
-	
-	let skinOption = new builder(id, data);
+	registerOptionTypes();
 
-	optionManager.settings[id] = skinOption;
-	
-	// TODO: Options do not save for some reason
-	optionManager.restore(id);
+	let builder = terra.export.OptionTypeBuilder.builders.get(type);
+	if (!builder)
+		throw new Error("[TerraTogether] Unknown option type: " + type);
+
+	let option = new builder(id, data);
+
+	let options = terra.export.g_options;
+	options.settings[id] = option;
+	// Keep a value restored from localStorage/save, otherwise use the default.
+	if (options.values[id] === undefined || options.values[id] === null)
+		options.values[id] = option.default;
+
+	return option;
 }
 
 //# sourceURL=/mods/terra-together/helper.js

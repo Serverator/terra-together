@@ -1,4 +1,4 @@
-export { startServer, stopServer, send, broadcast };
+export { startServer, stopServer, send, broadcast, isHosting };
 
 import { WebSocketServer } from "./ws.js";
 
@@ -117,6 +117,11 @@ function stopServer() {
 	clientsSockets.clear();
 	server.close();
 	server = null;
+}
+
+/** True while a server is running (or starting up) on this machine. */
+function isHosting() {
+	return !!server;
 }
 
 

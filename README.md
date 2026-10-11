@@ -14,5 +14,5 @@ You need [TerraModloader](https://github.com/Serverator/terra-modloader) for it 
 - Characters and skins
 - Effects and sounds
 
-### Planned features
-- Player name display
+## AI use notice
+This mod was created with support from AI

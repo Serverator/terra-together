@@ -1,4 +1,4 @@
-import { loadConfig } from "./helper.js";
+import { registerOptionTypes, createTextOption, createButtonOption } from "./option-types.js";
 import * as skin from './skin.js';
 import * as server from './server.js';
 import * as client from './client.js';
@@ -17,7 +17,13 @@ class Multiplayer extends terra.export.Observable {
 	}
 
 	onOptionEvent(event, key) {
-		if (key = "tt-hide-party") {
+		// Keep the server informed when the player renames themselves.
+		if (key === "tt-username") {
+			const name = String(terra.export.g_options.get("tt-username") ?? "").trim();
+			client.send({ type: "profile", username: name === "" ? null : name });
+		}
+
+		if (key === "tt-hide-party") {
 			let hideParty = terra.export.g_options.get("tt-hide-party") ?? false;
 			if (hideParty) {
 				for (const party of terra.export.g_party?.entities ?? []) {
@@ -30,28 +36,33 @@ class Multiplayer extends terra.export.Observable {
 			}
 		}
 
-		if (key = "tt-always-focused") {
-			let alwaysFocused = terra.export.g_options.get("tt-always-focused") ?? false;
-
-			window.IG_KEEP_WINDOW_FOCUS = alwaysFocused;
-			terra.export.g_system.setWindowFocus(false);
+		// Apply on change, and whenever the options are (re)loaded. The latter is
+		// what makes a stored value take effect on startup, not only when toggled.
+		const OPTION_EVENT = terra.export.OPTION_EVENT;
+		if (key === "tt-always-focused"
+			|| event === OPTION_EVENT.SETTINGS_UPDATED
+			|| event === OPTION_EVENT.SETTINGS_LOADED) {
+			this.applyAlwaysFocused();
 		}
 	}
 
+	applyAlwaysFocused() {
+		const alwaysFocused = terra.export.g_options.get("tt-always-focused") ?? false;
+		window.IG_KEEP_WINDOW_FOCUS = alwaysFocused;
+		terra.export.g_system.setWindowFocus(false);
+	}
+
 	onAddonInit() {
+		// Add the extra setting types (TEXT + BUTTON) before any menu is built.
+		registerOptionTypes();
+
 		terra.export.g_options.observers.push(this);
 
 		let stepArray = terra.export.GAME_CONF.FEATURES.flatMap(f => f.steps ?? []).flat();
 		terraTogether.steps = Object.fromEntries(stepArray.map(step => [step.key, step]));
 	}
 
-	onLoopStart() {		
-		let config = loadConfig();
-
-		if (config?.server && config.server.enabled) {
-			server.startServer(config.server.host ?? '0.0.0.0', config.server.port ?? 17005);
-		}
-
+	onLoopStart() { 		
 		let g_options = terra.export.g_options;
 
 		// Add settings
@@ -85,7 +96,7 @@ class Multiplayer extends terra.export.Observable {
 			category: "MODS",
 			local: true,
 			label: { en_US: "Player Nameplates" },
-			description: { en_US: "Show player usernames above characters.\n\nUsernames are set in mods/terra-together/config.json (client.username)." },
+			description: { en_US: "Show player usernames above characters.\n\nUsernames are configured in the Player Name setting below." },
 			type: {
 				default: 2,
 				list: [
@@ -100,6 +111,54 @@ class Multiplayer extends terra.export.Observable {
 		g_options.settings["tt-nameplates"] = nameplates;
 		if (g_options.values["tt-nameplates"] === undefined)
 			g_options.values["tt-nameplates"] = nameplateData.type.default;
+
+		// In-game client configuration. There is no config.json: everything is
+		// stored as game options, so settings persist without editing files.
+		// These are `local` options, persisted in the game's local options storage.
+		createTextOption("tt-username", {
+			header: "Terra Together",
+			category: "MODS",
+			local: true,
+			label: { en_US: "Player Name" },
+			description: { en_US: "Your name as shown to other players.\n\nLeave empty to show no nameplate.\n\nPress confirm to edit, then confirm again (or click away) to save." },
+			type: { default: "", maxLength: 24, placeholder: "Anonymous" }
+		});
+
+		createTextOption("tt-server-address", {
+			category: "MODS",
+			local: true,
+			label: { en_US: "Server Address" },
+			description: { en_US: "Host used when connecting to a multiplayer server." },
+			type: { default: "127.0.0.1", placeholder: "127.0.0.1" }
+		});
+
+		createTextOption("tt-server-port", {
+			category: "MODS",
+			local: true,
+			label: { en_US: "Server Port" },
+			description: { en_US: "Port used when connecting to a multiplayer server." },
+			type: { default: "17005", maxLength: 5, placeholder: "17005" }
+		});
+
+		// A BUTTON setting: pressing it runs custom JS from the mod.
+		// Hosting is opt-in — the server only starts when this is pressed, and the
+		// button becomes non-pressable once a server is running.
+		const hostButton = createButtonOption("tt-host-server", {
+			header: "Terra Together",
+			category: "MODS",
+			label: { en_US: "Hosting" },
+			description: { en_US: "Start a multiplayer server on this machine.\n\nOther players connect using the Server Address and Server Port above." },
+			type: { text: { en_US: "Start Hosting" }, disabledText: { en_US: "Hosting…" }, width: 150 }
+		}, () => {
+			const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
+			server.startServer("0.0.0.0", port);
+			console.log(`[TerraTogether] Hosting on ws://0.0.0.0:${port}`);
+		});
+		hostButton.isEnabled = () => !server.isHosting();
+
+		// Baseline: apply the stored Always Focused value as soon as the game
+		// starts. (A load also re-applies it via SETTINGS_UPDATED.)
+		this.applyAlwaysFocused();
 	}
 }
 

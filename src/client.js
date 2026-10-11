@@ -1,6 +1,5 @@
 export { joinServer, leaveServer, send }
 
-import { loadConfig } from "./helper.js";
 import { skins } from "./skin.js";
 
 const { SCENE_STATE, SCENE_EVENT } = terra.file.sceneTypes;
@@ -12,6 +11,7 @@ let lastScene = "INIT";
 
 let client = null;
 let playerId = null;
+let connected = false;
 
 const playerActors = new Map();
 const playerNames = new Map();
@@ -23,7 +23,23 @@ window.terraTogether.playerNames = playerNames;
 const playerUpdates = new Map();
 const playerActions = new Map();
 
-let config = loadConfig();
+// All configuration lives in the in-game options (Options > Mods tab); there is
+// no config.json.
+function getSetting(key, fallback) {
+	const value = terra.export.g_options?.get(key);
+	return (value === undefined || value === null || value === "") ? fallback : value;
+}
+
+function getUsername() {
+	const name = String(getSetting("tt-username", "")).trim();
+	return name === "" ? null : name;
+}
+
+function getServerUrl() {
+	const host = getSetting("tt-server-address", "127.0.0.1");
+	const port = getSetting("tt-server-port", 17005);
+	return `ws://${host}:${port}`;
+}
 
 let actorFxQueue = [];
 let globalFxQueue = [];
@@ -240,6 +256,27 @@ class MultiplayerClient extends terra.export.Observable {
 				return originalFxStart.apply(this, args);
 			};
 
+			// The enter/exit "appear"/"disappear" fx are what drive a core show/hide
+			// transition: they FADE the target's figure (see fx-fade.js -> FigureFade).
+			// Each client plays its own transition, so these must NOT be synced -- a
+			// replayed fade would be left applied to the peer's figure and render the
+			// character invisible (most visible after a map change). The game calls
+			// initHideShowChange() on exactly these fx, right after start(), so we
+			// cancel the sync entry queued by the start hook here.
+			let originalInitHideShowChange = terra.export.FxEntity.prototype.initHideShowChange;
+			terra.export.FxEntity.prototype.initHideShowChange = function (...args) {
+				if (this._ttFxId) {
+					for (let i = globalFxQueue.length - 1; i >= 0; i--) {
+						if (globalFxQueue[i].id === this._ttFxId) {
+							globalFxQueue.splice(i, 1);
+							break;
+						}
+					}
+					this._ttFxId = 0;
+				}
+				return originalInitHideShowChange.apply(this, args);
+			};
+
 			// Despawn: `stop()` is the real teardown path. Looped/infinite fx end
 			// through subscription-end / spawner-hide / clearList -> stop(), none of
 			// which go through the static clearList. Hooking stop() is what makes
@@ -414,10 +451,12 @@ function updatePlayerState(id, state) {
 	playerUpdates.set(id, state);
 }
 
-function joinServer(address = 'ws://127.0.0.1:17005') {
+function joinServer(address) {
+	address = address ?? getServerUrl();
 	client = new WebSocket(address);
 
-	client.on("open", () => {
+	client.addEventListener("open", () => {
+		connected = true;
 		console.log("[TT Client] Connected to server");
 	});
 
@@ -430,7 +469,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 					console.log("[TT Client] Connected to the server");
 					playerId = msg.id;
 					// Username is sent exactly once per connection, not with every update.
-					send({ type: "profile", username: config?.client?.username ?? null });
+					send({ type: "profile", username: getUsername() });
 					break;
 
 				case "player_profile":
@@ -473,32 +512,38 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 
 	client.addEventListener("close", () => {
 		console.log("Disconnected from server.");
-		for (const player of playerActors.keys()) {
-			playerActions.set(player, "HIDE");
-		}
-		client = null;
-		playerId = null;
-		playerActors.clear();
-		playerUpdates.clear();
-		playerNames.clear();
+		onDisconnected();
 	});
 
 	client.addEventListener("error", (err) => {
 		console.error("Connection error:", err.message);
-		for (const player of playerActors.keys()) {
-			playerActions.set(player, "HIDE");
-		}
-		client = null;
-		playerId = null;
-		playerActors.clear();
-		playerUpdates.clear();
-		playerNames.clear();
+		onDisconnected();
 	});
 }
 
 function leaveServer() {
 	if (!client) return console.log("Not connected.");
 	client.close();
+}
+
+// Clean up local multiplayer state after the connection drops. If we were
+// actually connected, send the player back to the main menu.
+function onDisconnected() {
+	for (const player of playerActors.keys()) {
+		playerActions.set(player, "HIDE");
+	}
+	client = null;
+	playerId = null;
+	playerActors.clear();
+	playerUpdates.clear();
+	playerNames.clear();
+
+	if (connected) {
+		connected = false;
+		const scene = terra.export.g_scene;
+		if (scene && !scene.isTitle())
+			scene.goToTitle();
+	}
 }
 
 function send(data) {
@@ -576,6 +621,10 @@ function movePlayerActor(id, state) {
 		return;
 	}
 
+	// Local show/hide transition (as the game does): each client plays its own
+	// enter/exit animation, and those transition fx are intentionally not synced
+	// (see the initHideShowChange hook above). justCreated skips it on the very
+	// first frame so the actor doesn't play an appear fx before it has data.
 	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path) {
 		actor.core?.hide(justCreated);
 		return;
