@@ -12,8 +12,7 @@ You need [TerraModloader](https://github.com/Serverator/terra-modloader) for it 
 - World position
 - Animations
 - Characters and skins
-- Effects (except for looped ones)
+- Effects and sounds
 
 ### Planned features
-- Sound sync
 - Player name display
