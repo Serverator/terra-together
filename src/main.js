@@ -2,6 +2,7 @@ import { loadConfig } from "./helper.js";
 import * as skin from './skin.js';
 import * as server from './server.js';
 import * as client from './client.js';
+import * as nameplates from './nameplates.js';
 
 window.terraTogether ??= {};
 
@@ -78,6 +79,27 @@ class Multiplayer extends terra.export.Observable {
 		};
 		let alwaysFocused = new (terra.export.OptionTypeBuilder.builders.get('CHECKBOX'))("tt-always-focused", alwaysFocusedData);
 		g_options.settings["tt-always-focused"] = alwaysFocused;
+
+		let nameplateData = {
+			header: "Terra Together",
+			category: "MODS",
+			local: true,
+			label: { en_US: "Player Nameplates" },
+			description: { en_US: "Show player usernames above characters.\n\nUsernames are set in mods/terra-together/config.json (client.username)." },
+			type: {
+				default: 2,
+				list: [
+					{ en_US: "Off" },
+					{ en_US: "Others" },
+					{ en_US: "Others + Self" }
+				],
+				type: 'RADIO_GROUP'
+			}
+		};
+		let nameplates = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-nameplates", nameplateData);
+		g_options.settings["tt-nameplates"] = nameplates;
+		if (g_options.values["tt-nameplates"] === undefined)
+			g_options.values["tt-nameplates"] = nameplateData.type.default;
 	}
 }
 

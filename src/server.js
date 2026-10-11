@@ -8,6 +8,9 @@ const clientsSockets = new Map();
 // Server need to store current location of players to send to new players
 const playerData = new Map();
 
+// Username per player, sent once by each client on connect.
+const playerNames = new Map();
+
 function startServer(host = '0.0.0.0', port = 17005) {
 	if (server) return console.log("[TerraTogether] Server already running.");
 
@@ -50,6 +53,18 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						broadcast({ type: "actor_fx", id: playerId, actorFx: msg.actorFx }, socket);
 						break;
 
+					case "profile":
+						playerNames.set(playerId, msg.username);
+						clientsSockets.get(socket).username = msg.username;
+						// Tell everyone else who just connected...
+						broadcast({ type: "player_profile", id: playerId, username: msg.username }, socket);
+						// ...and tell the newcomer about everyone already here.
+						for (const [id, username] of playerNames) {
+							if (id != playerId)
+								send(socket, { type: "player_profile", id, username });
+						}
+						break;
+
 					case "join_map":
 						broadcast({ type: "join_map", id: playerId, map: msg.map }, socket);
 						for (const [id, state] of playerData) {
@@ -70,6 +85,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		socket.on("close", () => {
 			clientsSockets.delete(socket);
 			playerData.delete(playerId);
+			playerNames.delete(playerId);
 			console.log(`Player ${playerId} disconnected. Total: Disconnect`);
 			broadcast({ type: "player_left", id: playerId });
 		});
@@ -77,6 +93,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		socket.on("error", (err) => {
 			clientsSockets.delete(socket);
 			playerData.delete(playerId);
+			playerNames.delete(playerId);
 			console.log(`Player ${playerId} crashed. Reason: ${err}`);
 			broadcast({ type: "player_left", id: playerId });
 		});

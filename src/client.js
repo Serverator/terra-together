@@ -14,9 +14,11 @@ let client = null;
 let playerId = null;
 
 const playerActors = new Map();
+const playerNames = new Map();
 
 window.terraTogether ??= {};
 window.terraTogether.playerActors = playerActors;
+window.terraTogether.playerNames = playerNames;
 
 const playerUpdates = new Map();
 const playerActions = new Map();
@@ -427,6 +429,12 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 				case "welcome":
 					console.log("[TT Client] Connected to the server");
 					playerId = msg.id;
+					// Username is sent exactly once per connection, not with every update.
+					send({ type: "profile", username: config?.client?.username ?? null });
+					break;
+
+				case "player_profile":
+					playerNames.set(msg.id, msg.username);
 					break;
 
 				case "update":
@@ -449,6 +457,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 
 				case "player_left":
 					playerActions.set(msg.id, "HIDE");
+					playerNames.delete(msg.id);
 					console.log(`[TT Client] Player ${msg.id} left`);
 					break;
 
@@ -471,6 +480,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 		playerId = null;
 		playerActors.clear();
 		playerUpdates.clear();
+		playerNames.clear();
 	});
 
 	client.addEventListener("error", (err) => {
@@ -482,6 +492,7 @@ function joinServer(address = 'ws://127.0.0.1:17005') {
 		playerId = null;
 		playerActors.clear();
 		playerUpdates.clear();
+		playerNames.clear();
 	});
 }
 
