@@ -75,7 +75,7 @@ export function createModSettings() {
 		local: true,
 		label: { en_US: "Server Address" },
 		description: { en_US: "Host used when connecting to a multiplayer server." },
-		type: { default: "127.0.0.1", placeholder: "127.0.0.1" }
+		type: { default: "", placeholder: "127.0.0.1" }
 	});
 
 	createTextOption("tt-server-port", {
@@ -83,7 +83,7 @@ export function createModSettings() {
 		local: true,
 		label: { en_US: "Server Port" },
 		description: { en_US: "Port used when connecting to a multiplayer server." },
-		type: { default: "17005", maxLength: 5, placeholder: "17005" }
+		type: { default: "", maxLength: 5, placeholder: "17005" }
 	});
 
 	// === Hosting ===

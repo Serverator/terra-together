@@ -22,6 +22,8 @@ const buttonHandlers = new Map();
 
 let registered = false;
 
+g.ColorDecorator.WHITE = new g.ColorDecorator(g.FONT_COLOR.WHITE);
+
 // ───────────────────────────── data model ─────────────────────────────
 
 class OptionText extends g.Option {
@@ -86,11 +88,11 @@ class OptionTextGui extends g.OptionTypeGui {
 		this.onKeyDown = this.onKeyDown.bind(this);
 		this.onWindowMouseDown = this.onWindowMouseDown.bind(this);
 
-		this.background = new g.ColorGui(new g.Color("#2b2826"));
+		this.background = new g.ColorGui(new g.Color("#00000000"));
 		this.background.setAlign(ALIGN_X.CENTER, ALIGN_Y.CENTER);
 		this.addChild(this.background);
 
-		this.text = new g.TextGui("", { size: g.FONT_SIZE.MEDIUM });
+		this.text = new g.TextGui("", { size: g.FONT_SIZE.LARGE });
 		this.text.setAlign(ALIGN_X.CENTER, ALIGN_Y.CENTER);
 		this.text.setPos(0, -1);
 		this.addChild(this.text);
@@ -121,7 +123,7 @@ class OptionTextGui extends g.OptionTypeGui {
 		if (this.editing) {
 			const caret = this.caretOn ? "|" : " ";
 			this.text.setText(this.editText.slice(0, this.caret) + caret + this.editText.slice(this.caret));
-			this.text.setDecorator(this.focused ? g.ColorDecorator.GREEN : g.ColorDecorator.MENU);
+			this.text.setDecorator(this.focused ? g.ColorDecorator.YELLOW : g.ColorDecorator.WHITE);
 			return;
 		}
 		const value = g.g_options.get(this.key);
@@ -131,7 +133,7 @@ class OptionTextGui extends g.OptionTypeGui {
 		}
 		else {
 			this.text.setText(String(value));
-			this.text.setDecorator(g.ColorDecorator.MENU);
+			this.text.setDecorator(g.ColorDecorator.WHITE);
 		}
 	}
 
