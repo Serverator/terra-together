@@ -1,13 +1,5 @@
-// Terra Together - player nameplates.
-//
-// Rendered with the game's own Gui/TextGui (font system) so the labels go
-// through the GUI renderer. Each label is anchored to the character's (stable)
-// collision-box center and lifted above the head, then positioned with
-// hook.transformToMapPos() -- the same approach world HUD elements and NPC
-// dialogue use.
-//
-// The player id -> actor / username data lives in client.js and is shared via
-// `window.terraTogether`.
+// Player nameplates, drawn with the game's Gui/TextGui and positioned above each
+// character via hook.transformToMapPos(). Actor/username data comes from client.js.
 
 const Vec3 = terra.export.Vec3;
 
@@ -19,8 +11,7 @@ const NAMEPLATE_OUTLINE = terra.export.FONT_OUTLINE.ON;
 const NAMEPLATE_FONT_ALIGN = terra.export.FONT_ALIGN.CENTER;
 const NAMEPLATE_HEAD_OFFSET = 0.3;
 
-// Radio index -> scale. Order must match the "Nameplate Scale" option list
-// (Small / Normal / Large) in settings.js.
+// Radio index -> scale; must match the "Nameplate Scale" list in settings.js.
 const NAMEPLATE_SCALES = [0.5, 1.0, 1.5];
 const NAMEPLATE_SCALE_DEFAULT = 1.0;
 
@@ -40,8 +31,7 @@ function getNameplateText(name) {
 	return trimmed === "" ? null : trimmed;
 }
 
-// World position just above the character, based on the stable collision box
-// (not the animated head bone, which bobs while walking).
+// Just above the head, from the stable collision box (not the bobbing head bone).
 function getNameplateHeadPos(actor) {
 	const core = actor?.core;
 	if (!core) return null;

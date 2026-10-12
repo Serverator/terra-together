@@ -23,8 +23,7 @@ window.terraTogether.playerNames = playerNames;
 const playerUpdates = new Map();
 const playerActions = new Map();
 
-// All configuration lives in the in-game options (Options > Mods tab); there is
-// no config.json.
+// All config lives in the in-game options (Options > Mods tab); there is no config.json.
 function getSetting(key, fallback) {
 	const value = terra.export.g_options?.get(key);
 	return (value === undefined || value === null || value === "") ? fallback : value;
@@ -47,12 +46,10 @@ let fxStopQueue = [];
 let soundQueue = [];
 let windboxQueue = [];
 
-// Every Sound resource we have seen, keyed by its buffer path. Sounds are
-// serialized by path, then re-resolved and replayed on the peer.
+// Sound resources by buffer path; sounds sync by path and re-resolve on the peer.
 const soundRegistry = new Map();
 
-// >0 while inside a sound source that is intentionally NOT synced here.
-// (movement sounds are replayed through actorFx)
+// >0 while inside a sound source intentionally not synced here (see actorFx).
 let soundSyncSuppress = 0;
 
 let fxSyncId = 0;
@@ -63,8 +60,7 @@ let soundStopQueue = [];
 const activeSyncedSounds = new Map();
 
 // Effects aligned to a figure-indexed node fall back to the entity center when
-// the peer's figure lacks that index (ViewCmp.getNodeAlignPos). Clamp to the
-// base figure so such effects land on the node (hand/weapon) instead.
+// the peer's figure lacks that index; clamp to the base figure so they land on it.
 function clampAlignToFigure(ent, align) {
 	if (!align) return align;
 	const getEntAlign = terra.export.getEntAlign;
@@ -97,8 +93,7 @@ function registerSound(sound) {
 	return sound;
 }
 
-// Only world/gameplay sounds belong in the multiplayer mix. Menu/UI, music and
-// ambience are single-client (e.g. `loadout-switch-01` is forced onto the UI bus).
+// Only world/gameplay sounds sync; Menu/UI, music and ambience are single-client.
 function isSyncableBus(type) {
 	const bus = type?.bus;
 	return !bus || (bus !== "UI" && bus !== "MUSIC" && bus !== "AMBIENCE");
@@ -113,7 +108,7 @@ class MultiplayerClient extends terra.export.Observable {
 		sendPlayerData();
 	}
 
-	// When entering new map clean up the reference
+	// Clear peer actors when entering a new map.
 	onGameMapLoad() {
 		stopAllActorSounds();
 		playerActors.clear();
@@ -126,7 +121,7 @@ class MultiplayerClient extends terra.export.Observable {
 		}
 	}
 
-	// Create second actor on map start
+	// Join the server and hook the player's actorFx on map start.
 	onGameMapStart() {
 		if (!client)
 			joinServer();
@@ -168,7 +163,6 @@ class MultiplayerClient extends terra.export.Observable {
 		terra.export.g_scene.observers.push(this);
 		terra.export.g_options.observers.push(this);
 
-		// Add observer to window focus change
 		let focusChange = this.onFocusChange;
 		let originalsetWindowFocus = terra.export.System.prototype.setWindowFocus;
 		terra.export.System.prototype.setWindowFocus = function (...args) {
@@ -177,7 +171,7 @@ class MultiplayerClient extends terra.export.Observable {
 			return result;
 		};
 
-		// Send windbox data
+		// Sync windbox knockback the player receives.
 		let originalStart = terraTogether.steps.SPAWN_WINDBOX.prototype.start;
 		terraTogether.steps.SPAWN_WINDBOX.prototype.start = function (...args) {
 			let context = args[0];
@@ -207,14 +201,13 @@ class MultiplayerClient extends terra.export.Observable {
 			syncHooksInstalled = true;
 
 			// --- Effects ------------------------------------------------------
-			// Spawn: tag every player-owned fx with a sync id and send its descriptor.
+			// Spawn: tag player-owned fx with a sync id and send its descriptor.
 			let originalFxStart = terra.export.FxEntity.prototype.start;
 			terra.export.FxEntity.prototype.start = function (...args) {
 				this._ttFxStopSent = false;
 
-				// Player-owned = attached to the player, or spawned by one of the
-				// player's action/step contexts (SPAWN_FX sets stepContext to the
-				// action owner, so ground impacts count too).
+				// Player-owned = attached to the player or spawned by a player step
+				// (SPAWN_FX), so ground impacts count too.
 				const owner = this.stepContext?.entity;
 				const targetEnt = this.target?.getFollowEntity?.() ?? this.target?.entity ?? null;
 				const onPlayer = isPlayerEntity(targetEnt);
@@ -224,17 +217,13 @@ class MultiplayerClient extends terra.export.Observable {
 					let fx = {
 						id,
 						effect: this.effect?.cacheKey,
-						// NOTE: -1 means an infinite effect (e.g. the respawn/teleport hide
-						// fade, spawned via startRespawn -> fx.start(-1)). Sending it through
-						// as-is makes the peer run that fade forever, leaving its figure fully
-						// transparent (character invisible). Coerce infinite effects to a
-						// finite duration so the replayed fade finishes and clears.
-						duration: args[0] == -1 ? 0 : args[0] ?? 0,
+						// -1 means "loop forever" and must reach the peer unchanged; infinite
+						// effects are torn down via the stop() hook below.
+						duration: args[0] ?? 0,
 						delay: this.delay,
 						group: this.attachGroup,
 						looped: this.looped,
-						// Raw numeric values: alignments can be bit-encoded with a figure
-						// index (addFigureToEntAlign), so names don't round-trip.
+						// Raw numeric values: alignments can carry a bit-encoded figure index.
 						part: this.part,
 						alignment: this.target.alignment
 					};
@@ -243,8 +232,7 @@ class MultiplayerClient extends terra.export.Observable {
 						fx.offset = this.target.posOrOffset.v;
 					if (terra.export.TARGET_RES_TYPE && this.target?.type == terra.export.TARGET_RES_TYPE.ENT_REL_OFFSET)
 						fx.rel = true;
-					// Effects that are not attached to the player (e.g. ground
-					// impacts) keep their world position at spawn time.
+					// Unattached effects (e.g. ground impacts) keep their world position at spawn.
 					if (!onPlayer) {
 						const v = new Vec3();
 						if (this.target?.get(v))
@@ -261,10 +249,24 @@ class MultiplayerClient extends terra.export.Observable {
 				return originalFxStart.apply(this, args);
 			};
 
-			// Despawn: `stop()` is the real teardown path. Looped/infinite fx end
-			// through subscription-end / spawner-hide / clearList -> stop(), none of
-			// which go through the static clearList. Hooking stop() is what makes
-			// looped effects actually disappear on the peers too.
+			// Enter/exit appear/disappear fx fade the target's figure. Each client plays
+			// its own, so they must NOT sync (a replayed fade can leave the peer invisible).
+			let originalInitHideShowChange = terra.export.FxEntity.prototype.initHideShowChange;
+			terra.export.FxEntity.prototype.initHideShowChange = function (...args) {
+				if (this._ttFxId) {
+					for (let i = globalFxQueue.length - 1; i >= 0; i--) {
+						if (globalFxQueue[i].id === this._ttFxId) {
+							globalFxQueue.splice(i, 1);
+							break;
+						}
+					}
+					this._ttFxId = 0;
+				}
+				return originalInitHideShowChange.apply(this, args);
+			};
+
+			// Despawn: stop() is the real teardown path for looped/infinite fx, so
+			// hooking it removes them on peers too.
 			let originalFxStop = terra.export.FxEntity.prototype.stop;
 			terra.export.FxEntity.prototype.stop = function (...args) {
 				if (this._ttFxId && !this._ttFxStopSent) {
@@ -275,9 +277,8 @@ class MultiplayerClient extends terra.export.Observable {
 				return originalFxStop.apply(this, args);
 			};
 
-			// Sounds emitted from inside an effect are already replayed on the peer
-			// by the effect itself (the ghost runs the same effect timeline), so we
-			// must NOT also sync them -> otherwise every effect sound doubles.
+			// Effect sounds are already replayed by the peer's effect, so don't sync
+			// them here (they'd double).
 			let originalFxDeferredUpdate = terra.export.FxEntity.prototype.deferredUpdate;
 			terra.export.FxEntity.prototype.deferredUpdate = function (...args) {
 				soundSyncSuppress++;
@@ -288,7 +289,7 @@ class MultiplayerClient extends terra.export.Observable {
 			// --- Sounds -------------------------------------------------------
 			const Sound = terra.file.sound?.Sound;
 			if (Sound?.prototype?.play) {
-				// index every Sound resource that gets loaded
+				// Index every Sound resource as it loads.
 				let originalSoundFetch = Sound.fetch;
 				Sound.fetch = function (...args) {
 					return registerSound(originalSoundFetch.apply(this, args));
@@ -298,10 +299,8 @@ class MultiplayerClient extends terra.export.Observable {
 				Sound.prototype.play = function (...args) {
 					const playback = originalSoundPlay.apply(this, args);
 					registerSound(this);
-					// `targetRes.entity` is the entity the playback is bound to.
-					// PLAY_SOUND steps default to target SELF (= action owner = player).
-					// Fall back to the ambient update context so sounds with global /
-					// offset positions (weapon whooshes, ground impacts) are caught too.
+					// Playback is bound to targetRes.entity (PLAY_SOUND defaults to the
+					// player); fall back to the ambient context for global/offset sounds.
 					const ctxEnt = terra.export.g_gState?.contextEntity?.ent;
 					if (playback) {
 						const tied = client && !soundSyncSuppress && this.path &&
@@ -353,7 +352,7 @@ class MultiplayerClient extends terra.export.Observable {
 				};
 			}
 
-			// Stop sync: a synced (possibly looping) sound being stopped must stop on peers.
+			// A synced sound being stopped must stop on peers.
 			const Playback = terra.file.playback?.Playback;
 			if (Playback?.prototype?.stop) {
 				let originalPlaybackStop = Playback.prototype.stop;
@@ -409,6 +408,7 @@ function updatePlayerState(id, state) {
 	let scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 	let lastUpdate = playerUpdates.get(id);
 
+	// If the previous update hasn't been consumed yet, carry its one-shot events over.
 	if (lastUpdate && scene == "RUNNING") {
 		state.globalFx ??= [];
 		state.fxStops ??= [];
@@ -510,8 +510,7 @@ function leaveServer() {
 	client.close();
 }
 
-// Clean up local multiplayer state after the connection drops. If we were
-// actually connected, send the player back to the main menu.
+// Clean up local state after a disconnect; if we were connected, return to the title.
 function onDisconnected() {
 	for (const player of playerActors.keys()) {
 		playerActions.set(player, "HIDE");
@@ -537,10 +536,9 @@ function send(data) {
 }
 
 function createPlayerActor(id) {
-	// We are creating new Actor (NPC)
+	// A peer is represented by a TerraActor (NPC) added to the world.
 	var actor = new terra.export.TerraActor();
 
-	// Inserts that entity in the world
 	terra.export.g_gState.addEntity(actor, true, false);
 
 	if (actor.actor)
@@ -558,10 +556,8 @@ function createPlayerActor(id) {
 	actor.actorExt.actorFx.dust = terra.export.g_fxConnect.effects.dust.entries.ActorM;
 	actor.actorExt.actorFx.sound = terra.export.g_fxConnect.sounds.actor.entries.Cloth1;
 
-	// Client-side stepping sound/fx is really inconsistent for some reason
-	// So here we disable `onActorFx` to disable that client-side behaviour for player actors
-	// Getting them from the server is more consistent, but visual fx still gets lost sometimes
-	// TODO: Find out why and properly implement
+	// Client-side step sound/fx is inconsistent, so suppress it for peer actors and
+	// replay from the server instead. TODO: visual fx can still get lost.
 	let originalOnPostMove = actor.actor.onPostMove;
 	actor.actor.onPostMove = function (...args) {
 		const originalOnActorFx = this.fxCallback?.onActorFx;
@@ -588,6 +584,7 @@ function createPlayerActor(id) {
 	return actor;
 }
 
+// Apply a state snapshot to a peer actor, creating it on first sight.
 function movePlayerActor(id, state) {
 	if (!state)
 		return;
@@ -605,6 +602,8 @@ function movePlayerActor(id, state) {
 		return;
 	}
 
+	// Show/hide transitions are local and unsynced (see initHideShowChange);
+	// justCreated skips the appear fx before the actor has any data.
 	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path) {
 		actor.core?.hide(justCreated);
 		return;
@@ -811,6 +810,7 @@ function stopAllActorSounds() {
 }
 
 
+// Mirror the sender's equipped weapon (figure + fade fx) onto the peer actor.
 function updateWeaponState(actor, newWeapon) {
 	actor.terraTogether.weapon ??= {};
 	let weaponState = actor.terraTogether.weapon;
@@ -864,7 +864,7 @@ function sendPlayerData(forceSend = false, scene = null) {
 	if (!scene)
 		scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 
-	// No not send current state if not in game
+	// Don't send state when not in game.
 	if (scene == "INIT" || scene == "TITLE" || scene == "LOADING" || g_player.entity == null)
 		return;
 	
@@ -896,7 +896,7 @@ function sendPlayerData(forceSend = false, scene = null) {
 	state.animation = g_player.entity?.view?.figState?.anim?.name || "idle";
 	state.anim_time = g_player.entity?.view?.figState?.time;
 
-	// Copy the look direcition
+	// Copy the look direction
 	state.face_dir = g_player.entity?.actor?.face?.clone().v;
 
 	let weapon = g_player.entity?.player?.weapon;

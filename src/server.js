@@ -119,7 +119,7 @@ function stopServer() {
 	server = null;
 }
 
-/** True while a server is running (or starting up) on this machine. */
+// True while a server is running (or starting up) on this machine.
 function isHosting() {
 	return !!server;
 }

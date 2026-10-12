@@ -1,35 +1,5 @@
-// Adds two new option ("setting") types to the game's Options menu:
-//
-//   TEXT   - a focusable/editable text field. Its value is a plain string and
-//            behaves like every other option (persists via the option/storage
-//            system, fires OPTION_EVENT.CHANGED, shows up in the info panel).
-//   BUTTON - a clickable button. Pressing it runs a JS callback supplied by a
-//            mod, so anything a mod can do can be triggered from a setting.
-//
-// The game registers option types in two places, both keyed by a string type:
-//   * OptionTypeBuilder    -> the data model   (engine/options/option.js)
-//   * OptionGuiTypeBuilder -> the menu renderer (…/options/types/option-type-base.js)
-// Neither is in the game's OPTION_TYPE enum, so we add both sides ourselves and
-// register them here. Registration is idempotent.
-//
-// Usage from a mod (usually inside `onLoopStart`):
-//
-//   import { createTextOption, createButtonOption } from "./option-types.js";
-//
-//   createTextOption("tt-username", {
-//       category: "MODS",
-//       local: true,
-//       label: { en_US: "Player Name" },
-//       description: { en_US: "Sent to the server." },
-//       type: { default: "Player", maxLength: 24, placeholder: "Anonymous" },
-//   });
-//
-//   createButtonOption("tt-reconnect", {
-//       category: "MODS",
-//       label: { en_US: "Reconnect" },
-//       description: { en_US: "Reconnects using the settings above." },
-//       type: { text: { en_US: "Reconnect" }, width: 140 },
-//   }, () => connectUsingOptions());
+// Adds two option types to the game's Options menu: TEXT (editable string) and
+// BUTTON (clickable, runs a mod callback). Each needs a data model and a renderer.
 
 export {
 	registerOptionTypes,
@@ -47,8 +17,7 @@ const g = terra.export;
 const ALIGN_X = g.GUI_ALIGN_X;
 const ALIGN_Y = g.GUI_ALIGN_Y;
 
-// Callbacks for BUTTON options, keyed by option key. A mod can either pass the
-// callback to createButtonOption() or register it later with setButtonHandler().
+// BUTTON callbacks by option key; set at creation or via setButtonHandler().
 const buttonHandlers = new Map();
 
 let registered = false;
@@ -84,8 +53,7 @@ class OptionButton extends g.Option {
 		super(key, data);
 		this.buttonWidth = this.config.width || 0;
 		this.onPress = null;
-		// Optional predicate: () => boolean. When it returns false the button is
-		// rendered inactive and cannot be pressed. Assign it after creation.
+		// Optional predicate () => boolean; when false the button is disabled.
 		this.isEnabled = null;
 	}
 	getDefaultText() {
@@ -176,11 +144,9 @@ class OptionTextGui extends g.OptionTypeGui {
 		this.editing = true;
 		this.caretOn = true;
 		this.caretTimer = 0;
-		// Freeze menu navigation and capture keystrokes before the game's own
-		// window-level (bubble phase) keydown handler sees them.
+		// Capture keystrokes (bubble phase) before the game's menu handler does.
 		g.g_input.ignoreKeyboard = true;
-		// Drop any actions still held (e.g. the confirm press that opened editing)
-		// so they don't repeat while typing.
+		// Drop held actions (e.g. the confirm press) so they don't repeat while typing.
 		g.g_input.clearActions();
 		window.addEventListener("keydown", this.onKeyDown, true);
 		window.addEventListener("mousedown", this.onWindowMouseDown, true);
@@ -320,9 +286,7 @@ class OptionButtonGui extends g.OptionTypeGui {
 		this.refreshEnabled();
 	}
 
-	// Re-reads the option's enabled predicate and applies it to the button, both
-	// visually (inactive/grayscale) and behaviourally (the interact system refuses
-	// to activate an inactive gui, playing the "blocked" sound instead).
+	// Apply the enabled predicate visually and behaviourally (plays "blocked" when off).
 	refreshEnabled() {
 		const enabled = this.option.getEnabled();
 		this.button.setActive(enabled);
@@ -383,7 +347,7 @@ OptionButtonGui.type = "BUTTON";
 
 // ───────────────────────────── helpers ─────────────────────────────
 
-/** Registers both halves of the new option types. Safe to call repeatedly. */
+// Registers both halves of the new option types. Safe to call repeatedly.
 function registerOptionTypes() {
 	if (registered)
 		return;
@@ -398,10 +362,7 @@ function registerOptionTypes() {
 			g.g_options.addType(type);
 }
 
-/**
- * Registers a button handler by option key. Useful when the option is created
- * elsewhere (e.g. from data) or when the callback is defined later.
- */
+// Registers a button handler by option key (for callbacks defined later).
 function setButtonHandler(key, handler) {
 	buttonHandlers.set(key, handler);
 }
@@ -415,17 +376,14 @@ function addSetting(key, option) {
 	return option;
 }
 
-/** Creates a TEXT setting. `data.type` may carry `default`, `maxLength`, `placeholder`. */
+// Creates a TEXT setting. `data.type` may carry `default`, `maxLength`, `placeholder`.
 function createTextOption(key, data) {
 	registerOptionTypes();
 	data.type = { ...(data.type || {}), type: "TEXT" };
 	return addSetting(key, g.OptionTypeBuilder.build("TEXT", key, data));
 }
 
-/**
- * Creates a BUTTON setting. `onPress(option, key)` runs when the button is
- * pressed; omit it and call setButtonHandler(key, fn) instead.
- */
+// Creates a BUTTON setting. `onPress(option, key)` runs on press.
 function createButtonOption(key, data, onPress) {
 	registerOptionTypes();
 	data.type = { ...(data.type || {}), type: "BUTTON" };

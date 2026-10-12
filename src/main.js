@@ -36,8 +36,7 @@ class Multiplayer extends terra.export.Observable {
 			}
 		}
 
-		// Apply on change, and whenever the options are (re)loaded. The latter is
-		// what makes a stored value take effect on startup, not only when toggled.
+		// Apply on change and on (re)load; the latter makes stored values apply at startup.
 		const OPTION_EVENT = terra.export.OPTION_EVENT;
 		if (key === "tt-always-focused"
 			|| event === OPTION_EVENT.SETTINGS_UPDATED
@@ -66,8 +65,7 @@ class Multiplayer extends terra.export.Observable {
 		// Build the settings category and its tab.
 		createModSettings();
 
-		// Baseline: apply the stored Always Focused value as soon as the game
-		// starts. (A load also re-applies it via SETTINGS_UPDATED.)
+		// Apply the stored Always Focused value at startup (a load re-applies it too).
 		this.applyAlwaysFocused();
 	}
 }

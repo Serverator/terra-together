@@ -1,23 +1,15 @@
-// Settings-menu glue for "Terra Together".
-//
-// Everything that plugs the mod into the game's Options menu lives here:
-//   * the mod's options category (createModSettings), and
-//   * the category's tab in the Options menu (SettingsTab).
-// main.js keeps the multiplayer logic and just wires these in.
+// Options-menu glue: the mod's settings category (createModSettings) and its tab
+// (SettingsTab). main.js wires these in.
 
 import { createTextOption, createButtonOption } from "./option-types.js";
 import * as server from "./server.js";
 import { createSkinSetting } from "./skin.js";
 
-// The options category. Doubles as the Options-menu tab key, so the settings
-// below and the tab all use the same string.
+// Options category; also used as the Options-menu tab key.
 export const CATEGORY = "MULTIPLAYER";
 export const TAB_LABEL = "Multiplayer";
 
-/**
- * Adds the mod's settings to its category. Call once at startup, before the
- * Options menu builds its lists.
- */
+// Adds the mod's settings. Call once at startup, before Options builds its lists.
 export function createModSettings() {
 	let g_options = terra.export.g_options;
 
@@ -135,20 +127,14 @@ export function createModSettings() {
 	g_options.settings["tt-hide-party"] = hideParty;
 }
 
-/**
- * Adds the mod's tab to the game's Options menu. Registered as an addon so it
- * runs after the menu has been built.
- */
+// Adds the mod's tab to the Options menu (as an addon, after the menu is built).
 export class SettingsTab extends terra.export.Observable {
 	onLoopStart() {
-		// Create the category tab
 		let mainMenu = terra.export.g_gui.hooks.find(x => x.gui?.constructor.name == "MainMenu").gui;
 		let optionsMenu = Object.entries(mainMenu.submenus).map(x => x[1].menu).find(x => x.constructor.name == "OptionsMenu");
 		optionsMenu.tabs.addTab(CATEGORY, { label: TAB_LABEL, icon: "lore-type-PEOPLE" });
 
-		// Register the tab's title under "gui.menu.options.tabs.titles.<key>".
-		// The game (OptionsMenu.updateRestoreButton) looks the tab title up there
-		// for the "Restore <tab>" button; without it you get "ENOENT: <key>".
+		// Register the tab title so OptionsMenu's "Restore <tab>" lookup doesn't ENOENT.
 		let localeEntry = { en_US: TAB_LABEL };
 		localeEntry.get = () => { return TAB_LABEL; };
 		let tabTitles = terra.export.g_label?.labelFiles?.gui?.labels?.menu?.sub?.options?.sub?.tabs?.sub?.titles?.sub;

@@ -2,9 +2,7 @@ export { createOption }
 
 import { registerOptionTypes } from "./option-types.js";
 
-/** Helper function to create new options in the game menu
-
-Should run in `onLoopStart` */
+// Creates a new option in the game menu. Should run in `onLoopStart`.
 function createOption(id, data, type) {
 	registerOptionTypes();
 
