@@ -132,8 +132,11 @@ export function createModSettings() {
 			const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
 			// Leave any existing connection before hosting (joinServer replaces it anyway).
 			client.disconnect();
-			server.startServer("0.0.0.0", port);
-			client.joinServer(undefined, { force: true });
+			// Only join once the server is actually listening: joining immediately races
+			// the bind, so the first attempt is refused and logs a connection error.
+			server.startServer("0.0.0.0", port)
+				.then(() => client.joinServer(undefined, { force: true }))
+				.catch(() => { /* startServer already logged the failure */ });
 		}
 	});
 	// Enabled to stop hosting, or to start hosting only when not already connected

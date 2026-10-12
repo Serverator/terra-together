@@ -13,13 +13,24 @@ const playerData = new Map();
 const playerNames = new Map();
 
 function startServer(host = '0.0.0.0', port = 17005) {
-	if (server) return console.log("[TerraTogether] Server already running.");
+	if (server) return Promise.resolve();
 
 	hostPort = port;
 	server = new WebSocketServer({ port, host });
 
+	// Resolves once the socket is actually accepting connections. Callers (the
+	// host button) must await this before connecting a client, otherwise the first
+	// join races the bind and gets refused.
+	let readyResolve;
+	let readyReject;
+	const ready = new Promise((resolve, reject) => {
+		readyResolve = resolve;
+		readyReject = reject;
+	});
+
 	server.on('listening', () => {
 		console.log(`[TerraTogether] Server listening on ws://${host}:${port}`);
+		readyResolve();
 	});
 
 	server.on('connection', (socket) => {
@@ -105,13 +116,16 @@ function startServer(host = '0.0.0.0', port = 17005) {
 	server.on("error", (err) => {
 		console.error(`Failed to start server: ${err.message}`);
 		server = null;
+		readyReject(err);
 	});
 
 	server.on("close", () => {
-		console.error(`[TT Server] Server closed`);
+		console.log(`[TT Server] Server closed`);
 		clientsSockets.clear();
 		server = null;
 	});
+
+	return ready;
 }
 
 function stopServer() {

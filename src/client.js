@@ -537,10 +537,13 @@ function joinServer(address, options = {}) {
 		onDisconnected();
 	};
 
-	const onError = (err) => {
+	const onError = () => {
 		if (client !== ws) return;
 		connecting = false;
-		console.error("Connection error:", err.message);
+		// A WebSocket 'error' event is a plain Event with no message, so logging
+		// err.message just prints "undefined". A hosted connection recovers through
+		// onDisconnected()'s forced retry.
+		console.error("[TT Client] Connection error (server unreachable)");
 		onDisconnected();
 	};
 
