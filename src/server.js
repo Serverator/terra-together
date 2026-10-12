@@ -29,11 +29,8 @@ function startServer(host = '0.0.0.0', port = 17005) {
 
 		send(socket, { type: "welcome", id: playerId });
 
-		for (const [id, state] of playerData) {
-			if (state.scene == "MENU" && playerId != id && msg.map == state.map)
-				send(socket, { type: "update", id, state });
-		}
-
+		// Existing players broadcast their state every frame, and the "join_map"
+		// handler syncs on map entry, so no extra state sync is needed here.
 		broadcast({ type: "player_joined", id: playerId }, socket);
 
 		socket.on('message', (raw) => {
@@ -48,6 +45,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						break;
 
 					case "scene_changed":
+						// Remember the scene so stale state can't resurrect a player who left
+						// the world (e.g. for clients that join the map later).
+						if (playerData.has(playerId))
+							playerData.get(playerId).scene = msg.scene;
 						broadcast({ type: "scene_changed", id: playerId, scene: msg.scene }, socket);
 						break;
 

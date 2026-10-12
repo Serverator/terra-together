@@ -83,6 +83,20 @@ class WebSocketConnection extends EventEmitter {
 
 			this.buffer = this.buffer.slice(offset + payloadLen);
 
+			if (opcode === 0x8) {
+				// Peer requested close: acknowledge it and tear the socket down so both
+				// sides actually get their 'close' event (otherwise the handshake hangs).
+				this.close();
+				return;
+			}
+			if (opcode === 0x9) {
+				// Ping: reply with a pong carrying the same payload.
+				this.socket.write(Buffer.concat([Buffer.from([0x8A, payload.length]), payload]));
+				continue;
+			}
+			if (opcode === 0xA)
+				continue;
+
 			if (opcode === 0x1)
 				this.emit('message', payload.toString('utf8'));
 		}

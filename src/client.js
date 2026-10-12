@@ -162,10 +162,15 @@ class MultiplayerClient extends terra.export.Observable {
 	}
 
 	onFocusChange(focused) {
-		if (!focused) {
-			send({ type: "scene_changed", scene: "PAUSED" });
-			sendPlayerData(true, "PAUSED");
-		}
+		if (focused)
+			return;
+		// Only meaningful while in a world: at the title the character is already
+		// unloaded, and a focus change must not re-show it for other players.
+		const scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
+		if (scene != "RUNNING")
+			return;
+		send({ type: "scene_changed", scene: "PAUSED" });
+		sendPlayerData(true, "PAUSED");
 	}
 
 	onLoopStart() {
@@ -499,9 +504,11 @@ function joinServer(address, options = {}) {
 					break;
 
 				case "scene_changed":
+					// Title screen: unload this player's character for everyone else.
 					if (msg.scene == "LOADING" || msg.scene == "TITLE") {
 						playerActions.set(msg.id, "HIDE");
 					}
+					// In-game menu / window focus lost: keep them in place but frozen.
 					if (msg.scene == "MENU" || msg.scene == "PAUSED") {
 						playerActions.set(msg.id, "PAUSE");
 					}
@@ -565,8 +572,12 @@ function detachClient() {
 
 // Drop all per-connection state. Shared by detachClient() and onDisconnected().
 function clearPeers() {
-	for (const player of playerActors.keys()) {
-		playerActions.set(player, "HIDE");
+	// Hide any existing peer actors before dropping references, otherwise they stay
+	// rendered in the world as untracked orphans.
+	for (const actor of playerActors.values()) {
+		stopActorSounds(actor);
+		setActorTimeFactor(actor, 1);
+		actor.core?.hide();
 	}
 	playerActors.clear();
 	playerUpdates.clear();
@@ -598,21 +609,15 @@ function isConnecting() {
 	return connecting;
 }
 
-// Clean up local state after a disconnect; if we were connected, return to the title.
+// Clean up local state after a disconnect. The player is never moved out of their
+// current scene: a dropped connection just clears the peers until they reconnect.
 function onDisconnected() {
 	if (!client && !connected)
 		return;
 	client = null;
 	clientHandlers = null;
-	const wasConnected = connected;
 	connected = false;
 	clearPeers();
-
-	if (wasConnected) {
-		const scene = terra.export.g_scene;
-		if (scene && !scene.isTitle())
-			scene.goToTitle();
-	}
 
 	// A hosted connection is mandatory: rejoin our own server while it is up.
 	if (forced && isHosting()) {
@@ -1050,11 +1055,14 @@ function updateOtherPlayers() {
 			const actor = playerActors.get(id);
 			if (actor) {
 				stopActorSounds(actor);
+				// The in-game menu freezes peer actors (time factor 0), which also
+				// freezes the hide fade. Restore normal speed so it can play.
+				setActorTimeFactor(actor, 1);
 				actor.core?.hide();
 			}
 		} else if (action == "PAUSE") {
 			let actor = playerActors.get(id);
-			if (!actor) return;
+			if (!actor) continue;
 
 			setActorTimeFactor(actor, 0);
 		}
