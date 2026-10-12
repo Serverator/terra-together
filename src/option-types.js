@@ -31,6 +31,11 @@ class OptionText extends g.Option {
 		super(key, data);
 		this.maxLength = this.config.maxLength || 0;
 		this.placeholder = g.LangEntry.getText(this.config.placeholder, true) || "";
+		// Optional predicate () => boolean; when false the field cannot be edited.
+		this.isEnabled = null;
+	}
+	getEnabled() {
+		return typeof this.isEnabled === "function" ? !!this.isEnabled() : true;
 	}
 	get default() {
 		const value = this.config.default;
@@ -84,6 +89,7 @@ class OptionTextGui extends g.OptionTypeGui {
 		this.caretOn = true;
 		this.caretTimer = 0;
 		this.focused = false;
+		this.lastEnabled = null;
 
 		this.onKeyDown = this.onKeyDown.bind(this);
 		this.onWindowMouseDown = this.onWindowMouseDown.bind(this);
@@ -108,13 +114,28 @@ class OptionTextGui extends g.OptionTypeGui {
 	}
 
 	update() {
-		if (!this.editing)
+		if (this.editing) {
+			// Blink the caret roughly twice a second.
+			this.caretTimer += g.g_tick.gui;
+			if (this.caretTimer >= 0.5) {
+				this.caretTimer = 0;
+				this.caretOn = !this.caretOn;
+				this.refresh();
+			}
 			return;
-		// Blink the caret roughly twice a second.
-		this.caretTimer += g.g_tick.gui;
-		if (this.caretTimer >= 0.5) {
-			this.caretTimer = 0;
-			this.caretOn = !this.caretOn;
+		}
+		// Reflect enable/disable changes (e.g. while connected) live.
+		this.refreshEnabled();
+	}
+
+	getEnabled() {
+		return typeof this.option.getEnabled === "function" ? this.option.getEnabled() : true;
+	}
+
+	refreshEnabled() {
+		const enabled = this.getEnabled();
+		if (enabled !== this.lastEnabled) {
+			this.lastEnabled = enabled;
 			this.refresh();
 		}
 	}
@@ -126,6 +147,7 @@ class OptionTextGui extends g.OptionTypeGui {
 			this.text.setDecorator(this.focused ? g.ColorDecorator.YELLOW : g.ColorDecorator.WHITE);
 			return;
 		}
+		const enabled = this.getEnabled();
 		const value = g.g_options.get(this.key);
 		if (value === undefined || value === null || value === "") {
 			this.text.setText(this.option.placeholder || "<empty>");
@@ -133,13 +155,17 @@ class OptionTextGui extends g.OptionTypeGui {
 		}
 		else {
 			this.text.setText(String(value));
-			this.text.setDecorator(g.ColorDecorator.WHITE);
+			this.text.setDecorator(enabled ? g.ColorDecorator.WHITE : g.ColorDecorator.GREY);
 		}
 	}
 
 	startEditing() {
 		if (this.editing)
 			return;
+		if (!this.getEnabled()) {
+			g.g_menuSFX.blocked();
+			return;
+		}
 		const value = g.g_options.get(this.key);
 		this.editText = (value === undefined || value === null) ? "" : String(value);
 		this.caret = this.editText.length;
@@ -230,6 +256,7 @@ class OptionTextGui extends g.OptionTypeGui {
 	}
 
 	onValidate() {
+		this.lastEnabled = this.getEnabled();
 		if (!this.editing)
 			this.refresh();
 	}
@@ -285,16 +312,31 @@ class OptionButtonGui extends g.OptionTypeGui {
 		this.button.setAlign(ALIGN_X.CENTER, ALIGN_Y.CENTER);
 		this.button.onButtonPress = () => this.press();
 		this.addChild(this.button);
+		this.lastEnabled = null;
+		this.lastText = null;
+		this.refreshEnabled();
+	}
+
+	// Called every frame while the menu is open so the button reflects live state.
+	update() {
 		this.refreshEnabled();
 	}
 
 	// Apply the enabled predicate visually and behaviourally (plays "blocked" when off).
+	// Cached so setActive()/setText() (which rebuild the text) only run on change.
 	refreshEnabled() {
 		const enabled = this.option.getEnabled();
-		this.button.setActive(enabled);
-		if (!enabled)
-			this.button.setPressed(false);
-		this.button.setText(this.option.getButtonText(), true);
+		if (enabled !== this.lastEnabled) {
+			this.lastEnabled = enabled;
+			this.button.setActive(enabled);
+			if (!enabled)
+				this.button.setPressed(false);
+		}
+		const text = this.option.getButtonText();
+		if (text !== this.lastText) {
+			this.lastText = text;
+			this.button.setText(text, true);
+		}
 	}
 
 	press() {

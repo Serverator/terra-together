@@ -1,8 +1,9 @@
-export { startServer, stopServer, send, broadcast, isHosting };
+export { startServer, stopServer, send, broadcast, isHosting, getHostPort };
 
 import { WebSocketServer } from "./ws.js";
 
 let server = null;
+let hostPort = 17005;
 const clientsSockets = new Map();
 
 // Server need to store current location of players to send to new players
@@ -14,6 +15,7 @@ const playerNames = new Map();
 function startServer(host = '0.0.0.0', port = 17005) {
 	if (server) return console.log("[TerraTogether] Server already running.");
 
+	hostPort = port;
 	server = new WebSocketServer({ port, host });
 
 	server.on('listening', () => {
@@ -122,6 +124,11 @@ function stopServer() {
 // True while a server is running (or starting up) on this machine.
 function isHosting() {
 	return !!server;
+}
+
+// Port the server is (or was last) listening on.
+function getHostPort() {
+	return hostPort;
 }
 
 

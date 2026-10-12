@@ -1,6 +1,7 @@
-export { joinServer, leaveServer, send }
+export { joinServer, leaveServer, disconnect, isConnected, isConnecting, send }
 
 import { skins } from "./skin.js";
+import { isHosting, getHostPort } from "./server.js";
 
 const { SCENE_STATE, SCENE_EVENT } = terra.file.sceneTypes;
 
@@ -10,8 +11,13 @@ const Vec3 = terra.export.Vec3;
 let lastScene = "INIT";
 
 let client = null;
+let clientHandlers = null;
 let playerId = null;
 let connected = false;
+let connecting = false;
+// True while the connection is pinned to our own hosted server (cannot be dropped
+// by the player; it follows hosting state instead).
+let forced = false;
 
 const playerActors = new Map();
 const playerNames = new Map();
@@ -35,6 +41,9 @@ function getUsername() {
 }
 
 function getServerUrl() {
+	// When hosting, the connection is pinned to our own server on localhost.
+	if (forced && isHosting())
+		return `ws://127.0.0.1:${getHostPort()}`;
 	const host = getSetting("tt-server-address", "127.0.0.1");
 	const port = getSetting("tt-server-port", 17005);
 	return `ws://${host}:${port}`;
@@ -124,7 +133,7 @@ class MultiplayerClient extends terra.export.Observable {
 	// Join the server and hook the player's actorFx on map start.
 	onGameMapStart() {
 		if (!client)
-			joinServer();
+			joinServer(undefined, { force: isHosting() });
 
 		playerActors.clear();
 		playerUpdates.clear();
@@ -435,16 +444,36 @@ function updatePlayerState(id, state) {
 	playerUpdates.set(id, state);
 }
 
-function joinServer(address) {
+function joinServer(address, options = {}) {
+	// Replace any existing connection (e.g. switching from a remote server to hosting).
+	if (client)
+		detachClient();
+
+	forced = !!options.force;
+	connecting = true;
 	address = address ?? getServerUrl();
-	client = new WebSocket(address);
 
-	client.addEventListener("open", () => {
+	let ws;
+	try {
+		ws = new WebSocket(address);
+	}
+	catch (err) {
+		console.error(`[TT Client] Invalid server address '${address}':`, err);
+		connecting = false;
+		forced = false;
+		return;
+	}
+	client = ws;
+
+	const onOpen = () => {
+		if (client !== ws) return;
 		connected = true;
+		connecting = false;
 		console.log("[TT Client] Connected to server");
-	});
+	};
 
-	client.addEventListener("message", (event) => {
+	const onMessage = (event) => {
+		if (client !== ws) return;
 		try {
 			let msg = JSON.parse(event.data);
 
@@ -492,40 +521,105 @@ function joinServer(address) {
 			console.warn("Error on client 'message':", err);
 			return;
 		}
-	});
+	};
 
-	client.addEventListener("close", () => {
+	const onClose = () => {
+		if (client !== ws) return;
+		connecting = false;
 		console.log("Disconnected from server.");
 		onDisconnected();
-	});
+	};
 
-	client.addEventListener("error", (err) => {
+	const onError = (err) => {
+		if (client !== ws) return;
+		connecting = false;
 		console.error("Connection error:", err.message);
 		onDisconnected();
-	});
+	};
+
+	ws.addEventListener("open", onOpen);
+	ws.addEventListener("message", onMessage);
+	ws.addEventListener("close", onClose);
+	ws.addEventListener("error", onError);
+
+	clientHandlers = { open: onOpen, message: onMessage, close: onClose, error: onError };
+}
+
+// Tear down a connection without its close/error events reaching onDisconnected.
+function detachClient() {
+	if (!client)
+		return;
+	const ws = client;
+	if (clientHandlers) {
+		ws.removeEventListener("open", clientHandlers.open);
+		ws.removeEventListener("message", clientHandlers.message);
+		ws.removeEventListener("close", clientHandlers.close);
+		ws.removeEventListener("error", clientHandlers.error);
+	}
+	clientHandlers = null;
+	try { ws.close(); } catch (e) { /* ignore */ }
+	client = null;
+	connected = false;
+	clearPeers();
+}
+
+// Drop all per-connection state. Shared by detachClient() and onDisconnected().
+function clearPeers() {
+	for (const player of playerActors.keys()) {
+		playerActions.set(player, "HIDE");
+	}
+	playerActors.clear();
+	playerUpdates.clear();
+	playerNames.clear();
+	playerId = null;
+	connecting = false;
 }
 
 function leaveServer() {
-	if (!client) return console.log("Not connected.");
+	// Manual disconnect also clears the forced (hosting) flag.
+	forced = false;
+	if (!client) {
+		connecting = false;
+		return console.log("Not connected.");
+	}
 	client.close();
+}
+
+// Alias used by the settings menu.
+function disconnect() {
+	leaveServer();
+}
+
+function isConnected() {
+	return connected && !!client && client.readyState === WebSocket.OPEN;
+}
+
+function isConnecting() {
+	return connecting;
 }
 
 // Clean up local state after a disconnect; if we were connected, return to the title.
 function onDisconnected() {
-	for (const player of playerActors.keys()) {
-		playerActions.set(player, "HIDE");
-	}
+	if (!client && !connected)
+		return;
 	client = null;
-	playerId = null;
-	playerActors.clear();
-	playerUpdates.clear();
-	playerNames.clear();
+	clientHandlers = null;
+	const wasConnected = connected;
+	connected = false;
+	clearPeers();
 
-	if (connected) {
-		connected = false;
+	if (wasConnected) {
 		const scene = terra.export.g_scene;
 		if (scene && !scene.isTitle())
 			scene.goToTitle();
+	}
+
+	// A hosted connection is mandatory: rejoin our own server while it is up.
+	if (forced && isHosting()) {
+		setTimeout(() => {
+			if (forced && isHosting() && !client)
+				joinServer(undefined, { force: true });
+		}, 1000);
 	}
 }
 

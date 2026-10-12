@@ -2,6 +2,7 @@
 // (SettingsTab). main.js wires these in.
 
 import { createTextOption, createButtonOption } from "./option-types.js";
+import * as client from "./client.js";
 import * as server from "./server.js";
 import { createSkinSetting } from "./skin.js";
 
@@ -69,36 +70,80 @@ export function createModSettings() {
 
 	// === Connection ===
 
-	createTextOption("tt-server-address", {
+	const addressOption = createTextOption("tt-server-address", {
 		header: "Connection",
 		category: CATEGORY,
 		local: true,
-		label: { en_US: "Server Address" },
-		description: { en_US: "Host used when connecting to a multiplayer server." },
+		label: { en_US: "Address" },
+		description: { en_US: "Address used when connecting to a multiplayer server." },
 		type: { default: "", placeholder: "127.0.0.1" }
 	});
 
-	createTextOption("tt-server-port", {
+	const portOption = createTextOption("tt-server-port", {
 		category: CATEGORY,
 		local: true,
-		label: { en_US: "Server Port" },
-		description: { en_US: "Port used when connecting to a multiplayer server." },
+		label: { en_US: "Port" },
+		description: { en_US: "Port used when connecting and hosting a multiplayer server." },
 		type: { default: "", maxLength: 5, placeholder: "17005" }
 	});
+
+	// Address and port can only be edited while not connected/connecting/hosting.
+	const connectionEditable = () => !client.isConnected() && !client.isConnecting() && !server.isHosting();
+	addressOption.isEnabled = connectionEditable;
+	portOption.isEnabled = connectionEditable;
+
+	const connectButton = createButtonOption("tt-connect-server", {
+		category: CATEGORY,
+		label: { en_US: "Connect" },
+		description: { en_US: "Click to connect/disconnect from a multiplayer server" },
+		type: { text: { en_US: "Connect" }, width: 220 }
+	}, () => {
+		if (client.isConnected() || client.isConnecting())
+			client.disconnect();
+		else
+			client.joinServer();
+	});
+	// Disabled while hosting: the local connection is then mandatory.
+	connectButton.isEnabled = () => !server.isHosting();
+	connectButton.getButtonText = () => {
+		if (server.isHosting())
+			return "Connected (Hosting)";
+		if (client.isConnected())
+			return "Connected!";
+		if (client.isConnecting())
+			return "Connecting...";
+		return "Connect";
+	};
 
 	// === Hosting ===
 	const hostButton = createButtonOption("tt-host-server", {
 		header: "Hosting",
 		category: CATEGORY,
 		label: { en_US: "Hosting" },
-		description: { en_US: "Start a multiplayer server on this machine. Default port is 17005" },
-		type: { text: { en_US: "Start Hosting" }, disabledText: { en_US: "Hosting!" }, width: 150 }
+		description: { en_US: "Start or stop hosting a multiplayer server on this machine. Hosting connects you automatically" },
+		type: { text: { en_US: "Start Hosting" }, width: 220 }
 	}, () => {
-		const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
-		server.startServer("0.0.0.0", port);
-		console.log(`[TerraTogether] Hosting on ws://0.0.0.0:${port}`);
+		if (server.isHosting()) {
+			// Stop hosting: the host connection (and any peer connections) are dropped.
+			server.stopServer();
+			client.disconnect();
+		}
+		else {
+			const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
+			// Leave any existing connection before hosting (joinServer replaces it anyway).
+			client.disconnect();
+			server.startServer("0.0.0.0", port);
+			client.joinServer(undefined, { force: true });
+		}
 	});
-	hostButton.isEnabled = () => !server.isHosting();
+	// Enabled to stop hosting, or to start hosting only when not already connected
+	// to another server. Hosting itself keeps the button enabled so it can be stopped.
+	hostButton.isEnabled = () => server.isHosting() || (!client.isConnected() && !client.isConnecting());
+	hostButton.getButtonText = () => {
+		if (server.isHosting())
+			return `Hosting on :${server.getHostPort()}`;
+		return "Start Hosting";
+	};
 
 	// === Miscellaneous ===
 	let alwaysFocusedData = {
