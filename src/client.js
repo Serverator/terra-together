@@ -105,6 +105,93 @@ function isPlayerTied(ent) {
 	return ent == player || ent._ttFxId || ent.target?.entity == player;
 }
 
+// FX steps that modify *global, screen-space* state: the screen vignette/climate,
+// the radial blur and the camera shake. These are strictly per-client — replaying
+// one on a peer would tint, blur or shake that peer's whole screen. This is what
+// leaked the low-HP red vignette and the Sommu's-dream black vignette onto every
+// other player. We do NOT drop such effects wholesale (that also removed genuinely
+// shared world visuals, e.g. an aether/lightning explosion); instead we keep the
+// effect synced and neutralise only the global parts when the peer replays it.
+//
+// LIGHT is a special case: it spawns a world-space light *and*, if it carries
+// darkness/grayness, a global climate darkening (fx-light.js:92). On a peer replay
+// we keep the world light but strip the darkening.
+const SCREEN_FX_STEP_KEYS = ["CLIMATE", "RADIAL_BLUR", "SHAKE_SCREEN"];
+const SCREEN_FX_STEP_NAMES = ["FxClimateStep", "FxRadialBlurStep", "FxShakeScreenStep"];
+const LIGHT_FX_STEP_NAME = "FxLightStep";
+
+function isScreenGlobalStep(step) {
+	if (!step) return false;
+	// Prefer the live step registry (robust to renamed classes)...
+	const FX_STEPS = terra.export.FX_STEPS ?? terra.file.fxBase?.FX_STEPS;
+	if (FX_STEPS) {
+		for (const key of SCREEN_FX_STEP_KEYS) {
+			const StepClass = FX_STEPS[key];
+			if (StepClass && step instanceof StepClass)
+				return true;
+		}
+	}
+	// ...and fall back to class names, which the shipped bundle preserves (the
+	// modloader already relies on that elsewhere).
+	return SCREEN_FX_STEP_NAMES.includes(step.constructor?.name);
+}
+
+// Patch a step class's start() so it behaves correctly on a peer replay:
+//  - "skip"  : do nothing at all (the step is purely screen-global).
+//  - "light" : run normally but drop the global climate darkening.
+const patchedStepClasses = new WeakMap();
+function patchStepClassForRemote(cls, kind) {
+	if (!cls?.prototype || patchedStepClasses.has(cls))
+		return;
+	const originalStart = cls.prototype.start;
+	if (typeof originalStart !== "function")
+		return;
+	patchedStepClasses.set(cls, kind);
+	if (kind === "light") {
+		cls.prototype.start = function (fx) {
+			if (!fx?._ttRemote)
+				return originalStart.apply(this, arguments);
+			// Keep the world light, suppress its global climate mod.
+			const darkness = this.darkness, grayness = this.grayness;
+			this.darkness = 0;
+			this.grayness = 0;
+			try {
+				return originalStart.apply(this, arguments);
+			}
+			finally {
+				this.darkness = darkness;
+				this.grayness = grayness;
+			}
+		};
+	}
+	else {
+		cls.prototype.start = function (fx) {
+			if (fx?._ttRemote)
+				return undefined;
+			return originalStart.apply(this, arguments);
+		};
+	}
+}
+
+// Effect definitions are shared/cached, so scan each one at most once. Our step
+// instances keep real class names, so we can grab the classes to patch without
+// relying on FX_STEPS being exposed.
+const scannedFxEffects = new WeakSet();
+function installScreenStepSuppression(effect) {
+	if (!effect?.steps || scannedFxEffects.has(effect))
+		return;
+	scannedFxEffects.add(effect);
+	for (const step of effect.steps) {
+		const cls = step?.constructor;
+		if (!cls)
+			continue;
+		if (cls.name === LIGHT_FX_STEP_NAME)
+			patchStepClassForRemote(cls, "light");
+		else if (isScreenGlobalStep(step))
+			patchStepClassForRemote(cls, "skip");
+	}
+}
+
 // Local player's rogue sublayout identity. `variant` is the seeded layout of the
 // current room and is null outside an active rogue run, so it only affects syncing
 // while in the roguelike mode.
@@ -368,6 +455,15 @@ class MultiplayerClient extends terra.export.Observable {
 			terra.export.FxEntity.prototype.start = function (...args) {
 				this._ttFxStopSent = false;
 
+				// Consume the peer-replay marker set by movePlayerActor just before
+				// start(). Resetting here (rather than trusting the pooled instance) keeps
+				// a recycled entity from suppressing a *local* effect's screen steps.
+				this._ttRemote = this._ttRemotePending === true;
+				this._ttRemotePending = false;
+
+				// Make sure this effect's screen-global steps no-op on peer replays.
+				installScreenStepSuppression(this.effect);
+
 				// Player-owned = attached to the player or spawned by a player step
 				// (SPAWN_FX), so ground impacts count too.
 				//
@@ -380,6 +476,8 @@ class MultiplayerClient extends terra.export.Observable {
 				const attachedEnt = this.target?.entity ?? null;
 				const onPlayer = isPlayerEntity(attachedEnt);
 
+				// Screen-global effects are still synced for their world visuals, but the
+				// sender's own vignette/blur/shake steps are dropped on the peer above.
 				if (onPlayer || isPlayerEntity(owner)) {
 					let id = (this._ttFxId = ++fxSyncId);
 					let fx = {
@@ -1046,6 +1144,9 @@ function movePlayerActor(id, state) {
 		fx.setPart(fxState.part)
 		fx.looped = fxState.looped ?? false;
 		fx.attachGroup = fxState.group;
+		// Mark this spawn as a peer replay: its screen-global steps (vignette/blur/
+		// shake) are suppressed so they don't affect the local player's screen.
+		fx._ttRemotePending = true;
 		fx.start(fxState.duration);
 
 		if (fxState.id != null)
