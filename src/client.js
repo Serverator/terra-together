@@ -1217,14 +1217,17 @@ function movePlayerActor(id, state) {
 }
 
 function setActorTimeFactor(actor, time) {
+	// The figure advances by core.getTick(true) = g_tick.world * factor * logicFactor,
+	// so scale only ONE of the two: setting both to `time` squared the speed.
 	if (actor.core?.time) {
 		actor.core.time.factor = time;
-		actor.core.time.logicFactor = time;
+		actor.core.time.logicFactor = 1;
 	}
 
+	// The move influencer copies these back onto core.time each physics step.
 	if (actor.move?.influencer) {
 		actor.move.influencer.globalInvTime = time;
-		actor.move.influencer.globalInvLogic = time;
+		actor.move.influencer.globalInvLogic = 1;
 	}
 }
 
@@ -1351,8 +1354,18 @@ function sendPlayerData(forceSend = false, scene = null) {
 	
 	let state = {}
 
-	// Time factor of this client
-	let timeFactor = g_system.loopPaused ? 0 : g_system.timeFactor.world; 
+	// Effective *animation* speed of the local player, not the raw world slow factor.
+	// Slow-motion abilities use ADD_SLOW_MOTION with invert:"ALL"/"LOGIC", which makes
+	// the caster ignore the slow-mo (its core.time.factor/logicFactor compensate). The
+	// figure advances by core.getTick(true) = g_tick.world * factor * logicFactor, so
+	// sending timeFactor.world alone slowed the peer actor during the wind-up — before
+	// the explosion FX (sent a few frames later) had even arrived.
+	let timeFactor = 0;
+	if (!g_system.loopPaused) {
+		const t = g_player.entity?.core?.time;
+		timeFactor = g_system.timeFactor.global * g_system.timeFactor.world
+			* (t ? t.factor * t.logicFactor : 1);
+	}
 
 	if (timeFactor === 0) {
 		if (pausedSent && !forceSend) return;
