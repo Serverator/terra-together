@@ -1223,8 +1223,21 @@ function movePlayerActor(id, state) {
 	actor.view?.figState?.setAnim(state.animation || "idle", null);
 	actor.view?.figState?.setAnimTime(state.anim_time);
 
+	// The player flips its own facing mode between MOVE_DIR and FIXED (e.g. a dodge/
+	// perfect-dodge sets FIXED to hold the facing, player-cmp.js:2480/2544), but the mod
+	// only syncs the face *vector*. If the ghost stays MOVE_DIR, its update() overwrites
+	// the synced face with move.accelDir (actor-cmp.js:535-536) — the *movement* direction
+	// — so it renders backwards (e.g. faces up while the caster faces down) and never
+	// recovers. Pin the ghost to FIXED so the synced face vector is always authoritative.
+	if (actor.actor)
+		actor.actor.facing.type = terra.export.ACTOR_FACING?.FIXED ?? 1;
+
+	// A frozen ghost (time factor ~0) can't interpolate its figure rotation
+	// (maxRotate ∝ g_tick.entity, actor-cmp.js:630), so snap the facing instead —
+	// otherwise it keeps its old orientation while the caster turns during a freeze.
 	let rotateInstantly = terra.export.g_scene?.currentState == SCENE_STATE.MENU || justCreated;
-	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), rotateInstantly);
+	const frozen = !(state.timeFactor > 1e-4);
+	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), rotateInstantly || frozen);
 
 	updateWeaponState(actor, state.weapon)
 }
@@ -1380,7 +1393,11 @@ function sendPlayerData(forceSend = false, scene = null) {
 			* (t ? t.factor * t.logicFactor : 1);
 	}
 
-	if (timeFactor === 0) {
+	// Throttle only on a real engine pause (menu/cutscene), NOT on a slow-motion that
+	// bottoms out at 0: a scripted slow-mo (e.g. the tutorial dodge) still moves/faces the
+	// player, so position/face must keep flowing while the ghost itself stays frozen
+	// (timeFactor 0 makes the peer snap its facing; see movePlayerActor).
+	if (g_system.loopPaused) {
 		if (pausedSent && !forceSend) return;
 		pausedSent = true;
 	} else {
