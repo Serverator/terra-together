@@ -2,9 +2,53 @@ import { registerOptionTypes } from "./option-types.js";
 import { createModSettings, SettingsTab } from "./settings.js";
 import * as skin from './skin.js';
 import * as client from './client.js';
+import * as server from './server.js';
 import * as nameplates from './nameplates.js';
 
 window.terraTogether ??= {};
+
+// The game shows a LogoScreen (developer + promo logos) once the title scene appears,
+// and only reveals the title menu when that sequence ends (TitleScreen.onLogoDown ->
+// startBackground). We intercept the TitleScreen as it is added so we can short-circuit
+// the sequence when the option is on.
+function patchLogoScreen(logoScreen) {
+	if (!logoScreen || logoScreen.__ttPatched)
+		return;
+	const originalStart = logoScreen.start;
+	logoScreen.start = function (...args) {
+		if (terra.export.g_options.get("tt-skip-logos") ?? false) {
+			// Fire the same ENDED callback the sequence would, jumping to the title menu.
+			this.end();
+			return;
+		}
+		return originalStart.apply(this, args);
+	};
+	logoScreen.__ttPatched = true;
+}
+
+function installLogoScreenSkip() {
+	const g_gui = terra.export.g_gui;
+	if (!g_gui || g_gui.__ttLogosPatched)
+		return;
+	const originalAddElement = g_gui.addElement;
+	g_gui.addElement = function (element, ...rest) {
+		const result = originalAddElement.call(this, element, ...rest);
+		try {
+			if (element?.constructor?.name === "TitleScreen")
+				patchLogoScreen(element.logoScreen);
+		}
+		catch (err) {
+			console.warn("[TerraTogether] Failed to hook the title logo screen:", err);
+		}
+		return result;
+	};
+	g_gui.__ttLogosPatched = true;
+}
+
+function findTitleScreen() {
+	const hook = terra.export.g_gui?.hooks?.find(h => h.gui?.constructor?.name === "TitleScreen");
+	return hook?.gui ?? null;
+}
 
 class Multiplayer extends terra.export.Observable {
 	onGameMapStart() {
@@ -43,12 +87,44 @@ class Multiplayer extends terra.export.Observable {
 			|| event === OPTION_EVENT.SETTINGS_LOADED) {
 			this.applyAlwaysFocused();
 		}
+
+		// Auto-host: start hosting as soon as the option is enabled (no-op once hosting).
+		if (key === "tt-auto-host") {
+			this.applyAutoHost();
+		}
+
+		// Skip the logos immediately if they happen to be playing when enabled.
+		if (key === "tt-skip-logos") {
+			this.applySkipLogos();
+		}
+	}
+
+	// Ends an in-progress intro logo sequence when the option is switched on.
+	applySkipLogos() {
+		if (!(terra.export.g_options.get("tt-skip-logos") ?? false))
+			return;
+		const logoScreen = findTitleScreen()?.logoScreen;
+		if (logoScreen && !logoScreen.hasEnded())
+			logoScreen.end();
 	}
 
 	applyAlwaysFocused() {
 		const alwaysFocused = terra.export.g_options.get("tt-always-focused") ?? false;
 		window.IG_KEEP_WINDOW_FOCUS = alwaysFocused;
 		terra.export.g_system.setWindowFocus(false);
+	}
+
+	// Starts hosting when the option is on and we aren't already hosting. Safe to call
+	// repeatedly; the client connects to the local server on its next map start.
+	applyAutoHost() {
+		if (server.isHosting())
+			return;
+		if (!(terra.export.g_options.get("tt-auto-host") ?? false))
+			return;
+		const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
+		server.startServer("0.0.0.0", port).catch(err => {
+			console.error("[TerraTogether] Auto-host failed:", err);
+		});
 	}
 
 	onAddonInit() {
@@ -65,8 +141,15 @@ class Multiplayer extends terra.export.Observable {
 		// Build the settings category and its tab.
 		createModSettings();
 
+		// Wrap g_gui.addElement before the game creates its TitleScreen, so the intro
+		// logo sequence can be skipped.
+		installLogoScreenSkip();
+
 		// Apply the stored Always Focused value at startup (a load re-applies it too).
 		this.applyAlwaysFocused();
+
+		// Auto-host: start hosting at startup when the option is enabled.
+		this.applyAutoHost();
 	}
 }
 

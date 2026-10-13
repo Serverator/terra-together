@@ -1121,6 +1121,11 @@ function movePlayerActor(id, state) {
 
 	setActorTimeFactor(actor, state.timeFactor);
 
+	// HP ratio (0..1) for the nameplate HP bar (see nameplates.js).
+	actor.terraTogether.hp = typeof state.hp === "number" ? Math.max(0, Math.min(1, state.hp)) : 1;
+	// Where HP will stop once pending heals (HoT) tick in.
+	actor.terraTogether.hpTarget = typeof state.hp_target === "number" ? Math.max(0, Math.min(1, state.hp_target)) : actor.terraTogether.hp;
+
 	if (actor.actorExt.actorFx) {
 		for (const fx of state.actorFx ?? []) {
 			actor.actorExt.actorFx.onActorFx(actor.core, fx.type, fx.vary);
@@ -1428,6 +1433,11 @@ function sendPlayerData(forceSend = false, scene = null) {
 
 	// Copy the look direction
 	state.face_dir = g_player.entity?.actor?.face?.clone().v;
+
+	// HP ratio (0..1) for the peer nameplate HP bar.
+	state.hp = g_player.combat?.params?.getHPRatio?.() ?? 1;
+	// HP ratio including pending heals (HoT) — the "will stop here" preview the HUD shows.
+	state.hp_target = g_player.combat?.params?.getHPRatio?.(0, true) ?? state.hp;
 
 	let weapon = g_player.entity?.player?.weapon;
 	state.weapon = { weapon: weapon?.current?.name, back: weapon?.back ?? false, timer: weapon?.timer ?? 0 };

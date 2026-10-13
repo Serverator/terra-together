@@ -48,11 +48,34 @@ export function createModSettings() {
 	if (g_options.values["tt-nameplates"] === undefined)
 		g_options.values["tt-nameplates"] = nameplateData.type.default;
 
+	// Independent of the nameplate option: the HP bar can be shown even when the
+	// name is off, and vice versa.
+	let hpBarData = {
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Player Health Bars" },
+		description: { en_US: "Show player health bars above characters." },
+		type: {
+			default: 1,
+			list: [
+				{ en_US: "Off" },
+				{ en_US: "Others" },
+				{ en_US: "Others + Self" }
+			],
+			type: 'RADIO_GROUP'
+		}
+	};
+
+	let hpBars = new (terra.export.OptionTypeBuilder.builders.get('RADIO_GROUP'))("tt-hpbar", hpBarData);
+	g_options.settings["tt-hpbar"] = hpBars;
+	if (g_options.values["tt-hpbar"] === undefined)
+		g_options.values["tt-hpbar"] = hpBarData.type.default;
+
 	let nameplateScaleData = {
 		category: CATEGORY,
 		local: true,
 		label: { en_US: "Nameplate Scale" },
-		description: { en_US: "Size of player nameplates." },
+		description: { en_US: "Size of player nameplates and health bars." },
 		type: {
 			default: 1,
 			list: [
@@ -148,6 +171,21 @@ export function createModSettings() {
 		return "Start Hosting";
 	};
 
+	let autoHostData = {
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Auto Host" },
+		description: { en_US: "Start hosting a multiplayer server automatically when the game starts." },
+		type: {
+			default: false,
+			type: 'CHECKBOX'
+		}
+	};
+	let autoHost = new (terra.export.OptionTypeBuilder.builders.get('CHECKBOX'))("tt-auto-host", autoHostData);
+	g_options.settings["tt-auto-host"] = autoHost;
+	if (g_options.values["tt-auto-host"] === undefined)
+		g_options.values["tt-auto-host"] = autoHostData.type.default;
+
 	// === Miscellaneous ===
 	let alwaysFocusedData = {
 		category: CATEGORY,
@@ -173,6 +211,21 @@ export function createModSettings() {
 	};
 	let hideParty = new (terra.export.OptionTypeBuilder.builders.get('CHECKBOX'))("tt-hide-party", hidePartyData);
 	g_options.settings["tt-hide-party"] = hideParty;
+
+	let skipLogosData = {
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Skip Intro Logos" },
+		description: { en_US: "Skip the developer and promo logo screens shown before the title menu." },
+		type: {
+			default: false,
+			type: 'CHECKBOX'
+		}
+	};
+	let skipLogos = new (terra.export.OptionTypeBuilder.builders.get('CHECKBOX'))("tt-skip-logos", skipLogosData);
+	g_options.settings["tt-skip-logos"] = skipLogos;
+	if (g_options.values["tt-skip-logos"] === undefined)
+		g_options.values["tt-skip-logos"] = skipLogosData.type.default;
 }
 
 // Adds the mod's tab to the Options menu (as an addon, after the menu is built).
