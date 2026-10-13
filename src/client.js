@@ -192,6 +192,18 @@ function installScreenStepSuppression(effect) {
 	}
 }
 
+// Player-attached effects that are purely local feedback and must never be sent to
+// peers. The in-game A/B loadout quick-switch is the canonical case: its light and
+// particles, and the "loadout-switch-01" sound baked into the effect, belong only to
+// the player doing the switch. (The menu loadout sound is on the UI bus and is
+// already excluded.) Key format is the effect's cacheKey: "FX:<sheet>#<name>".
+const LOCAL_ONLY_FX = new Set([
+	"FX:player.actions#changeLoadout",
+]);
+function isLocalOnlyEffect(effect) {
+	return !!effect && LOCAL_ONLY_FX.has(effect.cacheKey);
+}
+
 // Local player's rogue sublayout identity. `variant` is the seeded layout of the
 // current room and is null outside an active rogue run, so it only affects syncing
 // while in the roguelike mode.
@@ -478,7 +490,8 @@ class MultiplayerClient extends terra.export.Observable {
 
 				// Screen-global effects are still synced for their world visuals, but the
 				// sender's own vignette/blur/shake steps are dropped on the peer above.
-				if (onPlayer || isPlayerEntity(owner)) {
+				// Local-only feedback (e.g. the A/B loadout quick-switch) is never synced.
+				if ((onPlayer || isPlayerEntity(owner)) && !isLocalOnlyEffect(this.effect)) {
 					let id = (this._ttFxId = ++fxSyncId);
 					let fx = {
 						id,
