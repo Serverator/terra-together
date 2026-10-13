@@ -58,6 +58,10 @@ let globalFxQueue = [];
 let fxStopQueue = [];
 let soundQueue = [];
 let windboxQueue = [];
+let projectileQueue = [];
+let projSyncId = 0;
+// True only during a receiver-initiated mirror spawn (see spawnRemoteProjectile).
+let spawningVisualCopy = false;
 
 // Sound resources by buffer path; sounds sync by path and re-resolve on the peer.
 const soundRegistry = new Map();
@@ -67,6 +71,7 @@ let soundSyncSuppress = 0;
 
 let fxSyncId = 0;
 let syncHooksInstalled = false;
+let projectileHooksInstalled = false;
 
 let soundSyncId = 0;
 let soundStopQueue = [];
@@ -154,6 +159,98 @@ function registerSound(sound) {
 function isSyncableBus(type) {
 	const bus = type?.bus;
 	return !bus || (bus !== "UI" && bus !== "MUSIC" && bus !== "AMBIENCE");
+}
+
+// --- Projectile sync ---------------------------------------------------
+// Ranged projectiles are real `Projectile` entities created at one choke point
+// (ProxyDef.spawn). Peers mirror them as "visual" copies owned by the sending
+// player's ghost actor; damage is suppressed so shots only show up.
+
+// Resolve a proxy def by name: the local player's config proxies (weapon proxies
+// are local names like "arrow") first, then global actor-globals proxies.
+function resolveProxyDef(name) {
+	if (!name)
+		return null;
+	const local = terra.export.g_player?.config?.proxies?.[name];
+	if (local)
+		return local;
+	return terra.export.g_actorGlobals?.getProxy?.(name) ?? null;
+}
+
+// A cosmetic projectile needs an owner damager whose .ent is the ghost and whose
+// .stats is non-null (Projectile.init reads owner.stats.getCombatant()). Create one
+// lazily per ghost; no AttackerCmp, so the ghost is not registered as an attacker.
+function getVisualDamager(actor) {
+	if (!actor)
+		return null;
+	if (actor.terraTogether?.ttDamager)
+		return actor.terraTogether.ttDamager;
+	const DamagerCmp = terra.export.DamagerCmp;
+	const CombatStats = terra.export.CombatStats;
+	if (!DamagerCmp || !CombatStats)
+		return null;
+	const damager = actor.addCmp(DamagerCmp);
+	// Party is cosmetic here (damage is disabled); 1 = COMBATANT_PARTY.PLAYER.
+	const party = terra.export.COMBATANT_PARTY?.PLAYER ?? 1;
+	damager.setStatProxies(CombatStats.getAttackStats(1, party), {});
+	actor.terraTogether.ttDamager = damager;
+	return damager;
+}
+
+// Cosmetic copies must not take the local player's ranged-weapon extension
+// (Projectile.init keys off the *local* player's weaponRanged + def.metaType).
+// Spawn from a shallow clone with metaType forced to NONE; cache per def so the
+// shared game def is never mutated.
+const visualDefCache = new WeakMap();
+function visualDef(def) {
+	let clone = visualDefCache.get(def);
+	if (clone)
+		return clone;
+	clone = Object.create(Object.getPrototypeOf(def));
+	Object.assign(clone, def);
+	clone.metaType = 0; // PROJ_META_TYPE.NONE
+	visualDefCache.set(def, clone);
+	return clone;
+}
+
+// Step types a mirrored (visual) proxy must never execute: proxy/enemy spawning
+// (would duplicate or spawn real, damaging entities) and local-global effects
+// (camera, slow-motion, player control, nav danger). Guarded by `__ttVisual`, so
+// real actors that use the same steps are unaffected.
+const VISUAL_BLOCKED_STEPS = [
+	"SHOOT_PROXY", "SHOOT_PROXY_RANGE", "SPAWN_ENEMY", "SPAWN_ENEMY_RANGE",
+	"CALL_PROXY_ACTION", "SET_ON_HIT_PROXY", "CLEAR_ON_HIT_PROXY",
+	"SET_VAR_ENTITY_PROXY", "SET_VAR_NUMBER_PROXY_COUNT", "NOTIFY_PROXY_GROUP",
+	"MODIFY_GENERIC_PROXY", "SET_PROXY_LIFE",
+	"SET_CAMERA_TARGET", "RESET_CAMERA", "ADD_SLOW_MOTION", "CLEAR_SLOW_MOTION",
+	"SET_PLAYER_BLOCK", "CLEAR_PLAYER_ARROW_CHARGE",
+	"SET_DAMAGER_DMG_FACTOR", "MARK_NAV_DANGER",
+];
+
+function spawnRemoteProjectile(actor, p) {
+	const def = resolveProxyDef(p.name);
+	if (!def)
+		return;
+	const damager = getVisualDamager(actor);
+	if (!damager)
+		return;
+
+	// Element is the variant index (0 neutral, 1 aether, 2 ignis, 3 cryo). init
+	// copies it from the owner damager, so set it right before spawning.
+	damager.variant = p.variant ?? 0;
+
+	const pos = new Vec3(p.pos[0], p.pos[1], p.pos[2]);
+	const dir = new Vec3(p.dir[0], p.dir[1], p.dir[2] ?? 0);
+
+	// Mark the spawn as a mirror for the ProxyDef.spawn wrapper. Proxies are pooled,
+	// so the flag is (re)assigned on every spawn rather than trusting the instance.
+	spawningVisualCopy = true;
+	try {
+		visualDef(def).spawn(pos, dir, damager, p.group ?? null);
+	}
+	finally {
+		spawningVisualCopy = false;
+	}
 }
 
 class MultiplayerClient extends terra.export.Observable {
@@ -460,6 +557,93 @@ class MultiplayerClient extends terra.export.Observable {
 			// weapon / loadout swap sounds are local to the switching player only
 			for (const m of ["switchLoadout", "setLoadout", "equipWeapon"])
 				suppress(terra.file.playerCombat?.PlayerCombat?.prototype, m);
+
+			// --- Projectiles -----------------------------------------------
+			if (!projectileHooksInstalled) {
+				projectileHooksInstalled = true;
+
+				const Projectile = terra.export.Projectile;
+				const ProxyDef = terra.export.ProxyDef;
+
+				if (Projectile?.prototype && ProxyDef?.prototype) {
+					const GenericProxy = terra.export.GenericProxy;
+					const HitForce = terra.export.HitForce;
+					const ACTION_STEP = terra.export.ACTION_STEP ?? terra.file.stepBase?.ACTION_STEP;
+
+					// Universal no-damage guard: a hit-force owned by a mirrored proxy can
+					// never land a hit, whichever act produced it (projectile hits or HIT_*
+					// steps). Movement, wall/ground collide and despawn are untouched.
+					if (HitForce?.prototype?.isHitCompatible) {
+						let originalIsHitCompatible = HitForce.prototype.isHitCompatible;
+						HitForce.prototype.isHitCompatible = function (...args) {
+							if (this.damager?.ent?.__ttVisual)
+								return 0; // HIT_RESULT.IGNORE
+							return originalIsHitCompatible.apply(this, args);
+						};
+					}
+
+					// A mirrored proxy must not re-run steps that spawn proxies/enemies or
+					// hijack the local camera/time/player (real actors are unaffected).
+					if (ACTION_STEP) {
+						for (const key of VISUAL_BLOCKED_STEPS) {
+							const StepClass = ACTION_STEP[key];
+							if (!StepClass?.prototype?.start || StepClass.prototype.start._ttVisualGuard)
+								continue;
+							let originalStart = StepClass.prototype.start;
+							const wrapped = function (...args) {
+								if (args[0]?.entity?.__ttVisual)
+									return undefined;
+								return originalStart.apply(this, args);
+							};
+							wrapped._ttVisualGuard = true;
+							StepClass.prototype.start = wrapped;
+						}
+					}
+
+					// A mirrored copy must never spawn (possibly damaging) sub-proxies, so
+					// block the single spawn path for its sub-proxies too.
+					let originalSpawnSubProxy = Projectile.prototype.spawnSubProxy;
+					Projectile.prototype.spawnSubProxy = function (...args) {
+						if (this.__ttVisual)
+							return undefined;
+						return originalSpawnSubProxy.apply(this, args);
+					};
+
+					// One choke point for every proxy (weapon shots, HIT proxies, sub-proxies).
+					let originalSpawn = ProxyDef.prototype.spawn;
+					ProxyDef.prototype.spawn = function (pos, dir, damager, group) {
+						const proxy = originalSpawn.apply(this, arguments);
+
+						// Proxies are pooled and reused, so a stale __ttVisual from a previous
+						// life must never leak. A spawn is a "mirror" only when the receiver
+						// initiated it; assign unconditionally to clear recycled state.
+						const isMirror = spawningVisualCopy;
+						proxy.__ttVisual = isMirror;
+
+						// Ranged attacks spawn both Projectile and Generic proxies (e.g. the
+						// crossbow's "shoot down" fires Generic arrowUp), so mirror both. Only
+						// the local player's: peers' copies are owned by ghosts and already
+						// marked visual, so they never echo back.
+						const mirrored = proxy instanceof Projectile
+							|| (GenericProxy && proxy instanceof GenericProxy);
+						if (client && mirrored && !isMirror
+							&& terra.export.g_player?.isPlayer?.(damager?.getRoot?.())) {
+							projectileQueue.push({
+								id: ++projSyncId,
+								name: this.name,
+								pos: [pos.x, pos.y, pos.z],
+								dir: [dir.x, dir.y, dir.z ?? 0],
+								variant: damager?.variant ?? 0,
+								group: group ?? null,
+							});
+						}
+						return proxy;
+					};
+				}
+				else {
+					console.warn("[TT Client] Projectile export not found; projectile sync disabled.");
+				}
+			}
 		}
 	}
 
@@ -487,9 +671,27 @@ function updatePlayerState(id, state) {
 	// If the previous update hasn't been consumed yet, carry its one-shot events over.
 	if (lastUpdate && scene == "RUNNING") {
 		state.globalFx ??= [];
+		state.actorFx ??= [];
+		state.sounds ??= [];
+		state.soundVols ??= [];
 		state.fxStops ??= [];
 		state.soundStops ??= [];
 		state.windboxes ??= [];
+		state.projectiles ??= [];
+
+		for (const fx of lastUpdate.actorFx ?? []) {
+			state.actorFx.push(fx);
+		}
+
+		// Sounds/volumes were previously dropped here: with the server on the same
+		// machine updates can outpace frames, losing a peer's one-shot sounds.
+		for (const s of lastUpdate.sounds ?? []) {
+			state.sounds.push(s);
+		}
+
+		for (const v of lastUpdate.soundVols ?? []) {
+			state.soundVols.push(v);
+		}
 
 		for (const fx of lastUpdate.globalFx ?? []) {
 			state.globalFx.push(fx);
@@ -505,6 +707,10 @@ function updatePlayerState(id, state) {
 
 		for (const fx of lastUpdate.windboxes ?? []) {
 			state.windboxes.push(fx);
+		}
+
+		for (const p of lastUpdate.projectiles ?? []) {
+			state.projectiles.push(p);
 		}
 	}
 	
@@ -896,6 +1102,10 @@ function movePlayerActor(id, state) {
 		}
 	}
 
+	for (const p of state.projectiles ?? []) {
+		spawnRemoteProjectile(actor, p);
+	}
+
 	actor.view?.figState?.setAnim(state.animation || "idle", null);
 	actor.view?.figState?.setAnimTime(state.anim_time);
 
@@ -1112,6 +1322,9 @@ function sendPlayerData(forceSend = false, scene = null) {
 
 	state.windboxes = [...windboxQueue];
 	windboxQueue = [];
+
+	state.projectiles = [...projectileQueue];
+	projectileQueue = [];
 
 	send({ type: "update", state });
 }
