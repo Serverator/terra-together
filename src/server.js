@@ -80,9 +80,11 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						break;
 
 					case "join_map":
-						broadcast({ type: "join_map", id: playerId, map: msg.map }, socket);
+						broadcast({ type: "join_map", id: playerId, map: msg.map, variant: msg.variant ?? null }, socket);
 						for (const [id, state] of playerData) {
-							if (state.scene == "MENU" && playerId != id && msg.map == state.map)
+							// Rogue rooms share a map name but differ per seeded sublayout, so match
+							// on variant too (both null outside rogue).
+							if (state.scene == "MENU" && playerId != id && msg.map == state.map && (msg.variant ?? null) == (state.variant ?? null))
 								send(socket, { type: "update", id, state });
 						}
 						break;

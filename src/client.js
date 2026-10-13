@@ -29,6 +29,10 @@ window.terraTogether.playerNames = playerNames;
 const playerUpdates = new Map();
 const playerActions = new Map();
 
+// Last known rogue identity per peer: { seed, variant }. Kept sticky (not cleared
+// every frame) so an in-progress run's seed stays available to adopt later.
+const peerRogue = new Map();
+
 // All config lives in the in-game options (Options > Mods tab); there is no config.json.
 function getSetting(key, fallback) {
 	const value = terra.export.g_options?.get(key);
@@ -96,6 +100,50 @@ function isPlayerTied(ent) {
 	return ent == player || ent._ttFxId || ent.target?.entity == player;
 }
 
+// Local player's rogue sublayout identity. `variant` is the seeded layout of the
+// current room and is null outside an active rogue run, so it only affects syncing
+// while in the roguelike mode.
+function getRogueInfo() {
+	const g = terra.export.g_rogue;
+	if (!g || !g.isActive())
+		return { seed: null, variant: null };
+	const room = g.getCurrentRoom?.();
+	return {
+		seed: g.run ? g.run.getRunState().seed : null,
+		variant: room?.config ? room.variant : null,
+	};
+}
+
+// Seed of any peer currently in a rogue run, so a fresh run can reuse it.
+function getPeerRogueSeed() {
+	for (const info of peerRogue.values()) {
+		if (info?.seed)
+			return info.seed;
+	}
+	return null;
+}
+
+// Patch RogueManager.startRun so a run started without an explicit seed adopts an
+// in-progress peer's seed, keeping floor layouts identical between players.
+let rogueSeedHookInstalled = false;
+function installRogueSeedHook() {
+	if (rogueSeedHookInstalled)
+		return;
+	const g = terra.export.g_rogue;
+	if (!g || typeof g.startRun !== "function")
+		return;
+	rogueSeedHookInstalled = true;
+
+	const originalStartRun = g.startRun;
+	g.startRun = function (seed) {
+		// The game treats 0/null as "random"; prefer a running peer's seed instead.
+		const effective = seed || getPeerRogueSeed() || null;
+		if (effective && window.terraTogether?.rogueDebug)
+			console.debug("[TT rogue] adopting peer seed", effective);
+		return originalStartRun.call(this, effective);
+	};
+}
+
 function registerSound(sound) {
 	if (sound?.path)
 		soundRegistry.set(sound.path, sound);
@@ -139,7 +187,8 @@ class MultiplayerClient extends terra.export.Observable {
 		playerUpdates.clear();
 
 		let map = terra.export.g_game.map.active?.path;
-		send({ type: "join_map", map });
+		let variant = getRogueInfo().variant;
+		send({ type: "join_map", map, variant });
 
 		let player = terra.export.g_player.entity;
 		if (player?.actorExt?.actorFx) {
@@ -174,6 +223,8 @@ class MultiplayerClient extends terra.export.Observable {
 	}
 
 	onLoopStart() {
+		installRogueSeedHook();
+
 		terra.export.g_scene.observers.push(this);
 		terra.export.g_options.observers.push(this);
 
@@ -419,6 +470,11 @@ class MultiplayerClient extends terra.export.Observable {
 terra.addAddon(new MultiplayerClient(), { onGameMapStart: 35000, onLoopStart: 35000 });
 
 function updatePlayerState(id, state) {
+	// Remember the peer's rogue seed/variant even while it is hidden (menu/pause),
+	// so variant matching stays correct and its seed can still be adopted.
+	if (state)
+		peerRogue.set(id, { seed: state.seed ?? null, variant: state.variant ?? null });
+
 	let scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 	let lastUpdate = playerUpdates.get(id);
 
@@ -517,6 +573,7 @@ function joinServer(address, options = {}) {
 				case "player_left":
 					playerActions.set(msg.id, "HIDE");
 					playerNames.delete(msg.id);
+					peerRogue.delete(msg.id);
 					console.log(`[TT Client] Player ${msg.id} left`);
 					break;
 
@@ -585,6 +642,7 @@ function clearPeers() {
 	playerActors.clear();
 	playerUpdates.clear();
 	playerNames.clear();
+	peerRogue.clear();
 	playerId = null;
 	connecting = false;
 }
@@ -706,7 +764,11 @@ function movePlayerActor(id, state) {
 
 	// Show/hide transitions are local and unsynced (see initHideShowChange);
 	// justCreated skips the appear fx before the actor has any data.
-	if (state.scene == "LOADING" || state.scene == "TITLE" || state.map != terra.export.g_game.map.active?.path) {
+	// Rogue rooms share a map name but differ per seeded sublayout (variant), so a
+	// peer is only in the same room when BOTH map and variant match (null outside rogue).
+	if (state.scene == "LOADING" || state.scene == "TITLE"
+		|| state.map != terra.export.g_game.map.active?.path
+		|| (state.variant ?? null) !== (getRogueInfo().variant ?? null)) {
 		actor.core?.hide(justCreated);
 		return;
 	} else {
@@ -990,6 +1052,12 @@ function sendPlayerData(forceSend = false, scene = null) {
 	state.scene = scene;
 
 	state.map = terra.export.g_game.map.active?.path;
+
+	// Rogue sublayout identity: variant must match to render a peer; seed is shared so
+	// a player starting a run can adopt an in-progress run's seed.
+	const rogue = getRogueInfo();
+	state.variant = rogue.variant;
+	state.seed = rogue.seed;
 
 	state.position = g_player.entity?.core?.pos?.clone().v;
 	state.velocity = g_player.entity?.move?.vel?.clone().v;
