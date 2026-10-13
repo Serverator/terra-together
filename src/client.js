@@ -196,9 +196,16 @@ function installScreenStepSuppression(effect) {
 // peers. The in-game A/B loadout quick-switch is the canonical case: its light and
 // particles, and the "loadout-switch-01" sound baked into the effect, belong only to
 // the player doing the switch. (The menu loadout sound is on the UI bus and is
-// already excluded.) Key format is the effect's cacheKey: "FX:<sheet>#<name>".
+// already excluded.)
+//
+// The defeat "preDeath" blink (a red multiply fade + looping red particles) is spawned
+// on death with an infinite duration (`combatant-cmp.js` onDeathHit -> start(-1)). On
+// respawn the game tears it down without calling FxEntity.stop(), so the peer's synced
+// copy is never told to stop and flashes red forever. It is local death feedback, so
+// don't sync it at all. Key format is the effect's cacheKey: "FX:<sheet>#<name>".
 const LOCAL_ONLY_FX = new Set([
 	"FX:player.actions#changeLoadout",
+	"FX:combat.defeat#preDeath",
 ]);
 function isLocalOnlyEffect(effect) {
 	return !!effect && LOCAL_ONLY_FX.has(effect.cacheKey);
