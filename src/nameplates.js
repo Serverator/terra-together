@@ -32,6 +32,12 @@ const HP_BAR_FILL_MID = HP_BAR_ENABLED ? new Color(222 / 255, 176 / 255, 32 / 25
 const HP_BAR_FILL_LOW = HP_BAR_ENABLED ? new Color(214 / 255, 48 / 255, 40 / 255, 1) : null;
 // Pending-heal (HoT) preview, matching the HUD's HEAL color (hp-hud.js HUD_COLORS_HP.HEAL).
 const HP_BAR_REG_COLOR = HP_BAR_ENABLED ? new Color(55 / 255, 110 / 255, 110 / 255, 1) : null;
+// Lost-HP flash: on damage the lost slice shows in pink, lingers at full for
+// HP_BAR_DAMAGE_HOLD seconds, then drains toward the current HP
+// (fraction of max HP per second), like the HUD's used portion.
+const HP_BAR_DAMAGE_COLOR = HP_BAR_ENABLED ? new Color(255 / 255, 168 / 255, 110 / 255, 1) : null;
+const HP_BAR_DAMAGE_HOLD = 0.35;   // seconds before the pink starts draining
+const HP_BAR_DAMAGE_SPEED = 0.4;   // fraction of max HP per second
 
 // Radio index -> scale; must match the "Nameplate Scale" list in settings.js.
 const NAMEPLATE_SCALES = [0.5, 1.0, 1.5];
@@ -83,7 +89,11 @@ function hideBar(entry) {
 	if (entry.barOutline) for (const seg of entry.barOutline) seg.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
 	entry.barBg?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
 	entry.barRegen?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
+	entry.barDamage?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
 	entry.barFill?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
+	// Forget the last-shown HP so a re-shown bar doesn't flash a stale drop.
+	entry.hpShown = null;
+	entry.damageHold = 0;
 }
 
 function hideEntry(entry) {
@@ -150,7 +160,7 @@ class NameplateGui extends terra.export.GuiElement {
 		text.setAlign(terra.export.GUI_ALIGN_X.LEFT, terra.export.GUI_ALIGN_Y.TOP);
 		text.setPivot(0, 0);
 		text.hook.scale = getNameplateScale();
-		const entry = { text, name: null, barOutline: null, barBg: null, barRegen: null, barFill: null };
+		const entry = { text, name: null, barOutline: null, barBg: null, barRegen: null, barDamage: null, barFill: null, hpShown: null, damage: 0, damageHold: 0 };
 		if (HP_BAR_ENABLED) {
 			// Outline as 4 edges with the corner pixels omitted, so the bar looks rounded.
 			entry.barOutline = [];
@@ -161,9 +171,11 @@ class NameplateGui extends terra.export.GuiElement {
 			}
 			entry.barBg = new ColorGui(HP_BAR_BG_COLOR);
 			entry.barRegen = new ColorGui(HP_BAR_REG_COLOR);
+			entry.barDamage = new ColorGui(HP_BAR_DAMAGE_COLOR);
 			entry.barFill = new ColorGui(HP_BAR_FILL_HIGH);
 			this.addChild(entry.barBg);
 			this.addChild(entry.barRegen);
+			this.addChild(entry.barDamage);
 			this.addChild(entry.barFill);
 		}
 		this.entries.set(id, entry);
@@ -225,6 +237,31 @@ class NameplateGui extends terra.export.GuiElement {
 				const barX = anchorX - W * scale * 0.5;
 				const barY = stackY - (H + o) * scale;
 				const ratio = clampRatio(hp);
+
+				// Lost-HP flash: remember the pre-damage level, hold it briefly, then drain
+				// it toward the current HP. Drawn from 0, so the fill hides all but the lost
+				// slice.
+				if (entry.hpShown == null) {
+					entry.damage = ratio;
+					entry.damageHold = 0;
+				}
+				else if (ratio < entry.hpShown - 1e-4) {
+					entry.damage = Math.max(entry.damage, entry.hpShown);
+					entry.damageHold = HP_BAR_DAMAGE_HOLD;
+				}
+				entry.hpShown = ratio;
+				const dt = terra.export.g_tick?.real ?? 0;
+				if (entry.damage > ratio) {
+					if (entry.damageHold > 0)
+						entry.damageHold = Math.max(0, entry.damageHold - dt);
+					else
+						entry.damage = Math.max(ratio, entry.damage - HP_BAR_DAMAGE_SPEED * dt);
+				}
+				else {
+					entry.damage = ratio;
+					entry.damageHold = 0;
+				}
+
 				// Pending-heal preview extends from the current HP to where it will stop.
 				const target = Math.max(ratio, clampRatio(hpTarget ?? hp));
 				const px = (lx) => barX + lx * scale;
@@ -236,6 +273,7 @@ class NameplateGui extends terra.export.GuiElement {
 				layoutBar(entry.barOutline[3], scale, px(W), py(0), o, H);
 				layoutBar(entry.barBg, scale, barX, barY, W, H);
 				layoutBar(entry.barRegen, scale, barX, barY, Math.max(0.0001, W * target), H);
+				layoutBar(entry.barDamage, scale, barX, barY, Math.max(0.0001, W * entry.damage), H);
 				layoutBar(entry.barFill, scale, barX, barY, Math.max(0.0001, W * ratio), H);
 				hpBarFillColor(entry.barFill.color, ratio);
 				// Raise the baseline above the bar for the name: bar fill plus one outline
@@ -288,6 +326,7 @@ class NameplateGui extends terra.export.GuiElement {
 				if (entry.barOutline) for (const seg of entry.barOutline) this.removeChild(seg);
 				if (entry.barBg) this.removeChild(entry.barBg);
 				if (entry.barRegen) this.removeChild(entry.barRegen);
+				if (entry.barDamage) this.removeChild(entry.barDamage);
 				if (entry.barFill) this.removeChild(entry.barFill);
 				this.entries.delete(id);
 			}
