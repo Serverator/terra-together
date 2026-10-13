@@ -273,9 +273,15 @@ class MultiplayerClient extends terra.export.Observable {
 
 				// Player-owned = attached to the player or spawned by a player step
 				// (SPAWN_FX), so ground impacts count too.
+				//
+				// Deliberately test the raw attachment entity, NOT getFollowEntity():
+				// that accessor resolves FOLLOWING/FOLLOW_TARGET alignments to the
+				// attach-entity's *target*. Enemy aim/telegraph fx are attached to the
+				// enemy but aligned onto the player, so getFollowEntity() reports the
+				// player and syncs a stray targeting circle onto the peer.
 				const owner = this.stepContext?.entity;
-				const targetEnt = this.target?.getFollowEntity?.() ?? this.target?.entity ?? null;
-				const onPlayer = isPlayerEntity(targetEnt);
+				const attachedEnt = this.target?.entity ?? null;
+				const onPlayer = isPlayerEntity(attachedEnt);
 
 				if (onPlayer || isPlayerEntity(owner)) {
 					let id = (this._ttFxId = ++fxSyncId);
