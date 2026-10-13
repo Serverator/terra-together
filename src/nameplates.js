@@ -25,7 +25,7 @@ const HP_BAR_OUTLINE = 1;   // px
 const HP_BAR_GAP = 0;       // px between the text and the bar
 // Fill starts at the game's combat HUD green (media/gui/combat.png) and ramps to red
 // at low HP; dark grey track; black outline.
-const HP_BAR_OUTLINE_COLOR = HP_BAR_ENABLED ? new Color(0, 0, 0, 1) : null;
+const HP_BAR_OUTLINE_COLOR = HP_BAR_ENABLED ? new Color(0.06, 0.06, 0.06, 1) : null;
 const HP_BAR_BG_COLOR = HP_BAR_ENABLED ? new Color(55 / 255, 55 / 255, 55 / 255, 1) : null;
 const HP_BAR_FILL_HIGH = HP_BAR_ENABLED ? new Color(44 / 255, 176 / 255, 68 / 255, 1) : null;
 const HP_BAR_FILL_MID = HP_BAR_ENABLED ? new Color(222 / 255, 176 / 255, 32 / 255, 1) : null;
@@ -114,19 +114,24 @@ function layoutBar(bar, scale, x, y, w, h) {
 	bar.hook.size.setC(w, h);
 }
 
-// Green (>=50%) -> amber (25%) -> red (0). Above 50% is a solid green so the fill
-// doesn't sweep through yellow while regenerating.
+// Red (<=20%) -> yellow (50%) -> green (>=80%), interpolated in between. Below 20%
+// and above 80% are solid so the fill doesn't shift while regenerating/dying.
 function hpBarFillColor(color, ratio) {
 	let from, to, t;
-	if (ratio <= 0.25) {
+	if (ratio <= 0.2) {
 		from = HP_BAR_FILL_LOW;
-		to = HP_BAR_FILL_MID;
-		t = ratio / 0.25;
+		to = HP_BAR_FILL_LOW;
+		t = 0;
 	}
 	else if (ratio <= 0.5) {
+		from = HP_BAR_FILL_LOW;
+		to = HP_BAR_FILL_MID;
+		t = (ratio - 0.2) / 0.3;
+	}
+	else if (ratio <= 0.8) {
 		from = HP_BAR_FILL_MID;
 		to = HP_BAR_FILL_HIGH;
-		t = (ratio - 0.25) / 0.25;
+		t = (ratio - 0.5) / 0.3;
 	}
 	else {
 		from = HP_BAR_FILL_HIGH;
