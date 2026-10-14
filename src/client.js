@@ -104,6 +104,12 @@ let soundSyncId = 0;
 let soundStopQueue = [];
 const activeSyncedSounds = new Map();
 
+// Player-owned *infinite* fx (status conditions, hold loops, ...) currently alive on the
+// local player, keyed by their sync id: id -> { fx: FxEntity, desc: descriptor }. Re-sent
+// every frame so a peer entering our room can rebuild lasting fx whose one-shot spawn they
+// dropped while apart.
+const activePersistentFx = new Map();
+
 // Effects aligned to a figure-indexed node fall back to the entity center when
 // the peer's figure lacks that index; clamp to the base figure so they land on it.
 function clampAlignToFigure(ent, align) {
@@ -398,7 +404,8 @@ class MultiplayerClient extends terra.export.Observable {
 
 	// Clear peer actors when entering a new map.
 	onGameMapLoad() {
-		stopAllActorSounds();
+		for (const actor of playerActors.values())
+			clearPeerFx(actor);
 		playerActors.clear();
 		playerUpdates.clear();
 		reviver.onMapLoad();
@@ -415,6 +422,8 @@ class MultiplayerClient extends terra.export.Observable {
 		if (!client)
 			joinServer(undefined, { force: isHosting() });
 
+		for (const actor of playerActors.values())
+			clearPeerFx(actor);
 		playerActors.clear();
 		playerUpdates.clear();
 
@@ -556,6 +565,11 @@ class MultiplayerClient extends terra.export.Observable {
 						else if (this.core?.pos)
 							fx.pos = this.core.pos.clone().v;
 					}
+					// Infinite fx (e.g. status conditions use start(-1)) never end on their own, so a
+					// peer only ever learns of them from a spawn. Remember them to re-send every frame
+					// until they stop, so peers entering our room can rebuild the ones they missed.
+					if (fx.duration < 0)
+						activePersistentFx.set(id, { fx: this, desc: fx });
 					if (client)
 						globalFxQueue.push(fx);
 				}
@@ -585,6 +599,8 @@ class MultiplayerClient extends terra.export.Observable {
 			// hooking it removes them on peers too.
 			let originalFxStop = terra.export.FxEntity.prototype.stop;
 			terra.export.FxEntity.prototype.stop = function (...args) {
+				if (this._ttFxId)
+					activePersistentFx.delete(this._ttFxId);
 				if (this._ttFxId && !this._ttFxStopSent) {
 					this._ttFxStopSent = true;
 					if (client)
@@ -1018,7 +1034,7 @@ function clearPeers() {
 	// Hide any existing peer actors before dropping references, otherwise they stay
 	// rendered in the world as untracked orphans.
 	for (const actor of playerActors.values()) {
-		stopActorSounds(actor);
+		clearPeerFx(actor);
 		setActorTimeFactor(actor, 1);
 		actor.core?.hide();
 	}
@@ -1082,6 +1098,95 @@ function send(data) {
 	}
 }
 
+// Spawn one synced fx on a peer actor from a descriptor sent by its owner. Shared by the
+// one-shot globalFx path and the persistent-fx reconcile below.
+function spawnRemoteFx(actor, fxState) {
+	if (!fxState?.effect)
+		return null;
+
+	const effect = terra.export.Effect.get(fxState.effect);
+	if (!effect)
+		return null;
+
+	const align = clampAlignToFigure(actor, fxState.alignment);
+	const offset = fxState.offset
+		? new Vec3(fxState.offset[0], fxState.offset[1], fxState.offset[2])
+		: undefined;
+
+	let fx;
+	if (fxState.pos) {
+		const p = fxState.pos;
+		fx = effect.spawnPos(new Vec3(p[0], p[1], p[2]));
+	}
+	else {
+		fx = effect.spawnEntity(actor, align, offset, fxState.rel ?? false);
+	}
+
+	if (!fx)
+		return null;
+
+	fx.setDelay(fxState.delay ?? 0);
+	fx.setPart(fxState.part);
+	fx.looped = fxState.looped ?? false;
+	fx.attachGroup = fxState.group;
+	// Mark this spawn as a peer replay: its screen-global steps (vignette/blur/shake) are
+	// suppressed so they don't affect the local player's screen.
+	fx._ttRemotePending = true;
+	fx.start(fxState.duration);
+	return fx;
+}
+
+// Keep a peer's lasting (infinite) fx in step with the owner's current snapshot: spawn the
+// ones we're missing (e.g. a debuff gained while they were away) and stop the ones they no
+// longer have. The owner re-sends the snapshot every frame.
+function reconcilePersistentFx(actor, list) {
+	const map = actor.terraTogether.fxMap;
+	const prev = actor.terraTogether.persistentIds ?? new Set();
+	const next = new Set();
+
+	for (const fxState of list ?? []) {
+		if (fxState?.id == null || !fxState.effect)
+			continue;
+		next.add(fxState.id);
+		// Already shown (matched by id, whether spawned here or by the one-shot globalFx
+		// path): leave the live instance alone.
+		const existing = map[fxState.id];
+		if (existing && !existing.hasEnded?.())
+			continue;
+		const fx = spawnRemoteFx(actor, fxState);
+		if (fx)
+			map[fxState.id] = fx;
+	}
+
+	// Anything shown last frame but no longer reported has ended on the owner's side.
+	for (const id of prev) {
+		if (next.has(id))
+			continue;
+		const fx = map[id];
+		if (fx) {
+			try { fx.stop(0, false); } catch (e) { /* already gone */ }
+			delete map[id];
+		}
+	}
+
+	actor.terraTogether.persistentIds = next;
+}
+
+// Drop every fx/sound we spawned on a peer. Called when they leave the room or disconnect;
+// while they are away we never see their one-shot fxStops, so nothing else cleans up.
+// FxEntity.clearEntity with no group clears all fx attached to the core; world-position
+// one-shots aren't attached and simply play out.
+function clearPeerFx(actor) {
+	if (!actor)
+		return;
+	try { terra.export.FxEntity?.clearEntity?.(actor.core); } catch (e) { /* actor already gone */ }
+	if (actor.terraTogether) {
+		actor.terraTogether.fxMap = {};
+		actor.terraTogether.persistentIds = null;
+	}
+	stopActorSounds(actor);
+}
+
 function createPlayerActor(id) {
 	// A peer is represented by a TerraActor (NPC) added to the world.
 	var actor = new terra.export.TerraActor();
@@ -1091,7 +1196,7 @@ function createPlayerActor(id) {
 	if (actor.actor)
 		actor.actor.phaseOn = false;
 
-	actor.terraTogether = { fxMap: {}, soundMap: {} };
+	actor.terraTogether = { fxMap: {}, soundMap: {}, persistentIds: null, fxHidden: false };
 
 	actor.move?.mainColl?.setType(terra.export.COLL_TYPE.ACTOR);
 
@@ -1156,9 +1261,16 @@ function movePlayerActor(id, state) {
 	if (state.scene == "LOADING" || state.scene == "TITLE"
 		|| state.map != terra.export.g_game.map.active?.path
 		|| (state.variant ?? null) !== (getRogueInfo().variant ?? null)) {
+		// Leaving our room: strip the fx/sounds we spawned on this peer. While they're away
+		// we drop their one-shot fxStops (see the early return below), so nothing else does.
+		if (!actor.terraTogether.fxHidden) {
+			clearPeerFx(actor);
+			actor.terraTogether.fxHidden = true;
+		}
 		actor.core?.hide(justCreated);
 		return;
 	} else {
+		actor.terraTogether.fxHidden = false;
 		actor.core?.show(justCreated);
 	}
 
@@ -1201,43 +1313,14 @@ function movePlayerActor(id, state) {
 	}
 
 	for (const fxState of state.globalFx ?? []) {
-		if (!fxState.effect)
-			continue;
-		
-		let effect = terra.export.Effect.get(fxState.effect);
-
-		if (!effect)
-			continue;
-
-		let align = clampAlignToFigure(actor, fxState.alignment);
-		let offset = fxState.offset
-			? new Vec3(fxState.offset[0], fxState.offset[1], fxState.offset[2])
-			: undefined;
-
-		let fx;
-		if (fxState.pos) {
-			let p = fxState.pos;
-			fx = effect.spawnPos(new Vec3(p[0], p[1], p[2]));
-		}
-		else {
-			fx = effect.spawnEntity(actor, align, offset, fxState.rel ?? false);
-		}
-
-		if (!fx)
-			continue;
-
-		fx.setDelay(fxState.delay ?? 0);
-		fx.setPart(fxState.part)
-		fx.looped = fxState.looped ?? false;
-		fx.attachGroup = fxState.group;
-		// Mark this spawn as a peer replay: its screen-global steps (vignette/blur/
-		// shake) are suppressed so they don't affect the local player's screen.
-		fx._ttRemotePending = true;
-		fx.start(fxState.duration);
-
-		if (fxState.id != null)
+		const fx = spawnRemoteFx(actor, fxState);
+		if (fx && fxState.id != null)
 			actor.terraTogether.fxMap[fxState.id] = fx;
 	}
+
+	// Rebuild our lasting fx the peer missed while we were apart (e.g. a debuff gained
+	// while away), and drop the ones they no longer report.
+	reconcilePersistentFx(actor, state.persistentFx);
 
 	for (const windbox of state.windboxes ?? []) {
 		let handle = terra.export.g_windboxManager.add();
@@ -1387,11 +1470,6 @@ function stopActorSounds(actor) {
 	actor.terraTogether.soundMap = {};
 }
 
-function stopAllActorSounds() {
-	for (const actor of playerActors.values())
-		stopActorSounds(actor);
-}
-
 
 // Mirror the sender's equipped weapon (figure + fade fx) onto the peer actor.
 function updateWeaponState(actor, newWeapon) {
@@ -1520,6 +1598,19 @@ function sendPlayerData(forceSend = false, scene = null) {
 	state.globalFx = [...globalFxQueue];
 	globalFxQueue = [];
 
+	// Full snapshot of our lasting (infinite) fx, re-sent every frame (NOT cleared like the
+	// queues above) so a peer entering the room rebuilds debuffs it missed while we were
+	// apart. Ended instances are pruned here as a backstop.
+	const persistent = [];
+	for (const [id, entry] of activePersistentFx) {
+		if (!entry.fx || entry.fx.hasEnded?.()) {
+			activePersistentFx.delete(id);
+			continue;
+		}
+		persistent.push(entry.desc);
+	}
+	state.persistentFx = persistent;
+
 	state.fxStops = [...fxStopQueue];
 	fxStopQueue = [];
 
@@ -1569,7 +1660,8 @@ function updateOtherPlayers() {
 		if (action == "HIDE") {
 			const actor = playerActors.get(id);
 			if (actor) {
-				stopActorSounds(actor);
+				clearPeerFx(actor);
+				actor.terraTogether.fxHidden = true;
 				// The in-game menu freezes peer actors (time factor 0), which also
 				// freezes the hide fade. Restore normal speed so it can play.
 				setActorTimeFactor(actor, 1);
