@@ -2,6 +2,7 @@
 // (SettingsTab). main.js wires these in.
 
 import { createTextOption, createButtonOption } from "./option-types.js";
+import { createOption } from "./helper.js";
 import * as client from "./client.js";
 import * as server from "./server.js";
 import { createSkinSetting } from "./skin.js";
@@ -9,6 +10,57 @@ import { createSkinSetting } from "./skin.js";
 // Options category; also used as the Options-menu tab key.
 export const CATEGORY = "MULTIPLAYER";
 export const TAB_LABEL = "Multiplayer";
+
+// Host-authoritative revive toggle. The option value is the source of truth; the runtime
+// mirror window.terraTogether.reviveEnabled is what revive.js reads. Clients can't edit
+// it (the checkbox is disabled unless we run the server) and obey the value the host
+// pushes (server.js setHostSetting -> host_setting -> client.js).
+export const REVIVE_OPTION = "tt-revive";
+
+export function isReviveEnabled() {
+	return terra.export.g_options?.get(REVIVE_OPTION) === true;
+}
+
+// Reads the option, keeps the runtime mirror in sync and, when we host, (re)broadcasts it
+// to clients. Call on start-up, on change and whenever hosting starts.
+export function syncRevive() {
+	window.terraTogether ??= {};
+	window.terraTogether.reviveEnabled = isReviveEnabled();
+	if (server.isHosting())
+		server.setHostSetting(REVIVE_OPTION, isReviveEnabled());
+}
+
+// The game's CHECKBOX option type has no enable predicate, so patch its GUI once: grey out
+// and refuse changes when the option's getEnabled() returns false (host-only setting).
+function installHostOnlyCheckbox() {
+	const Gui = terra.export.OptionGuiTypeBuilder?.builders?.get("CHECKBOX");
+	if (!Gui?.prototype?.submitChange || Gui.prototype._ttHostOnly)
+		return;
+	Gui.prototype._ttHostOnly = true;
+
+	const submit = Gui.prototype.submitChange;
+	Gui.prototype.submitChange = function (value) {
+		const enabled = this.option?.getEnabled;
+		if (typeof enabled === "function" && !enabled.call(this.option)) {
+			terra.export.g_menuSFX?.blocked?.();
+			return;
+		}
+		return submit.call(this, value);
+	};
+
+	if (Gui.prototype.updateCurrent) {
+		const update = Gui.prototype.updateCurrent;
+		Gui.prototype.updateCurrent = function (focus = false) {
+			update.call(this, focus);
+			const enabled = this.option?.getEnabled;
+			if (typeof enabled === "function" && !enabled.call(this.option)) {
+				const grey = terra.export.ColorDecorator?.GREY ?? null;
+				this.on?.setDecorator(grey);
+				this.off?.setDecorator(grey);
+			}
+		};
+	}
+}
 
 // Adds the mod's settings. Call once at startup, before Options builds its lists.
 export function createModSettings() {
@@ -91,6 +143,25 @@ export function createModSettings() {
 	if (g_options.values["tt-nameplate-scale"] === undefined)
 		g_options.values["tt-nameplate-scale"] = nameplateScaleData.type.default;
 
+	// === Gameplay ===
+
+	// Host-authoritative boolean. Only whoever runs the server can toggle it; clients
+	// see and obey the host's value. getEnabled() gates the (patched) checkbox.
+	installHostOnlyCheckbox();
+	const reviveOption = createOption(REVIVE_OPTION, {
+		header: "Gameplay",
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Revive Teammates" },
+		description: { en_US: "When a player would die with a living teammate nearby, they go down instead of respawning, and a teammate can revive them.\n\nSet by the host; other players obey." },
+		type: { default: false, type: "CHECKBOX" }
+	}, "CHECKBOX");
+	// Editable only while we host (or are offline); otherwise we follow the host's value.
+	reviveOption.getEnabled = () => server.isHosting() || (!client.isConnected() && !client.isConnecting());
+
+	// Mirror the stored host preference into the runtime flag at start-up.
+	syncRevive();
+
 	// === Connection ===
 
 	const addressOption = createTextOption("tt-server-address", {
@@ -158,7 +229,7 @@ export function createModSettings() {
 			// Only join once the server is actually listening: joining immediately races
 			// the bind, so the first attempt is refused and logs a connection error.
 			server.startServer("0.0.0.0", port)
-				.then(() => client.joinServer(undefined, { force: true }))
+				.then(() => { client.joinServer(undefined, { force: true }); syncRevive(); })
 				.catch(() => { /* startServer already logged the failure */ });
 		}
 	});

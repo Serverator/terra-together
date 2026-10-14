@@ -38,6 +38,15 @@ const HP_BAR_REG_COLOR = HP_BAR_ENABLED ? new Color(55 / 255, 110 / 255, 110 / 2
 const HP_BAR_DAMAGE_COLOR = HP_BAR_ENABLED ? new Color(255 / 255, 168 / 255, 110 / 255, 1) : null;
 const HP_BAR_DAMAGE_HOLD = 0.35;   // seconds before the pink starts draining
 const HP_BAR_DAMAGE_SPEED = 0.4;   // fraction of max HP per second
+// Downed/revive bars: darker purple = bleed-out time remaining, lighter purple = how
+// far a teammate's revive has progressed.
+const HP_BAR_DOWNED_COLOR = HP_BAR_ENABLED ? new Color(150 / 255, 60 / 255, 220 / 255, 1) : null;
+const HP_BAR_REVIVE_COLOR = HP_BAR_ENABLED ? new Color(205 / 255, 130 / 255, 255 / 255, 1) : null;
+
+function setBarColor(color, src) {
+	if (!color || !src) return;
+	color.r = src.r; color.g = src.g; color.b = src.b; color.a = src.a;
+}
 
 // Radio index -> scale; must match the "Nameplate Scale" list in settings.js.
 const NAMEPLATE_SCALES = [0.5, 1.0, 1.5];
@@ -188,7 +197,7 @@ class NameplateGui extends terra.export.GuiElement {
 		return entry;
 	}
 
-	updateEntry(id, actor, name, hp, hpTarget, showName, showBar) {
+	updateEntry(id, actor, name, hp, hpTarget, showName, showBar, downedFrac = null, reviveFrac = null) {
 		const entry = this.entries.get(id) ?? this.createEntry(id);
 
 		// The name and the HP bar are independent: either can show without the other.
@@ -241,34 +250,6 @@ class NameplateGui extends terra.export.GuiElement {
 				// Bar bottom (including its bottom outline) rests on the baseline.
 				const barX = anchorX - W * scale * 0.5;
 				const barY = stackY - (H + o) * scale;
-				const ratio = clampRatio(hp);
-
-				// Lost-HP flash: remember the pre-damage level, hold it briefly, then drain
-				// it toward the current HP. Drawn from 0, so the fill hides all but the lost
-				// slice.
-				if (entry.hpShown == null) {
-					entry.damage = ratio;
-					entry.damageHold = 0;
-				}
-				else if (ratio < entry.hpShown - 1e-4) {
-					entry.damage = Math.max(entry.damage, entry.hpShown);
-					entry.damageHold = HP_BAR_DAMAGE_HOLD;
-				}
-				entry.hpShown = ratio;
-				const dt = terra.export.g_tick?.real ?? 0;
-				if (entry.damage > ratio) {
-					if (entry.damageHold > 0)
-						entry.damageHold = Math.max(0, entry.damageHold - dt);
-					else
-						entry.damage = Math.max(ratio, entry.damage - HP_BAR_DAMAGE_SPEED * dt);
-				}
-				else {
-					entry.damage = ratio;
-					entry.damageHold = 0;
-				}
-
-				// Pending-heal preview extends from the current HP to where it will stop.
-				const target = Math.max(ratio, clampRatio(hpTarget ?? hp));
 				const px = (lx) => barX + lx * scale;
 				const py = (ly) => barY + ly * scale;
 				// Outline edges only: the 4 corner pixels are left empty (rounded corners).
@@ -277,10 +258,54 @@ class NameplateGui extends terra.export.GuiElement {
 				layoutBar(entry.barOutline[2], scale, px(-o), py(0), o, H);
 				layoutBar(entry.barOutline[3], scale, px(W), py(0), o, H);
 				layoutBar(entry.barBg, scale, barX, barY, W, H);
-				layoutBar(entry.barRegen, scale, barX, barY, Math.max(0.0001, W * target), H);
-				layoutBar(entry.barDamage, scale, barX, barY, Math.max(0.0001, W * entry.damage), H);
-				layoutBar(entry.barFill, scale, barX, barY, Math.max(0.0001, W * ratio), H);
-				hpBarFillColor(entry.barFill.color, ratio);
+
+				if (downedFrac != null) {
+					// Downed: bleed-out time (darker) with revive progress (lighter) over it.
+					setBarColor(entry.barRegen.color, HP_BAR_DOWNED_COLOR);
+					setBarColor(entry.barFill.color, HP_BAR_REVIVE_COLOR);
+					layoutBar(entry.barDamage, scale, barX, barY, 0.0001, H);
+					layoutBar(entry.barRegen, scale, barX, barY, Math.max(0.0001, W * clampRatio(downedFrac)), H);
+					layoutBar(entry.barFill, scale, barX, barY, Math.max(0.0001, W * clampRatio(reviveFrac ?? 0)), H);
+					entry.hpShown = null;
+					entry.damage = 0;
+					entry.damageHold = 0;
+				}
+				else {
+					const ratio = clampRatio(hp);
+
+					// Lost-HP flash: remember the pre-damage level, hold it briefly, then drain
+					// it toward the current HP. Drawn from 0, so the fill hides all but the lost
+					// slice.
+					if (entry.hpShown == null) {
+						entry.damage = ratio;
+						entry.damageHold = 0;
+					}
+					else if (ratio < entry.hpShown - 1e-4) {
+						entry.damage = Math.max(entry.damage, entry.hpShown);
+						entry.damageHold = HP_BAR_DAMAGE_HOLD;
+					}
+					entry.hpShown = ratio;
+					const dt = terra.export.g_tick?.real ?? 0;
+					if (entry.damage > ratio) {
+						if (entry.damageHold > 0)
+							entry.damageHold = Math.max(0, entry.damageHold - dt);
+						else
+							entry.damage = Math.max(ratio, entry.damage - HP_BAR_DAMAGE_SPEED * dt);
+					}
+					else {
+						entry.damage = ratio;
+						entry.damageHold = 0;
+					}
+
+					// Pending-heal preview extends from the current HP to where it will stop.
+					const target = Math.max(ratio, clampRatio(hpTarget ?? hp));
+					setBarColor(entry.barRegen.color, HP_BAR_REG_COLOR);
+					setBarColor(entry.barDamage.color, HP_BAR_DAMAGE_COLOR);
+					layoutBar(entry.barRegen, scale, barX, barY, Math.max(0.0001, W * target), H);
+					layoutBar(entry.barDamage, scale, barX, barY, Math.max(0.0001, W * entry.damage), H);
+					layoutBar(entry.barFill, scale, barX, barY, Math.max(0.0001, W * ratio), H);
+					hpBarFillColor(entry.barFill.color, ratio);
+				}
 				// Raise the baseline above the bar for the name: bar fill plus one outline
 				// (so the name sits on the top outline, as before) plus the configured gap.
 				stackY -= (H + o + HP_BAR_GAP) * scale;
@@ -309,18 +334,23 @@ class NameplateGui extends terra.export.GuiElement {
 				const peerName = nameMode >= 1;
 				const peerBar = hpMode >= 1;
 				if (actors && (peerName || peerBar)) {
+					const rs = window.terraTogether?.reviveState;
 					for (const [id, actor] of actors) {
 						active.add(id);
-						this.updateEntry(id, actor, names?.get(id), actor?.terraTogether?.hp, actor?.terraTogether?.hpTarget, peerName, peerBar);
+						const downedFrac = actor?.terraTogether?.downedFrac ?? null;
+						const reviveFrac = rs?.target === id ? rs.targetFrac : null;
+						this.updateEntry(id, actor, names?.get(id), actor?.terraTogether?.hp, actor?.terraTogether?.hpTarget, peerName, peerBar || downedFrac != null, downedFrac, reviveFrac);
 					}
 				}
 				const selfName = nameMode >= 2;
 				const selfBar = hpMode >= 2;
-				if (selfName || selfBar) {
+				const rs = window.terraTogether?.reviveState;
+				const selfDownedFrac = rs?.selfDownedFrac ?? null;
+				if (selfName || selfBar || selfDownedFrac != null) {
 					active.add(NAMEPLATE_SELF_ID);
 					const params = terra.export.g_player?.combat?.params;
 					this.updateEntry(NAMEPLATE_SELF_ID, terra.export.g_player?.entity, terra.export.g_options?.get(USERNAME_OPTION),
-						params?.getHPRatio?.(), params?.getHPRatio?.(0, true), selfName, selfBar);
+						params?.getHPRatio?.(), params?.getHPRatio?.(0, true), selfName, selfBar || selfDownedFrac != null, selfDownedFrac, rs?.selfReviveFrac ?? null);
 				}
 			}
 		}

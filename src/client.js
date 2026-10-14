@@ -2,6 +2,7 @@ export { joinServer, leaveServer, disconnect, isConnected, isConnecting, send }
 
 import { skins } from "./skin.js";
 import { isHosting, getHostPort } from "./server.js";
+import { Reviver } from "./revive.js";
 
 const { SCENE_STATE, SCENE_EVENT } = terra.file.sceneTypes;
 
@@ -29,6 +30,16 @@ window.terraTogether.playerNames = playerNames;
 const playerUpdates = new Map();
 const playerActions = new Map();
 
+// Network ids of other connected players (drives hasPeers()).
+const peers = new Set();
+
+// Downed/revive state (see revive.js): whether our own player is down, and per-peer
+// down state propagated through the normal player state sync.
+let localDowned = false;
+const peerDowned = new Map();
+function setLocalDowned(value) { localDowned = !!value; }
+function getPeerDowned() { return peerDowned; }
+
 // Last known rogue identity per peer: { seed, variant }. Kept sticky (not cleared
 // every frame) so an in-progress run's seed stays available to adopt later.
 const peerRogue = new Map();
@@ -52,6 +63,22 @@ function getServerUrl() {
 	const port = getSetting("tt-server-port", 17005);
 	return `ws://${host}:${port}`;
 }
+
+// True while at least one other player is connected.
+function hasPeers() {
+	return peers.size > 0;
+}
+
+// Downed/revive handling lives in its own module.
+const reviver = new Reviver({
+	send,
+	isConnected,
+	hasPeers,
+	getLocalId: () => playerId,
+	getPlayerActors: () => playerActors,
+	getPeerDowned,
+	setLocalDowned,
+});
 
 let actorFxQueue = [];
 let globalFxQueue = [];
@@ -362,6 +389,7 @@ function spawnRemoteProjectile(actor, p) {
 class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
 		updateOtherPlayers();
+		reviver.onPreUpdate();
 	}
 
 	onPostUpdate() {
@@ -373,6 +401,7 @@ class MultiplayerClient extends terra.export.Observable {
 		stopAllActorSounds();
 		playerActors.clear();
 		playerUpdates.clear();
+		reviver.onMapLoad();
 	}
 
 	onOptionEvent(event, key) {
@@ -427,6 +456,7 @@ class MultiplayerClient extends terra.export.Observable {
 
 	onLoopStart() {
 		installRogueSeedHook();
+		reviver.onLoopStart();
 
 		terra.export.g_scene.observers.push(this);
 		terra.export.g_options.observers.push(this);
@@ -782,6 +812,7 @@ function updatePlayerState(id, state) {
 	// so variant matching stays correct and its seed can still be adopted.
 	if (state)
 		peerRogue.set(id, { seed: state.seed ?? null, variant: state.variant ?? null });
+	peerDowned.set(id, !!state?.downed);
 
 	let scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 	let lastUpdate = playerUpdates.get(id);
@@ -876,8 +907,22 @@ function joinServer(address, options = {}) {
 					send({ type: "profile", username: getUsername() });
 					break;
 
+				case "host_setting":
+					// Host-authoritative: the host's revive toggle, obeyed by every client.
+					// Apply with skipNotify so it does NOT re-fire CHANGED (which would
+					// re-broadcast it and loop); set the runtime flag directly instead.
+					if (msg.key === "tt-revive") {
+						const on = msg.value === true;
+						window.terraTogether.reviveEnabled = on;
+						const g = terra.export.g_options;
+						if (g?.settings?.["tt-revive"] && g.get("tt-revive") !== on)
+							g.set("tt-revive", on, true);
+					}
+					break;
+
 				case "player_profile":
 					playerNames.set(msg.id, msg.username);
+					peers.add(msg.id);
 					break;
 
 				case "update":
@@ -886,6 +931,7 @@ function joinServer(address, options = {}) {
 
 				case "player_joined":
 					console.log(`[TT Client] Player ${msg.id} joined`);
+					peers.add(msg.id);
 					updatePlayerState(msg.id, msg.state);
 					break;
 
@@ -903,12 +949,19 @@ function joinServer(address, options = {}) {
 				case "player_left":
 					playerActions.set(msg.id, "HIDE");
 					playerNames.delete(msg.id);
+					peers.delete(msg.id);
 					peerRogue.delete(msg.id);
+					peerDowned.delete(msg.id);
 					console.log(`[TT Client] Player ${msg.id} left`);
 					break;
 
 				case "join_map":
 					console.log(`[TT Client] Player ${msg.id} joined map '${msg.map}'`);
+					break;
+
+				case "revive":
+				case "revive_progress":
+					reviver.onMessage(msg);
 					break;
 			}
 		} catch (err) {
@@ -973,6 +1026,10 @@ function clearPeers() {
 	playerUpdates.clear();
 	playerNames.clear();
 	peerRogue.clear();
+	peers.clear();
+	peerDowned.clear();
+	localDowned = false;
+	reviver.onConnectionReset();
 	playerId = null;
 	connecting = false;
 }
@@ -1132,6 +1189,10 @@ function movePlayerActor(id, state) {
 	actor.terraTogether.hp = typeof state.hp === "number" ? Math.max(0, Math.min(1, state.hp)) : 1;
 	// Where HP will stop once pending heals (HoT) tick in.
 	actor.terraTogether.hpTarget = typeof state.hp_target === "number" ? Math.max(0, Math.min(1, state.hp_target)) : actor.terraTogether.hp;
+	// Downed bleed-out fraction (0..1 left) for the purple nameplate bar.
+	actor.terraTogether.downedFrac = state.downed
+		? (typeof state.downedFrac === "number" ? Math.max(0, Math.min(1, state.downedFrac)) : 1)
+		: null;
 
 	if (actor.actorExt.actorFx) {
 		for (const fx of state.actorFx ?? []) {
@@ -1422,6 +1483,9 @@ function sendPlayerData(forceSend = false, scene = null) {
 	state.figure = g_player.entity?.view?.getFigure()?.name;
 
 	state.scene = scene;
+
+	state.downed = localDowned;
+	state.downedFrac = reviver.downedFraction();
 
 	state.map = terra.export.g_game.map.active?.path;
 

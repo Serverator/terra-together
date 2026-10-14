@@ -1,10 +1,25 @@
-export { startServer, stopServer, send, broadcast, isHosting, getHostPort };
+export { startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting };
 
 import { WebSocketServer } from "./ws.js";
 
 let server = null;
 let hostPort = 17005;
 const clientsSockets = new Map();
+
+// Host-authoritative settings (e.g. the revive toggle), pushed by the host process and
+// replayed to every client as it connects. The server runs in the host's process, so
+// clients can't set these — they only ever receive them.
+const hostSettings = {};
+
+function setHostSetting(key, value) {
+	// Only broadcast on an actual change. The host's own client also receives these
+	// (broadcast hits every socket), so without this guard applying the value would
+	// echo straight back as another broadcast — an endless loop.
+	if (hostSettings[key] === value)
+		return;
+	hostSettings[key] = value;
+	broadcast({ type: "host_setting", key, value });
+}
 
 // Server need to store current location of players to send to new players
 const playerData = new Map();
@@ -39,6 +54,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		clientsSockets.set(socket, { id: playerId });
 
 		send(socket, { type: "welcome", id: playerId });
+
+		// Replay the host's settings to the newcomer.
+		for (const [key, value] of Object.entries(hostSettings))
+			send(socket, { type: "host_setting", key, value });
 
 		// Existing players broadcast their state every frame, and the "join_map"
 		// handler syncs on map entry, so no extra state sync is needed here.
@@ -87,6 +106,12 @@ function startServer(host = '0.0.0.0', port = 17005) {
 							if (state.scene == "MENU" && playerId != id && msg.map == state.map && (msg.variant ?? null) == (state.variant ?? null))
 								send(socket, { type: "update", id, state });
 						}
+						break;
+
+					case "revive":
+					case "revive_progress":
+						// Downed/revive handshake: relay verbatim to everyone but the sender.
+						broadcast(msg, socket);
 						break;
 
 					default:
