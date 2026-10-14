@@ -38,6 +38,10 @@ const HP_BAR_REG_COLOR = HP_BAR_ENABLED ? new Color(55 / 255, 110 / 255, 110 / 2
 const HP_BAR_DAMAGE_COLOR = HP_BAR_ENABLED ? new Color(255 / 255, 168 / 255, 110 / 255, 1) : null;
 const HP_BAR_DAMAGE_HOLD = 0.35;   // seconds before the pink starts draining
 const HP_BAR_DAMAGE_SPEED = 0.4;   // fraction of max HP per second
+// Top-pixel sheen: a lighter top row over the 2px bar gives it a little depth.
+// Drawn as a translucent white overlay so it blends with whatever is beneath
+// (fill, regen/damage slices, track, and the downed/revive bars).
+const HP_BAR_GLOSS_COLOR = HP_BAR_ENABLED ? new Color(1, 1, 1, 0.3) : null;
 // Downed/revive bars: darker purple = bleed-out time remaining, lighter purple = how
 // far a teammate's revive has progressed.
 const HP_BAR_DOWNED_COLOR = HP_BAR_ENABLED ? new Color(150 / 255, 60 / 255, 220 / 255, 1) : null;
@@ -100,6 +104,7 @@ function hideBar(entry) {
 	entry.barRegen?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
 	entry.barDamage?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
 	entry.barFill?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
+	entry.barGloss?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
 	// Forget the last-shown HP so a re-shown bar doesn't flash a stale drop.
 	entry.hpShown = null;
 	entry.damageHold = 0;
@@ -174,7 +179,7 @@ class NameplateGui extends terra.export.GuiElement {
 		text.setAlign(terra.export.GUI_ALIGN_X.LEFT, terra.export.GUI_ALIGN_Y.TOP);
 		text.setPivot(0, 0);
 		text.hook.scale = getNameplateScale();
-		const entry = { text, name: null, barOutline: null, barBg: null, barRegen: null, barDamage: null, barFill: null, hpShown: null, damage: 0, damageHold: 0 };
+		const entry = { text, name: null, barOutline: null, barBg: null, barRegen: null, barDamage: null, barFill: null, barGloss: null, hpShown: null, damage: 0, damageHold: 0 };
 		if (HP_BAR_ENABLED) {
 			// Outline as 4 edges with the corner pixels omitted, so the bar looks rounded.
 			entry.barOutline = [];
@@ -187,10 +192,13 @@ class NameplateGui extends terra.export.GuiElement {
 			entry.barRegen = new ColorGui(HP_BAR_REG_COLOR);
 			entry.barDamage = new ColorGui(HP_BAR_DAMAGE_COLOR);
 			entry.barFill = new ColorGui(HP_BAR_FILL_HIGH);
+			entry.barGloss = new ColorGui(HP_BAR_GLOSS_COLOR);
 			this.addChild(entry.barBg);
 			this.addChild(entry.barRegen);
 			this.addChild(entry.barDamage);
 			this.addChild(entry.barFill);
+			// Added last so its top row draws over the fill/slices/track.
+			this.addChild(entry.barGloss);
 		}
 		this.entries.set(id, entry);
 		this.addChild(text);
@@ -259,6 +267,10 @@ class NameplateGui extends terra.export.GuiElement {
 				layoutBar(entry.barOutline[3], scale, px(W), py(0), o, H);
 				layoutBar(entry.barBg, scale, barX, barY, W, H);
 
+				// Fraction (0..1) of the bar that is coloured (i.e. not empty track); the sheen
+				// only covers that part. Set per state below.
+				let glossFrac = 0;
+
 				if (downedFrac != null) {
 					// Downed: bleed-out time (darker) with revive progress (lighter) over it.
 					setBarColor(entry.barRegen.color, HP_BAR_DOWNED_COLOR);
@@ -266,6 +278,7 @@ class NameplateGui extends terra.export.GuiElement {
 					layoutBar(entry.barDamage, scale, barX, barY, 0.0001, H);
 					layoutBar(entry.barRegen, scale, barX, barY, Math.max(0.0001, W * clampRatio(downedFrac)), H);
 					layoutBar(entry.barFill, scale, barX, barY, Math.max(0.0001, W * clampRatio(reviveFrac ?? 0)), H);
+					glossFrac = Math.max(clampRatio(downedFrac), clampRatio(reviveFrac ?? 0));
 					entry.hpShown = null;
 					entry.damage = 0;
 					entry.damageHold = 0;
@@ -305,7 +318,11 @@ class NameplateGui extends terra.export.GuiElement {
 					layoutBar(entry.barDamage, scale, barX, barY, Math.max(0.0001, W * entry.damage), H);
 					layoutBar(entry.barFill, scale, barX, barY, Math.max(0.0001, W * ratio), H);
 					hpBarFillColor(entry.barFill.color, ratio);
+					glossFrac = Math.max(ratio, target, entry.damage);
 				}
+				// Sheen: a lighter top pixel row, drawn only over the coloured portion so the
+				// empty track stays flat.
+				layoutBar(entry.barGloss, scale, barX, barY, Math.max(0.0001, W * clampRatio(glossFrac)), 1);
 				// Raise the baseline above the bar for the name: bar fill plus one outline
 				// (so the name sits on the top outline, as before) plus the configured gap.
 				stackY -= (H + o + HP_BAR_GAP) * scale;
@@ -363,6 +380,7 @@ class NameplateGui extends terra.export.GuiElement {
 				if (entry.barRegen) this.removeChild(entry.barRegen);
 				if (entry.barDamage) this.removeChild(entry.barDamage);
 				if (entry.barFill) this.removeChild(entry.barFill);
+				if (entry.barGloss) this.removeChild(entry.barGloss);
 				this.entries.delete(id);
 			}
 		}
