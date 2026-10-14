@@ -17,6 +17,9 @@ export const TAB_LABEL = "Multiplayer";
 // pushes (server.js setHostSetting -> host_setting -> client.js).
 export const REVIVE_OPTION = "tt-revive";
 
+// Host-authoritative area-heal toggle ("Estus Heals Allies"). Off by default.
+export const ESTUS_OPTION = "tt-estus-share";
+
 export function isReviveEnabled() {
 	return terra.export.g_options?.get(REVIVE_OPTION) === true;
 }
@@ -28,6 +31,18 @@ export function syncRevive() {
 	window.terraTogether.reviveEnabled = isReviveEnabled();
 	if (server.isHosting())
 		server.setHostSetting(REVIVE_OPTION, isReviveEnabled());
+}
+
+export function isEstusShareEnabled() {
+	return terra.export.g_options?.get(ESTUS_OPTION) === true;
+}
+
+// Same host-authoritative mirroring as syncRevive(), for the estus area heal.
+export function syncEstusShare() {
+	window.terraTogether ??= {};
+	window.terraTogether.estusShareEnabled = isEstusShareEnabled();
+	if (server.isHosting())
+		server.setHostSetting(ESTUS_OPTION, isEstusShareEnabled());
 }
 
 // The game's CHECKBOX option type has no enable predicate, so patch its GUI once: grey out
@@ -159,8 +174,21 @@ export function createModSettings() {
 	// Editable only while we host (or are offline); otherwise we follow the host's value.
 	reviveOption.getEnabled = () => server.isHosting() || (!client.isConnected() && !client.isConnecting());
 
+	// Host-authoritative boolean: drinking your flask also heals nearby players. Off by default.
+	const estusShareOption = createOption(ESTUS_OPTION, {
+		header: "Gameplay",
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Estus Heals Allies" },
+		description: { en_US: "Drinking your estus flask also heals nearby players by the same amount. A downed teammate in range is revived. Only your own flask is consumed.\n\nSet by the host; other players obey." },
+		type: { default: false, type: "CHECKBOX" }
+	}, "CHECKBOX");
+	// Editable only while we host (or are offline); otherwise we follow the host's value.
+	estusShareOption.getEnabled = () => server.isHosting() || (!client.isConnected() && !client.isConnecting());
+
 	// Mirror the stored host preference into the runtime flag at start-up.
 	syncRevive();
+	syncEstusShare();
 
 	// === Connection ===
 
@@ -229,7 +257,7 @@ export function createModSettings() {
 			// Only join once the server is actually listening: joining immediately races
 			// the bind, so the first attempt is refused and logs a connection error.
 			server.startServer("0.0.0.0", port)
-				.then(() => { client.joinServer(undefined, { force: true }); syncRevive(); })
+				.then(() => { client.joinServer(undefined, { force: true }); syncRevive(); syncEstusShare(); })
 				.catch(() => { /* startServer already logged the failure */ });
 		}
 	});

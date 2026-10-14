@@ -1,0 +1,290 @@
+// Area estus heal (multiplayer).
+//
+// When a player drinks their estus flask, every other player within `radius` is healed
+// too. The heal is exactly what the *user's* flask produces (same amount + HoT duration),
+// but recipients do NOT spend their own charges — only the user spends one.
+//
+// A downed teammate in range is instead instantly revived at 25% (the same factor
+// revive.js uses); that instant healing counts against the flask, so only the remainder
+// is delivered as the estus heal-over-time.
+//
+// Peers are visual-only actors with no combat component (see client.js createPlayerActor),
+// so we can't heal them locally: each client heals its OWN g_player. We detect the flask
+// use locally, wait for the user's own heal to finish (the flask's HoT ticking out), then
+// broadcast; recipients re-check the distance against the sender's tracked actor, so only
+// players still near the healer are affected.
+//
+// Works in rogue (the heal carries no rogue guard; only the downed/revive path is
+// rogue-gated elsewhere — see revive.js goDowned).
+
+export { AreaHealer };
+
+const PLAYER_ITEM_DIR = terra.export.PLAYER_ITEM_DIR;
+// Frame delta is clamped so a hitch (or an unpause) can't fast-forward the timer.
+const MAX_DT = 0.1;
+
+// Tunables, also exposed at runtime as window.terraTogether.areaHealConfig.
+const CONFIG = {
+	radius: 4.0,      // world units (XY): heal range. Slightly more than revive's 3.0.
+	// Safety cap on how long we wait for the local heal to complete before sending.
+	// The flask's HoT is at most a few seconds; this only catches abnormal states.
+	maxWait: 8,
+};
+
+// Host-controlled (Options > Multiplayer > Estus Heals Allies). Default OFF. Prefers the
+// runtime mirror (kept in sync by settings.js), falling back to the option value itself.
+function enabled() {
+	if (window.terraTogether?.estusShareEnabled === true)
+		return true;
+	return terra.export.g_options?.get?.("tt-estus-share") === true;
+}
+
+// Real-time frame delta (seconds), or 0 while the loop is paused. Uses g_tick.real so a
+// game slow-motion doesn't stretch the wait.
+function dt() {
+	if (terra.export.g_system?.loopPaused)
+		return 0;
+	const real = terra.export.g_tick?.real;
+	return typeof real === "number" && real > 0 ? Math.min(real, MAX_DT) : 1 / 60;
+}
+
+function dist2(a, b) {
+	const dx = a.x - b.x, dy = a.y - b.y;
+	return dx * dx + dy * dy;
+}
+
+class AreaHealer {
+	// host: { send, isConnected, hasPeers, getLocalId, getPlayerActors, getPeerDowned,
+	//         isSelfDowned, reviveLocal }
+	constructor(host) {
+		this.host = host;
+		this.installed = false;
+		// Pending outgoing broadcast while the user's own heal finishes.
+		// { params, hot, data } — hot is the flask's HoT (or null when there is none).
+		this.pending = null;
+		this.wait = 0;
+
+		window.terraTogether ??= {};
+		window.terraTogether.areaHealConfig = CONFIG;
+	}
+
+	debug(...args) {
+		if (window.terraTogether?.areaHealDebug)
+			console.debug("[TT heal]", ...args);
+	}
+
+	// ---- addon hooks --------------------------------------------------------
+
+	onLoopStart() {
+		if (this.installed)
+			return;
+		const PlayerCuisine = terra.export.PlayerCuisine;
+		if (!PlayerCuisine?.prototype?.useItem) {
+			console.warn("[TT heal] PlayerCuisine.useItem not found; area heal disabled.");
+			return;
+		}
+		this.installed = true;
+
+		const self = this;
+		const originalUseItem = PlayerCuisine.prototype.useItem;
+		PlayerCuisine.prototype.useItem = function (dir) {
+			const params = terra.export.g_player?.combat?.params;
+			const estus = this.estus;
+			const beforeCharges = estus?.charges ?? 0;
+
+			// Let the flask be drunk at full HP when it would only help a nearby ally.
+			// Vanilla gates the estus branch on isHotFullyHealed(); shadow that one call
+			// so the rest of the vanilla path (charge, fx, event, trackers) runs untouched.
+			let forced = false;
+			if (enabled()
+				&& dir === PLAYER_ITEM_DIR?.DOWN
+				&& estus?.hasCharges?.()
+				&& params?.isHotFullyHealed?.()
+				&& self.hasNeedyPeer()) {
+				params.isHotFullyHealed = () => false;
+				forced = true;
+			}
+
+			// Snapshot the HoT list so we can find the one the flask is about to start.
+			const hotsBefore = params?.hots ? params.hots.slice() : null;
+			let result;
+			try {
+				result = originalUseItem.call(this, dir);
+			}
+			finally {
+				if (forced)
+					delete params.isHotFullyHealed;
+			}
+
+			// The flask was actually drunk (a charge went away); queue the broadcast.
+			if (result === true && (estus?.charges ?? 0) < beforeCharges)
+				self.beginSend(params, hotsBefore);
+
+			return result;
+		};
+
+		// The input handler refuses a full-HP flask use *before* useItem is ever called
+		// (player-cmp.js:1437, "healFull" fx). It checks g_player.combat.isFullyHealed(),
+		// which just delegates to params.isHotFullyHealed() (player-combat.js:930), so we
+		// shadow the same predicate across the call when a nearby ally needs the heal.
+		const PlayerCmp = terra.export.PlayerCmp;
+		if (PlayerCmp?.prototype?.handleItemUse) {
+			const originalHandleItemUse = PlayerCmp.prototype.handleItemUse;
+			PlayerCmp.prototype.handleItemUse = function (input) {
+				const params = terra.export.g_player?.combat?.params;
+				const estus = terra.export.g_player?.cuisine?.estus;
+				let forced = false;
+				if (enabled() && estus?.hasCharges?.() && params?.isHotFullyHealed?.() && self.hasNeedyPeer()) {
+					params.isHotFullyHealed = () => false;
+					forced = true;
+				}
+				try {
+					return originalHandleItemUse.call(this, input);
+				}
+				finally {
+					if (forced)
+						delete params.isHotFullyHealed;
+				}
+			};
+		}
+		else {
+			console.warn("[TT heal] PlayerCmp.handleItemUse not found; full-HP flask use stays blocked.");
+		}
+
+		console.debug("[TT heal] estus area-heal hooks installed (enabled=" + enabled() + ")");
+	}
+
+	onPreUpdate() {
+		if (!this.installed || !this.pending)
+			return;
+		const step = dt();
+		if (step <= 0)
+			return;
+		const { params, hot } = this.pending;
+		this.wait += step;
+		// The HoT is removed from params.hots when it ticks out (combat-params.js:385).
+		const finished = (hot && params?.hots && params.hots.indexOf(hot) === -1)
+			|| this.wait >= CONFIG.maxWait;
+		if (finished)
+			this.flush();
+	}
+
+	onGameMapLoad() {
+		this.reset();
+	}
+
+	onConnectionReset() {
+		this.reset();
+	}
+
+	reset() {
+		this.pending = null;
+		this.wait = 0;
+	}
+
+	// ---- outgoing -----------------------------------------------------------
+
+	// Any visible peer within reach that isn't already topped off (a downed peer counts
+	// as needing help). Drives the full-HP use allowance.
+	hasNeedyPeer() {
+		const me = terra.export.g_player?.entity;
+		const actors = this.host.getPlayerActors?.();
+		const down = this.host.getPeerDowned?.();
+		if (!me?.core || !actors)
+			return false;
+		const r2 = CONFIG.radius * CONFIG.radius;
+		for (const [id, actor] of actors) {
+			if (!actor?.core?.isVisible?.())
+				continue;
+			const needy = down?.get?.(id) || (actor.terraTogether?.hpTarget ?? 1) < 1;
+			if (needy && dist2(me.core.pos, actor.core.pos) <= r2)
+				return true;
+		}
+		return false;
+	}
+
+	beginSend(params, hotsBefore) {
+		if (!enabled())
+			return;
+		const estus = terra.export.g_player?.cuisine?.estus;
+		if (!estus)
+			return;
+		// Two flasks in quick succession: flush the previous heal before replacing it.
+		if (this.pending)
+			this.flush();
+		// The heal the user's flask produces: amount (absolute HP) and HoT duration.
+		const data = { amount: estus.amount, duration: estus.duration };
+		// Wait for the flask's own heal to complete; if the user was already at full HP
+		// no HoT starts, so there's nothing to wait for and we send right away.
+		let hot = null;
+		if (params?.hots && hotsBefore) {
+			const before = new Set(hotsBefore);
+			hot = params.hots.find(h => !before.has(h)) ?? null;
+		}
+		this.pending = { params, hot, data };
+		this.wait = 0;
+		this.debug("pending area heal", data, hot ? "waiting for HoT" : "immediate");
+		if (!hot)
+			this.flush();
+	}
+
+	flush() {
+		const pending = this.pending;
+		this.pending = null;
+		this.wait = 0;
+		if (!pending)
+			return;
+		if (!enabled() || !this.host.isConnected?.() || !this.host.hasPeers?.())
+			return;
+		const { amount, duration } = pending.data;
+		this.host.send?.({ type: "area_heal", from: this.host.getLocalId?.(), amount, duration });
+		this.debug("sent area heal", amount, duration);
+	}
+
+	// ---- incoming -----------------------------------------------------------
+
+	onMessage(msg) {
+		if (msg?.type !== "area_heal" || !enabled())
+			return;
+		const me = terra.export.g_player?.entity;
+		const params = terra.export.g_player?.combat?.params;
+		if (!me?.core || !params)
+			return;
+
+		// The sender must be an actor we track in our current room.
+		const healer = this.host.getPlayerActors?.()?.get?.(msg.from);
+		if (!healer?.core?.isVisible?.())
+			return;
+		const r2 = CONFIG.radius * CONFIG.radius;
+		if (dist2(me.core.pos, healer.core.pos) > r2)
+			return;
+
+		const amount = typeof msg.amount === "number" ? msg.amount : 0;
+		const duration = typeof msg.duration === "number" ? msg.duration : 0;
+		if (amount <= 0)
+			return;
+
+		// Downed ally: revive at 25% first (same path revive.js uses), then deliver only the
+		// *remainder* of the estus heal. The instant revive counts as healing, so it is
+		// subtracted from the flask amount and the total received still equals the flask's.
+		let healAmount = amount;
+		if (this.host.isSelfDowned?.()) {
+			const before = params.currentHP;
+			try { this.host.reviveLocal?.(); }
+			catch (err) { console.warn("[TT heal] revive failed:", err); }
+			const instant = Math.max(0, params.currentHP - before);
+			healAmount = Math.max(0, amount - instant);
+			this.debug("downed ally: revived for", instant, "-> estus HoT", healAmount);
+		}
+
+		try {
+			// Same heal call the flask makes on its own user; recipients keep their charges.
+			if (healAmount > 0)
+				params.heal(healAmount, duration, true);
+			terra.export.g_playerHeal?.playHealFx?.(me);
+		}
+		catch (err) {
+			console.warn("[TT heal] applying heal failed:", err);
+		}
+	}
+}

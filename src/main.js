@@ -1,5 +1,5 @@
 import { registerOptionTypes } from "./option-types.js";
-import { createModSettings, SettingsTab, syncRevive, REVIVE_OPTION } from "./settings.js";
+import { createModSettings, SettingsTab, syncRevive, REVIVE_OPTION, syncEstusShare, ESTUS_OPTION } from "./settings.js";
 import * as skin from './skin.js';
 import * as client from './client.js';
 import * as server from './server.js';
@@ -72,6 +72,11 @@ class Multiplayer extends terra.export.Observable {
 			syncRevive();
 		}
 
+		// Estus area-heal toggle: same host-authoritative sync.
+		if (key === ESTUS_OPTION) {
+			syncEstusShare();
+		}
+
 		if (key === "tt-hide-party") {
 			let hideParty = terra.export.g_options.get("tt-hide-party") ?? false;
 			if (hideParty) {
@@ -127,7 +132,7 @@ class Multiplayer extends terra.export.Observable {
 		if (!(terra.export.g_options.get("tt-auto-host") ?? false))
 			return;
 		const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
-		server.startServer("0.0.0.0", port).then(() => syncRevive()).catch(err => {
+		server.startServer("0.0.0.0", port).then(() => { syncRevive(); syncEstusShare(); }).catch(err => {
 			console.error("[TerraTogether] Auto-host failed:", err);
 		});
 	}

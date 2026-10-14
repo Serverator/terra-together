@@ -110,7 +110,9 @@ function startServer(host = '0.0.0.0', port = 17005) {
 
 					case "revive":
 					case "revive_progress":
-						// Downed/revive handshake: relay verbatim to everyone but the sender.
+					case "area_heal":
+						// Downed/revive handshake and area estus heals: relay verbatim to everyone
+						// but the sender (the sender already healed itself locally).
 						broadcast(msg, socket);
 						break;
 

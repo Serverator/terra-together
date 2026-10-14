@@ -3,6 +3,7 @@ export { joinServer, leaveServer, disconnect, isConnected, isConnecting, send }
 import { skins } from "./skin.js";
 import { isHosting, getHostPort } from "./server.js";
 import { Reviver } from "./revive.js";
+import { AreaHealer } from "./area-heal.js";
 
 const { SCENE_STATE, SCENE_EVENT } = terra.file.sceneTypes;
 
@@ -78,6 +79,18 @@ const reviver = new Reviver({
 	getPlayerActors: () => playerActors,
 	getPeerDowned,
 	setLocalDowned,
+});
+
+// Area estus heal handling lives in its own module.
+const areaHealer = new AreaHealer({
+	send,
+	isConnected,
+	hasPeers,
+	getLocalId: () => playerId,
+	getPlayerActors: () => playerActors,
+	getPeerDowned,
+	isSelfDowned: () => localDowned,
+	reviveLocal: () => reviver.reviveLocal(),
 });
 
 let actorFxQueue = [];
@@ -396,6 +409,7 @@ class MultiplayerClient extends terra.export.Observable {
 	onPreUpdate() {
 		updateOtherPlayers();
 		reviver.onPreUpdate();
+		areaHealer.onPreUpdate();
 	}
 
 	onPostUpdate() {
@@ -409,6 +423,7 @@ class MultiplayerClient extends terra.export.Observable {
 		playerActors.clear();
 		playerUpdates.clear();
 		reviver.onMapLoad();
+		areaHealer.onGameMapLoad();
 	}
 
 	onOptionEvent(event, key) {
@@ -466,6 +481,7 @@ class MultiplayerClient extends terra.export.Observable {
 	onLoopStart() {
 		installRogueSeedHook();
 		reviver.onLoopStart();
+		areaHealer.onLoopStart();
 
 		terra.export.g_scene.observers.push(this);
 		terra.export.g_options.observers.push(this);
@@ -934,6 +950,13 @@ function joinServer(address, options = {}) {
 						if (g?.settings?.["tt-revive"] && g.get("tt-revive") !== on)
 							g.set("tt-revive", on, true);
 					}
+					if (msg.key === "tt-estus-share") {
+						const on = msg.value === true;
+						window.terraTogether.estusShareEnabled = on;
+						const g = terra.export.g_options;
+						if (g?.settings?.["tt-estus-share"] && g.get("tt-estus-share") !== on)
+							g.set("tt-estus-share", on, true);
+					}
 					break;
 
 				case "player_profile":
@@ -978,6 +1001,10 @@ function joinServer(address, options = {}) {
 				case "revive":
 				case "revive_progress":
 					reviver.onMessage(msg);
+					break;
+
+				case "area_heal":
+					areaHealer.onMessage(msg);
 					break;
 			}
 		} catch (err) {
@@ -1046,6 +1073,7 @@ function clearPeers() {
 	peerDowned.clear();
 	localDowned = false;
 	reviver.onConnectionReset();
+	areaHealer.onConnectionReset();
 	playerId = null;
 	connecting = false;
 }
