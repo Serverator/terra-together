@@ -81,16 +81,36 @@
  *   MSG.ENEMY_STATE       "enemy_state"      client -> server -> other clients, per frame, and only
  *                                            from an enemy's CURRENT owner: the movement, animation
  *                                            and HP of the enemies that client simulates, which the
- *                                            other clients apply to their puppets. The one relayed
- *                                            type the server does NOT forward verbatim -- it rechecks
- *                                            every entry against the arbiter
+ *                                            other clients apply to their puppets, PLUS that
+ *                                            owner's effects for those enemies (Phase 6). The one
+ *                                            relayed type the server does NOT forward verbatim -- it
+ *                                            rechecks every entry against the arbiter
  *                                            (enemy-ownership.js validate()) and DROPS any the sender
  *                                            does not own, then relays the surviving frame with
  *                                            `owner` stamped to the sender (server.js, the
  *                                            MSG.ENEMY_STATE case). Payload: { owner, map, variant,
  *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
- *                                            animTime, hp, state, action } ] }. Client case:
- *                                            MSG.ENEMY_STATE.
+ *                                            animTime, hp, state, action } ], plus whichever of
+ *                                            globalFx, fxStops, persistentFx, sounds, soundStops and
+ *                                            projectiles this frame has }. Those six effect batches
+ *                                            are the shapes the player snapshot's own arrays already
+ *                                            carry (see MSG.UPDATE), so the recipient replays them
+ *                                            through the same code, and every entry names the enemy it
+ *                                            belongs to in an `enemy` field: the id of a `list` entry
+ *                                            of the same frame, which is how the recipient routes it
+ *                                            to the local copy of that enemy and never to the enemy of
+ *                                            another client's stream. A batch is present only when
+ *                                            the frame has one -- an owner that spawned no fx, played
+ *                                            no sound and fired no shot this frame sends exactly the
+ *                                            frame it sent before Phase 6. (The `fx`/`fy` of a `list`
+ *                                            entry are that enemy's FACING vector; the `globalFx`
+ *                                            batch is a sibling of `list` and unrelated to it.) An
+ *                                            attack telegraph or aim fx is an infinite fx in group
+ *                                            "__aimFx__" attached to the enemy (enemy-aim-fx.js:33,
+ *                                            :57-74), so it travels as a globalFx entry, is re-sent
+ *                                            in persistentFx while it is up (a peer entering the room
+ *                                            mid-telegraph still sees it) and is torn down by its
+ *                                            fxStops entry. Client case: MSG.ENEMY_STATE.
  *   MSG.ENEMY_HANDOFF     "enemy_handoff"    client -> server -> other clients, ONE-SHOT, from the
  *                                            client that has just LOST an enemy (it reads that from
  *                                            the same enemy_owner broadcast the new owner reads):

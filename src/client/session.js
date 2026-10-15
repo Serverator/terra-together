@@ -10,6 +10,8 @@
  *   - Shared sync state (queues, soundRegistry, activeSyncedSounds, activePersistentFx,
  *     soundSyncSuppress, RUN_FX_*) that fx-sync.js fills, snapshot.js drains and actors.js
  *     reads — declared here because the client module graph is a DAG rooted at this file.
+ *   - The enemy half of that state (enemyQueues, activeEnemyFx) plus the enemyOwnership probe
+ *     that fx-sync.js attributes an owned enemy's effects with and enemies.js implements.
  *   - Lifecycle: joinServer/leaveServer/disconnect/send + detachClient/clearPeers/
  *     onDisconnected, and the inbound dispatch (MSG.* -> peer state, snapshot ingest,
  *     revive/area-heal/enemy-owner/enemy-despawn/enemy-respawn/enemy-hit routing).
@@ -18,7 +20,8 @@
  *   getPeerDowned, isLocalDowned, getRogueInfo, getPeerRogueSeed, playerActors, playerNames,
  *   playerUpdates, playerActions, peers, peerDowned, peerRogue, queues, soundRegistry,
  *   activeSyncedSounds, activePersistentFx, soundSyncSuppress, RUN_FX_GROUPS,
- *   RUN_FX_SPEED_EPS, SCENE_STATE, SCENE_EVENT, Vec2, Vec3
+ *   RUN_FX_SPEED_EPS, SCENE_STATE, SCENE_EVENT, Vec2, Vec3, enemyQueues, activeEnemyFx,
+ *   enemyOwnership
  * Engine touchpoints: terra.file.sceneTypes, terra.export.{Vec2,Vec3,g_options,g_rogue},
  *   window.terraTogether (read/write mirrors, incl. reviveEnabled/estusShareEnabled), WebSocket.
  * Notes: import leaf — it imports ../net/protocol.js and nothing else, so the client
@@ -124,6 +127,44 @@ export const queues = {
 	// mirrored ranged projectiles
 	projectiles: [],
 };
+
+// Enemy-attributed effect traffic (enemy-sync Phase 6): the fx, sounds and projectiles an enemy
+// THIS client owns and simulates emits. Same shapes as the player queues above plus an `enemy`
+// field naming the enemy, filled by the same capture hooks in fx-sync.js (which attribute an
+// effect to an enemy through the ownership probe below) and drained by ./enemies.js into the
+// enemy_state frame it already sends every frame -- so the other client renders them on its own
+// copy of that enemy. Deliberately NOT the player slots: those are drained by ./snapshot.js into
+// the player update, and one queue with two drainers is how a frame loses half its contents.
+export const enemyQueues = {
+	// fx spawned on an owned enemy this frame (travels on the frame as `globalFx`)
+	globalFx: [],
+	// those fx stopping
+	fxStops: [],
+	// sounds tied to an owned enemy starting this frame
+	sounds: [],
+	// those sounds stopping
+	soundStops: [],
+	// proxies (projectiles) an owned enemy fired this frame
+	projectiles: [],
+};
+
+// Enemy-owned *infinite* fx (attack telegraphs, status markers) currently alive on the local
+// enemies: id -> { fx: FxEntity, desc: descriptor }. The mirror of activePersistentFx below,
+// re-sent on every enemy frame for the same reason (a peer entering the room rebuilds lasting
+// enemy fx whose one-shot spawn it dropped while apart) and kept apart from it because the two
+// are drained into different messages.
+export const activeEnemyFx = new Map();
+
+// The one question fx-sync.js has to ask about an enemy: is this entity an enemy THIS client
+// owns and simulates -- and if so, what is its wire id (the string the frame is keyed by)? The
+// enemy registry lives in ./enemies.js, which imports ./client.js and so cannot be imported here
+// (the client module graph is a DAG rooted at ./client.js) and sits above ./fx-sync.js; so
+// ./enemies.js fills this holder at load time, exactly as it registers its inbound handlers
+// through ./client.js's table -- the same seam, in the other direction. Its implementation
+// re-tests the state that can change under it (the feature flag, the connection, the assignment),
+// so a stale answer is impossible; the default here answers "no" and makes the whole enemy half
+// of the capture hooks inert until ./enemies.js has loaded.
+export const enemyOwnership = { ownedIdOf: () => null };
 
 // Sound resources by buffer path; sounds sync by path and re-resolve on the peer.
 export const soundRegistry = new Map();

@@ -200,6 +200,13 @@ export function sendPlayerData(forceSend = false, scene = null) {
 			activeSyncedSounds.delete(id);
 			continue;
 		}
+		// A sound belonging to an ENEMY we own (Phase 6) is not on this channel: it travels on the
+		// enemy frame ./enemies.js sends, whose playbacks the peer holds against the enemy rather
+		// than against a peer actor -- so a volume ramp has no receiver here. The entry is still
+		// kept and pruned by this loop, and a stop still travels (the Playback.stop hook routes it
+		// by this same `enemy` mark).
+		if (entry.enemy)
+			continue;
 		const v = pb.currentVolume;
 		if (typeof v === "number" && (entry.lastVol < 0 || Math.abs(v - entry.lastVol) > 0.005)) {
 			entry.lastVol = v;

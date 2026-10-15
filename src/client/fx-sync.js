@@ -3,35 +3,44 @@
  * Peer effect / sound / projectile synchronisation: the local capture hooks that fill the
  * sync queues, and the replay that rebuilds a peer's fx and sounds on our side.
  * Responsibilities:
- *   - FX predicates (isPlayerEntity/isPlayerTied, clampAlignToFigure) and the screen-global
- *     step suppression (vignette/blur/shake must not replay onto the peer's screen), plus
- *     the LOCAL_ONLY_FX deny list.
+ *   - FX predicates (isPlayerEntity/isPlayerTied/ownedEnemyId, clampAlignToFigure) and the
+ *     screen-global step suppression (vignette/blur/shake must not replay onto the peer's
+ *     screen), plus the LOCAL_ONLY_FX deny list.
  *   - Local capture: FxEntity/Sound/AudioEvent/Playback/ProxyDef patches, the SPAWN_WINDBOX
  *     knockback hook and the local player's actorFx injection — all feeding `queues` in
- *     ./session.js.
+ *     ./session.js — and the ENEMY half of every one of those: an fx, sound or projectile
+ *     belonging to an enemy this client OWNS (ownedEnemyId) is captured too, into the
+ *     `enemyQueues`/`activeEnemyFx` slots ./enemies.js drains into the enemy frame. An enemy
+ *     this client only puppets emits none of them here (its owner sends them).
  *   - Remote replay: spawnRemoteFx/reconcilePersistentFx/clearUntrackedRunFx, plus the
- *     per-peer teardown clearPeerFx (its fx *and* its synced sounds).
+ *     per-peer teardown clearPeerFx (its fx *and* its synced sounds) and the narrower
+ *     clearRemoteEnemyFx for an enemy whose owner's stream has stopped being applied to it.
  *   - Rogue seed/variant sync (installRogueSeedHook) and the sound-bus sync policy.
  * Public surface: installFxSyncHooks, installActorFxInjection, installRogueSeedHook,
  *   spawnRemoteFx, reconcilePersistentFx, clearUntrackedRunFx, clearPeerFx,
- *   spawnRemoteProjectile, stopActorSounds
+ *   spawnRemoteProjectile, stopActorSounds, clearRemoteEnemyFx
  * Engine touchpoints: terra.export.{FxEntity,Effect,Projectile,ProxyDef,GenericProxy,HitForce,
  *   ACTION_STEP,FX_STEPS,ACTOR_FX_TYPE,TARGET_RES_TYPE,COMBATANT_PARTY,DamagerCmp,CombatStats,
  *   getEntAlign,getEntAlignFigure,addFigureToEntAlign,g_rogue,g_player,g_actorGlobals,g_gState},
  *   terraTogether.steps.SPAWN_WINDBOX, terra.file.{sound,audioEvent,playback,actorSound,
  *   hitSounds,playerCombat,fxBase,stepBase}; Vec3 is re-exported by ./session.js.
  * Notes: the sync queues/registries are NOT declared here: they are shared with
- *   ./snapshot.js and ./actors.js and live in ./session.js (see its header). This module
- *   owns only capture-local state (fxSyncId, soundSyncId, projSyncId, spawningVisualCopy,
+ *   ./snapshot.js, ./actors.js and ./enemies.js and live in ./session.js (see its header). This
+ *   module owns only capture-local state (fxSyncId, soundSyncId, projSyncId, spawningVisualCopy,
  *   syncHooksInstalled, projectileHooksInstalled, rogueSeedHookInstalled) and the patch
- *   caches. Import graph: session <- fx-sync.
+ *   caches. Import graph: session <- fx-sync <- (actors, enemies). The enemy ownership question
+ *   (ownedEnemyId) is answered by ./enemies.js through the holder in ./session.js -- this module
+ *   cannot import that one (it imports ./client.js), the same seam that routes its inbound types.
  *   Decompiled refs: fx-light.js:92 (LIGHT step's global climate darkening),
- *   actor-fx.js:77-89 (POST_MOVE run glow, group "__runFX__").
+ *   actor-fx.js:77-89 (POST_MOVE run glow, group "__runFX__"), enemy-aim-fx.js:33/:57-74 (the
+ *   "__aimFx__" telegraph: an infinite fx attached to the enemy, target2 at the shooter),
+ *   enemy-type.js:83-85 + combat-act-steps.js:481/:521 (an enemy's own proxy list, which is what
+ *   its shots are resolved from on both sides).
  */
 
 import {
 	queues, soundRegistry, activeSyncedSounds, activePersistentFx, soundSyncSuppress,
-	RUN_FX_GROUPS, hasClient, getPeerRogueSeed, Vec3,
+	RUN_FX_GROUPS, hasClient, getPeerRogueSeed, Vec3, enemyQueues, activeEnemyFx, enemyOwnership,
 } from "./session.js";
 
 // --- Capture-local sync state -------------------------------------------------
@@ -72,6 +81,27 @@ function isPlayerTied(ent) {
 	if (!player) return false;
 	// player-owned effect entities are tagged by the FxEntity.start hook
 	return ent == player || ent._ttFxId || ent.target?.entity == player;
+}
+
+// --- Enemy attribution (enemy-sync Phase 6) -----------------------------------
+// The enemy THIS client owns and simulates, when `ent` is one — and its wire id, which is what
+// an effect descriptor is keyed by. null for everything else: the local player's own entities,
+// another client's enemy (this client only puppets those — the OWNER sends their effects, and
+// forwarding them here as well would double every one of them), an enemy with no wire-addressable
+// identity (a runtime spawn), and any time the feature flag is off or the client is offline (the
+// implementation in ./enemies.js re-tests all of that per call, see the note on ./session.js's
+// holder).
+//
+// This is THE predicate that makes the three capture hooks below attribute an effect to an enemy,
+// and it is deliberately the same ownership question the state half asks (isOwner): the one client
+// that may speak for an enemy's position is the one that may speak for its effects. It answers for
+// an enemy this client owns but has not taken over yet as well (ownership IS ours — the capture
+// must record what our own copy emitted either way); what may actually travel is decided later, by
+// the frame's published set (see drainEnemyEffects in ./enemies.js), which is the one place that
+// knows what this client is really speaking for.
+function ownedEnemyId(ent) {
+	if (!ent) return null;
+	return enemyOwnership.ownedIdOf(ent) ?? null;
 }
 
 // --- Screen-global FX step suppression ---------------------------------------
@@ -219,26 +249,39 @@ function isSyncableBus(type) {
 // --- Projectile sync ---------------------------------------------------
 // Ranged projectiles are real `Projectile` entities created at one choke point
 // (ProxyDef.spawn). Peers mirror them as "visual" copies owned by the sending
-// player's ghost actor; damage is suppressed so shots only show up.
+// player's ghost actor -- or, since Phase 6, by the local copy of the enemy that fired them;
+// damage is suppressed so shots only show up.
 
-// Resolve a proxy def by name: the local player's config proxies (weapon proxies
-// are local names like "arrow") first, then global actor-globals proxies.
-function resolveProxyDef(name) {
+// Resolve a proxy def by name. An entity that fired the shot is asked FIRST when one is given: an
+// enemy's own proxies live on its enemy sheet (enemy-type.js:83-85 builds `EnemySheet.proxies`,
+// which enemy-cmp.js:264 hands to its combatant's damager), and that is the very list the firing
+// step resolved the def from on the owner's side (ProxyKey.getProxyDef(attacker.damager.proxies),
+// combat-act-steps.js:481/:521) -- so the peer resolves the same def for the same name. Then the
+// local player's config proxies (weapon proxies are local names like "arrow"), then global
+// actor-globals proxies.
+function resolveProxyDef(name, ent) {
 	if (!name)
 		return null;
+	const own = ent?.combatant?.attacker?.damager?.proxies?.[name]
+		?? ent?.enemy?.enemyType?.sheet?.proxies?.[name];
+	if (own)
+		return own;
 	const local = terra.export.g_player?.config?.proxies?.[name];
 	if (local)
 		return local;
 	return terra.export.g_actorGlobals?.getProxy?.(name) ?? null;
 }
 
-// A cosmetic projectile needs an owner damager whose .ent is the ghost and whose
+// A cosmetic projectile needs an owner damager whose .ent is the receiving entity and whose
 // .stats is non-null (Projectile.init reads owner.stats.getCombatant()). Create one
 // lazily per ghost; no AttackerCmp, so the ghost is not registered as an attacker.
 function getVisualDamager(actor) {
 	if (!actor)
 		return null;
-	if (actor.terraTogether?.ttDamager)
+	// getVisualDamager is also reachable for an entity the mod hangs nothing on yet (see
+	// getMirrorDamager below), and the holder is where the lazily-created damager is cached.
+	actor.terraTogether ??= {};
+	if (actor.terraTogether.ttDamager)
 		return actor.terraTogether.ttDamager;
 	const DamagerCmp = terra.export.DamagerCmp;
 	const CombatStats = terra.export.CombatStats;
@@ -250,6 +293,25 @@ function getVisualDamager(actor) {
 	damager.setStatProxies(CombatStats.getAttackStats(1, party), {});
 	actor.terraTogether.ttDamager = damager;
 	return damager;
+}
+
+// The damager a MIRRORED projectile is spawned from, for the entity it is mirrored under.
+//   - A player ghost has no damager of its own: the mod adds one (getVisualDamager), provisioned
+//     with a stand-in stat block, and marks it with the sender's element (Projectile.init copies
+//     `owner.variant`, proxy-projectile.js:568-569).
+//   - An enemy HAS one -- `AttackerCmp.damager` (attacker-cmp.js:146), provisioned from its own
+//     sheet (enemy-cmp.js:264 -> combatant-cmp.js:1048-1051) and the very damager its real attacks
+//     fire from. It is already a valid parent (stats, proxies, party), so it is used AS IT IS:
+//     addCmp would hand back exactly that instance and re-provisioning it would overwrite a live
+//     enemy's real attack stats and proxy list with a level-1 player stand-in. Its `variant` is
+//     left alone too -- only player-cmp ever writes it (player-cmp.js:1629/:2838/:2852), so an
+//     enemy's is already the 0 the mirror would write.
+function getMirrorDamager(actor) {
+	if (!actor)
+		return null;
+	if (actor.enemy)
+		return actor.enemy?.combatant?.attacker?.damager ?? null;
+	return getVisualDamager(actor);
 }
 
 // Cosmetic copies must not take the local player's ranged-weapon extension
@@ -282,19 +344,24 @@ const VISUAL_BLOCKED_STEPS = [
 	"SET_DAMAGER_DMG_FACTOR", "MARK_NAV_DANGER",
 ];
 
-// Spawn one mirrored projectile on a peer actor (receiver side; see the ProxyDef.spawn
-// hook for the sender side).
+// Spawn one mirrored projectile on a peer actor -- the local player's ghost, or the local copy of
+// an enemy this client is puppeting (receiver side; see the ProxyDef.spawn hook for the sender
+// side). Either way it is a VISUAL copy: `spawningVisualCopy` below makes the ProxyDef.spawn
+// wrapper mark the proxy `__ttVisual`, which is what makes HitForce.isHitCompatible ignore every
+// hit it could land, the blocked action steps no-op and its sub-proxies refuse to spawn.
 export function spawnRemoteProjectile(actor, p) {
-	const def = resolveProxyDef(p.name);
+	const def = resolveProxyDef(p.name, actor);
 	if (!def)
 		return;
-	const damager = getVisualDamager(actor);
+	const damager = getMirrorDamager(actor);
 	if (!damager)
 		return;
 
-	// Element is the variant index (0 neutral, 1 aether, 2 ignis, 3 cryo). init
-	// copies it from the owner damager, so set it right before spawning.
-	damager.variant = p.variant ?? 0;
+	// Element is the variant index (0 neutral, 1 aether, 2 ignis, 3 cryo). init copies it from the
+	// owner damager, so set it right before spawning -- on the ghost's own damager only, which is
+	// the mirror-owned instance the sender's element belongs on (see getMirrorDamager).
+	if (!actor.enemy)
+		damager.variant = p.variant ?? 0;
 
 	const pos = new Vec3(p.pos[0], p.pos[1], p.pos[2]);
 	const dir = new Vec3(p.dir[0], p.dir[1], p.dir[2] ?? 0);
@@ -393,11 +460,21 @@ export function installFxSyncHooks() {
 			const attachedEnt = this.target?.entity ?? null;
 			const onPlayer = isPlayerEntity(attachedEnt);
 
+			// ...or owned by an ENEMY this client simulates (enemy-sync Phase 6): the enemy fx is
+			// attached to, or was spawned by, an enemy the server assigned to this client. The
+			// other client holds that enemy as a puppet, so it renders this fx on its own copy
+			// instead of emitting one of its own (a puppet's AI -- and so its action fx -- is
+			// suppressed, ./enemy-puppet.js). An fx from an enemy this client does NOT own is
+			// never attributed: the owner sends those.
+			const enemyId = onPlayer || isPlayerEntity(owner) ? null : (ownedEnemyId(attachedEnt) ?? ownedEnemyId(owner));
+
 			// Screen-global effects are still synced for their world visuals, but the
 			// sender's own vignette/blur/shake steps are dropped on the peer above.
-			// Local-only feedback (e.g. the A/B loadout quick-switch) is never synced.
-			if ((onPlayer || isPlayerEntity(owner)) && !isLocalOnlyEffect(this.effect)) {
+			// Local-only feedback (e.g. the A/B loadout quick-switch, and the defeat blink every
+			// client plays for itself) is never synced -- including on an enemy.
+			if ((onPlayer || isPlayerEntity(owner) || enemyId) && !isLocalOnlyEffect(this.effect)) {
 				let id = (this._ttFxId = ++fxSyncId);
+				this._ttFxEnemy = enemyId;
 				let fx = {
 					id,
 					effect: this.effect?.cacheKey,
@@ -416,24 +493,59 @@ export function installFxSyncHooks() {
 					fx.offset = this.target.posOrOffset.v;
 				if (terra.export.TARGET_RES_TYPE && this.target?.type == terra.export.TARGET_RES_TYPE.ENT_REL_OFFSET)
 					fx.rel = true;
-				// Unattached effects (e.g. ground impacts) keep their world position at spawn.
-				if (!onPlayer) {
+				// Unattached effects (e.g. ground impacts) keep their world position at spawn. An
+				// enemy-owned fx attached to its enemy is NOT one of those: it travels with that
+				// enemy, so the peer re-attaches it to the copy it holds (as the player case above
+				// re-attaches to the ghost) rather than pinning it to a world position -- which is
+				// what makes a telegraph follow the enemy and a status fx sit on it.
+				if (!onPlayer && !enemyId) {
 					const v = new Vec3();
 					if (this.target?.get(v))
 						fx.pos = v.v;
 					else if (this.core?.pos)
 						fx.pos = this.core.pos.clone().v;
 				}
+				if (enemyId) {
+					fx.enemy = enemyId;
+					// The aim/telegraph fx (AimFx.showFx, enemy-aim-fx.js:57-71) also points its
+					// SECONDARY target at the shooter (`selfPos` -> setTarget2Entity(entity, ...),
+					// :64/:66), which is the enemy itself and what the line/laser/homing fx draw
+					// towards (fx-line.js:69, fx-laser.js:110, fx-homing.js:91). On the peer that
+					// entity is the local copy of the enemy it holds, so mirroring the alignment and
+					// offset reproduces the same geometry; without it a line fx falls back to a
+					// default direction and the telegraph points nowhere. Only mirrored when target2
+					// really follows the entity the fx is attached to, and only for an enemy fx --
+					// the verified player path is left byte-identical.
+					const t2ent = typeof this.target2?.getFollowEntity === "function" ? this.target2.getFollowEntity() : null;
+					if (t2ent && t2ent === attachedEnt) {
+						fx.t2align = this.target2.alignment;
+						if (this.target2.posOrOffset && !this.target2.posOrOffset.isZero())
+							fx.t2off = this.target2.posOrOffset.v;
+						if (terra.export.TARGET_RES_TYPE && this.target2.type == terra.export.TARGET_RES_TYPE.ENT_REL_OFFSET)
+							fx.t2rel = true;
+					}
+				}
 				// Infinite fx (e.g. status conditions use start(-1)) never end on their own, so a
 				// peer only ever learns of them from a spawn. Remember them to re-send every frame
-				// until they stop, so peers entering our room can rebuild the ones they missed.
-				if (fx.duration < 0)
-					activePersistentFx.set(id, { fx: this, desc: fx });
-				if (hasClient())
-					queues.globalFx.push(fx);
+				// until they stop, so peers entering our room can rebuild the ones they missed --
+				// on the enemy's own registry for an enemy-owned one, so the lasting-fx snapshot
+				// travels in the message that enemy's state travels in.
+				if (fx.duration < 0) {
+					if (enemyId)
+						activeEnemyFx.set(id, { fx: this, desc: fx });
+					else
+						activePersistentFx.set(id, { fx: this, desc: fx });
+				}
+				if (hasClient()) {
+					if (enemyId)
+						enemyQueues.globalFx.push(fx);
+					else
+						queues.globalFx.push(fx);
+				}
 			}
 			else {
 				this._ttFxId = 0;
+				this._ttFxEnemy = null;
 			}
 			return originalFxStart.apply(this, args);
 		};
@@ -443,13 +555,15 @@ export function installFxSyncHooks() {
 		let originalInitHideShowChange = terra.export.FxEntity.prototype.initHideShowChange;
 		terra.export.FxEntity.prototype.initHideShowChange = function (...args) {
 			if (this._ttFxId) {
-				for (let i = queues.globalFx.length - 1; i >= 0; i--) {
-					if (queues.globalFx[i].id === this._ttFxId) {
-						queues.globalFx.splice(i, 1);
+				const list = this._ttFxEnemy ? enemyQueues.globalFx : queues.globalFx;
+				for (let i = list.length - 1; i >= 0; i--) {
+					if (list[i].id === this._ttFxId) {
+						list.splice(i, 1);
 						break;
 					}
 				}
 				this._ttFxId = 0;
+				this._ttFxEnemy = null;
 			}
 			return originalInitHideShowChange.apply(this, args);
 		};
@@ -458,14 +572,24 @@ export function installFxSyncHooks() {
 		// hooking it removes them on peers too.
 		let originalFxStop = terra.export.FxEntity.prototype.stop;
 		terra.export.FxEntity.prototype.stop = function (...args) {
-			if (this._ttFxId)
-				activePersistentFx.delete(this._ttFxId);
+			if (this._ttFxId) {
+				if (this._ttFxEnemy)
+					activeEnemyFx.delete(this._ttFxId);
+				else
+					activePersistentFx.delete(this._ttFxId);
+			}
 			// Report each spawn's stop at most once: clearEntity() calls stop() again on every
 			// entry it removes (effect-entity.js clearList), which is not a second stop.
 			if (this._ttFxId && !this._ttFxStopSent) {
 				this._ttFxStopSent = true;
-				if (hasClient())
-					queues.fxStops.push({ id: this._ttFxId, delay: args[0] ?? 0, softStop: args[1] ?? false });
+				if (hasClient()) {
+					// An enemy-owned fx stops in the batch that enemy's state travels in (see
+					// ./session.js enemyQueues), carrying the id it must be routed back on.
+					if (this._ttFxEnemy)
+						enemyQueues.fxStops.push({ id: this._ttFxId, delay: args[0] ?? 0, softStop: args[1] ?? false, enemy: this._ttFxEnemy });
+					else
+						queues.fxStops.push({ id: this._ttFxId, delay: args[0] ?? 0, softStop: args[1] ?? false });
+				}
 			}
 			return originalFxStop.apply(this, args);
 		};
@@ -493,17 +617,32 @@ export function installFxSyncHooks() {
 				const playback = originalSoundPlay.apply(this, args);
 				registerSound(this);
 				// Playback is bound to targetRes.entity (PLAY_SOUND defaults to the
-				// player); fall back to the ambient context for global/offset sounds.
+				// player); fall back to the ambient context for global/offset sounds. Both are
+				// the ACTING entity while a step runs (an enemy's own action pushes its core as
+				// the context entity, enemy-cmp.js initInternal), so an enemy's sounds are
+				// attributed the same way a player's are -- and only for an enemy THIS client
+				// owns (see ownedEnemyId).
 				const ctxEnt = terra.export.g_gState?.contextEntity?.ent;
 				if (playback) {
+					const enemyId = ownedEnemyId(args[0]?.targetRes?.entity) ?? ownedEnemyId(ctxEnt);
 					const tied = hasClient() && !soundSyncSuppress.depth && this.path &&
 						isSyncableBus(this.settings?.type) &&
-						(isPlayerTied(args[0]?.targetRes?.entity) || isPlayerTied(ctxEnt));
+						(enemyId !== null || isPlayerTied(args[0]?.targetRes?.entity) || isPlayerTied(ctxEnt));
 					if (tied) {
 						const id = ++soundSyncId;
 						playback._ttSoundId = id;
-						activeSyncedSounds.set(id, { playback, lastVol: -1 });
-						queues.sounds.push({ id, key: this.path, vol: args[1] ?? 1, speed: args[2] ?? 1 });
+						// `enemy` marks the entry as an enemy's: it travels on the enemy frame and
+						// its volume is not synced (./snapshot.js's volume pass skips it; see the
+						// note in ./enemies.js on what an enemy sound does and does not carry).
+						activeSyncedSounds.set(id, { playback, lastVol: -1, enemy: enemyId });
+						const entry = { id, key: this.path, vol: args[1] ?? 1, speed: args[2] ?? 1 };
+						if (enemyId) {
+							entry.enemy = enemyId;
+							enemyQueues.sounds.push(entry);
+						}
+						else {
+							queues.sounds.push(entry);
+						}
 					}
 					else {
 						playback._ttSoundId = 0;
@@ -524,14 +663,22 @@ export function installFxSyncHooks() {
 				const ctxEnt = terra.export.g_gState?.contextEntity?.ent;
 				const instance = originalEventPlay.apply(this, args);
 				if (instance?.playback) {
+					const enemyId = ownedEnemyId(args[0]?.targetRes?.entity) ?? ownedEnemyId(ctxEnt);
 					const tied = hasClient() && !soundSyncSuppress.depth && this.cacheKey &&
 						isSyncableBus(this.type) &&
-						(isPlayerTied(args[0]?.targetRes?.entity) || isPlayerTied(ctxEnt));
+						(enemyId !== null || isPlayerTied(args[0]?.targetRes?.entity) || isPlayerTied(ctxEnt));
 					if (tied) {
 						const id = ++soundSyncId;
 						instance.playback._ttSoundId = id;
-						activeSyncedSounds.set(id, { playback: instance.playback, lastVol: -1 });
-						queues.sounds.push({ id, event: this.cacheKey });
+						activeSyncedSounds.set(id, { playback: instance.playback, lastVol: -1, enemy: enemyId });
+						const entry = { id, event: this.cacheKey };
+						if (enemyId) {
+							entry.enemy = enemyId;
+							enemyQueues.sounds.push(entry);
+						}
+						else {
+							queues.sounds.push(entry);
+						}
 					}
 					else {
 						instance.playback._ttSoundId = 0;
@@ -547,7 +694,16 @@ export function installFxSyncHooks() {
 			let originalPlaybackStop = Playback.prototype.stop;
 			Playback.prototype.stop = function (...args) {
 				if (this._ttSoundId) {
-					if (hasClient()) queues.soundStops.push({ id: this._ttSoundId });
+					if (hasClient()) {
+						// Routed by what started it: an enemy's sound stops in the enemy frame,
+						// carrying the enemy it must be stopped on (its entry in the registry is
+						// the only record of that, so read it before dropping the entry).
+						const entry = activeSyncedSounds.get(this._ttSoundId);
+						if (entry?.enemy)
+							enemyQueues.soundStops.push({ id: this._ttSoundId, enemy: entry.enemy });
+						else
+							queues.soundStops.push({ id: this._ttSoundId });
+					}
 					activeSyncedSounds.delete(this._ttSoundId);
 					this._ttSoundId = 0;
 				}
@@ -642,21 +798,33 @@ export function installFxSyncHooks() {
 					proxy.__ttVisual = isMirror;
 
 					// Ranged attacks spawn both Projectile and Generic proxies (e.g. the
-					// crossbow's "shoot down" fires Generic arrowUp), so mirror both. Only
-					// the local player's: peers' copies are owned by ghosts and already
-					// marked visual, so they never echo back.
+					// crossbow's "shoot down" fires Generic arrowUp), so mirror both. Only from
+					// the local player, or from an ENEMY this client owns and simulates (enemy-sync
+					// Phase 6: its shots are as invisible on the peer as its fx were): peers'
+					// copies are owned by ghosts and already marked visual, so they never echo
+					// back, and an enemy this client merely puppets is not the one that fired.
 					const mirrored = proxy instanceof Projectile
 						|| (GenericProxy && proxy instanceof GenericProxy);
-					if (hasClient() && mirrored && !isMirror
-						&& terra.export.g_player?.isPlayer?.(damager?.getRoot?.())) {
-						queues.projectiles.push({
-							id: ++projSyncId,
-							name: this.name,
-							pos: [pos.x, pos.y, pos.z],
-							dir: [dir.x, dir.y, dir.z ?? 0],
-							variant: damager?.variant ?? 0,
-							group: group ?? null,
-						});
+					if (hasClient() && mirrored && !isMirror) {
+						const root = damager?.getRoot?.();
+						const enemyId = ownedEnemyId(root);
+						if (enemyId !== null || terra.export.g_player?.isPlayer?.(root)) {
+							const entry = {
+								id: ++projSyncId,
+								name: this.name,
+								pos: [pos.x, pos.y, pos.z],
+								dir: [dir.x, dir.y, dir.z ?? 0],
+								variant: damager?.variant ?? 0,
+								group: group ?? null,
+							};
+							if (enemyId !== null) {
+								entry.enemy = enemyId;
+								enemyQueues.projectiles.push(entry);
+							}
+							else {
+								queues.projectiles.push(entry);
+							}
+						}
 					}
 					return proxy;
 				};
@@ -670,7 +838,7 @@ export function installFxSyncHooks() {
 
 // --- Remote replay -----------------------------------------------------------
 // Spawn one synced fx on a peer actor from a descriptor sent by its owner. Shared by the
-// one-shot globalFx path and the persistent-fx reconcile below.
+// one-shot globalFx path, the persistent-fx reconcile below and the enemy frame's own effects.
 export function spawnRemoteFx(actor, fxState) {
 	if (!fxState?.effect)
 		return null;
@@ -700,6 +868,17 @@ export function spawnRemoteFx(actor, fxState) {
 	fx.setPart(fxState.part);
 	fx.looped = fxState.looped ?? false;
 	fx.attachGroup = fxState.group;
+	// The owner's secondary target, when it followed the very entity the fx is attached to (an
+	// enemy attack telegraph does: enemy-aim-fx.js:64/:66 points it at the shooter). `actor` IS the
+	// receiver's counterpart of that entity -- the ghost for a player fx, the local copy of the
+	// enemy for an enemy fx -- so re-pointing target2 at it reproduces the owner's geometry. Only
+	// sent for an enemy fx (see the capture hook), so this is inert on the player path.
+	if (fxState.t2align !== undefined && typeof fx.setTarget2Entity === "function") {
+		const t2offset = fxState.t2off
+			? new Vec3(fxState.t2off[0], fxState.t2off[1], fxState.t2off[2])
+			: undefined;
+		fx.setTarget2Entity(actor, clampAlignToFigure(actor, fxState.t2align), t2offset, fxState.t2rel ?? false);
+	}
 	// Mark this spawn as a peer replay: its screen-global steps (vignette/blur/shake) are
 	// suppressed so they don't affect the local player's screen.
 	fx._ttRemotePending = true;
@@ -732,6 +911,11 @@ export function clearUntrackedRunFx(actor) {
 // ones we're missing (e.g. a debuff gained while they were away) and stop the ones they no
 // longer have. The owner re-sends the snapshot every frame.
 export function reconcilePersistentFx(actor, list, running) {
+	// A caller that has not put this entity's sync state in place yet has nothing to reconcile
+	// with; the two callers (./actors.js for a ghost, ./enemies.js for an enemy) both do, but this
+	// runs on the frame path, where a throw would take the rest of the frame down with it.
+	if (!actor?.terraTogether)
+		return;
 	const map = actor.terraTogether.fxMap;
 	const prev = actor.terraTogether.persistentIds ?? new Set();
 	const next = new Set();
@@ -793,6 +977,31 @@ export function stopActorSounds(actor) {
 	for (const id in map)
 		map[id]?.stop();
 	actor.terraTogether.soundMap = {};
+}
+
+// Drop the effects a PEER OWNER's stream put on one enemy this client was puppeting, and the
+// sounds it started on it. Called by ./enemies.js wherever an enemy stops being a puppet (the
+// owner handed it over, it went stale and is simulated locally again, it despawned, the map went,
+// the feature was switched off): from that moment no stop will ever arrive for them, so an
+// infinite fx (an attack telegraph, a status marker) would stay on an enemy that is now THIS
+// client's own business.
+//
+// Deliberately narrower than clearPeerFx: that one clears the entity's whole fx broadcast, which
+// is right for a peer PLAYER's ghost (every fx on it came from the stream) but wrong for an enemy,
+// whose entity can carry engine-owned effects of its own. Only the descriptors this stream spawned
+// are tracked here, so only those are stopped. World-position one-shots (a hit impact) aren't
+// tracked and simply play out, exactly as on the player path.
+export function clearRemoteEnemyFx(ent) {
+	const holder = ent?.terraTogether;
+	if (!holder)
+		return;
+	const map = holder.fxMap ?? {};
+	for (const id in map) {
+		try { map[id]?.stop(0, false); } catch (e) { /* already gone */ }
+	}
+	holder.fxMap = {};
+	holder.persistentIds = null;
+	stopActorSounds(ent);
 }
 
 //# sourceURL=/mods/terra-together/client/fx-sync.js

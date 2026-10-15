@@ -76,6 +76,14 @@
  *     (grantKillReward, once per enemy). Nothing beyond that travels: giveExp/dropItems take no
  *     arguments and read only per-client state, so every client can answer for itself, and a
  *     grant never replays the owner's own kill bookkeeping (see grantKillReward).
+ *   - Effects/sounds/projectiles (Phase 6), both halves: the fx, sounds and projectiles an enemy we
+ *     own emits are attributed by ./fx-sync.js through the ownership probe registered below and
+ *     ride the SAME enemy_state frame as that enemy's state (sendOwnerStates/drainEnemyEffects) --
+ *     including its attack telegraph, which is an infinite fx in group "__aimFx__" and needs no
+ *     channel of its own. On the receiving side the same frame's effect batches are applied to the
+ *     LOCAL copy of that enemy exactly while it is driven as a puppet (applyEnemyEffects), and are
+ *     dropped when it stops being one (clearRemoteEnemyFx), so a peer renders the owner's enemy
+ *     effects and never emits a second copy of them.
  * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
  *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
  *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
@@ -98,7 +106,11 @@
  *   the level-scaled attack-stat stand-in) and COMBATANT_PARTY; for the Phase 5b reward half,
  *   additionally EnemyCmp.prototype.giveExp and EnemyCmp.prototype.dropItems (the owner-side reward
  *   gate, wrapped once per class and resolved per entity) and the engine's own player-proximity
- *   call, g_player.checkDistanceXY. Inbound routing: ./client.js (see the note at the handler
+ *   call, g_player.checkDistanceXY; for the Phase 6 effect half, ./fx-sync.js (the capture hooks
+ *   that attribute an effect to an enemy through the probe registered below, the descriptor/replay
+ *   helpers spawnRemoteFx / reconcilePersistentFx / spawnRemoteProjectile / clearRemoteEnemyFx) and
+ *   ./actors.js's playSyncedSound (the one remote-sound replay, which needs nothing of its target
+ *   but a core). Inbound routing: ./client.js (see the note at the handler
  *   registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
  *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
@@ -112,12 +124,16 @@
  */
 
 import { send, isConnected, addPeerMessageHandler } from "./client.js";
-import { getRogueInfo, hasPeers } from "./session.js";
+import { getRogueInfo, hasPeers, enemyQueues, activeEnemyFx, enemyOwnership } from "./session.js";
 import { MSG } from "../net/protocol.js";
 import {
 	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet, adoptState,
 	readHitDescriptor, setEnemyHitSink,
 } from "./enemy-puppet.js";
+import {
+	spawnRemoteFx, reconcilePersistentFx, clearRemoteEnemyFx, spawnRemoteProjectile,
+} from "./fx-sync.js";
+import { playSyncedSound } from "./actors.js";
 
 // The option key declared in ../config/settings.js (see the header note on why it is a
 // literal here). Read through g_options.get(), which hands back the stored value as-is.
@@ -508,8 +524,12 @@ function clearTakeoverState() {
 function releaseAllPuppets() {
 	if (puppets.size === 0)
 		return;
-	for (const ent of puppets.values())
+	for (const ent of puppets.values()) {
 		releasePuppet(ent);
+		// The stream that put fx/sounds on it is over (the feature went off, or the connection
+		// dropped): nothing will ever tell us to stop them (Phase 6).
+		clearRemoteEnemyFx(ent);
+	}
 	puppets.clear();
 }
 
@@ -668,10 +688,21 @@ function syncEnemies() {
 // on the wire — an owner with no peers has nobody to keep in sync, and the whole point of the
 // split is that only the owner's word is authoritative, so there is nothing to fall back to.
 function sendOwnerStates(live) {
-	if (!live || live.size === 0 || !hasPeers())
-		return;
+	// The enemies whose state this frame publishes. It is also the gate for the frame's effect
+	// batches: only an enemy we are speaking for may have its effects spoken for, and the peer can
+	// only apply an effect to an enemy whose state it holds.
+	const published = new Set();
 	const list = [];
-	for (const [id, core] of live) {
+	// With no peer to tell there is nothing to read and nothing to publish, and the frame's effects
+	// must then all be dropped -- which the drain does on an empty published set. This is the SOLO
+	// hot path (a connected client alone in the room owns enemies and sends nothing), so it must
+	// not pay for a state read it would throw away; the queues are still drained, or they would
+	// leak into a later frame.
+	if (!hasPeers()) {
+		drainEnemyEffects(published);
+		return;
+	}
+	for (const [id, core] of live ?? []) {
 		if (!isOwner(id))
 			continue;
 		// Ours and simulating, or ours and dying. Not ours-in-transit: an enemy we own but have not
@@ -686,15 +717,128 @@ function sendOwnerStates(live) {
 		const state = readEnemyState(core.ent);
 		// An enemy whose state cannot be read simply does not appear: the peer's copy of it goes
 		// stale and resumes local simulation, which is better than publishing a half state.
-		if (state)
+		if (state) {
 			list.push(state);
+			published.add(id);
+		}
 	}
+	// The frame's effect batches are drained whatever happens: a queue nobody empties leaks into a
+	// later frame, so the drain is unconditional even on the frames that send nothing (no peers,
+	// nothing owned, nothing readable).
+	const effects = drainEnemyEffects(published);
 	if (list.length === 0)
 		return;
 	// `owner` is our own playerId — the identity the server validates the sender against and
 	// the one every recipient gates on. `map`/`variant` name the room this state belongs to,
-	// exactly as the register does (they are part of the frozen payload both directions).
-	send({ type: MSG.ENEMY_STATE, owner: localPlayerId(), map: activeMapPath(), variant: roomVariant(), list });
+	// exactly as the register does (they are part of the frozen payload both directions). The
+	// effect batches ride along under the names the player channel uses for them (globalFx/
+	// fxStops/persistentFx/sounds/soundStops/projectiles), each entry tagged with the enemy it
+	// belongs to, and are absent entirely on a frame with none — the server relays the whole
+	// message, so the extra arrays cost one key per batch and no additional traffic.
+	const msg = { type: MSG.ENEMY_STATE, owner: localPlayerId(), map: activeMapPath(), variant: roomVariant(), list };
+	if (effects)
+		Object.assign(msg, effects);
+	send(msg);
+}
+
+// ─────────────────── owner half: our enemies' effects (Phase 6) ───────────────────
+//
+// The fx, sounds and projectiles an enemy we own emits are captured by ./fx-sync.js -- its
+// predicates ask THIS module which entity belongs to an enemy we own, through the probe registered
+// at the bottom of this file -- into ./session.js's `enemyQueues`, and ride the SAME enemy_state
+// frame as that enemy's state. The frame is the right carrier for reasons beyond "one message per
+// frame either way": the server already validates it per entry against the arbiter (the one relay
+// that is not taken on trust), the recipient already gates every entry on "is this sender the
+// enemy's owner", and an effect therefore arrives in the same frame as the state of the enemy it
+// belongs to -- so the peer never applies an effect to an enemy whose position it has not received.
+//
+// What travels, one batch per kind, every entry tagged with the enemy it belongs to (`enemy`, the
+// same wire id the state entries carry):
+//   globalFx       one descriptor per fx spawned on (or by) that enemy this frame -- the same shape
+//                  the player channel uses (effect/alignment/offset/rel/pos/duration/group/part/
+//                  looped/delay), so the replay is the same call. The aim/telegraph fx needs no
+//                  channel of its own: it IS an infinite fx in group "__aimFx__" attached to the
+//                  enemy (AimFx.showFx, enemy-aim-fx.js:57-71), so it is one of these, and its stop
+//                  (AimFx.stopFx -> FxEntity.clearList -> stop(), :72-74) reaches the stop hook like
+//                  any other.
+//   fxStops        the stops of the fx above, with their enemy. An infinite fx never ends by
+//                  itself, so this is the only way the peer ever learns to tear one down.
+//   persistentFx   the snapshot of that enemy's still-live infinite fx, re-sent every frame, so a
+//                  peer entering the room rebuilds the ones it missed (the player channel's
+//                  pattern, ./snapshot.js). A telegraph shown while the peer was away comes back.
+//   sounds         one-shot sounds tied to the enemy, played by the peer at that enemy's position.
+//                  Volume ramps do NOT travel (see the note in ./snapshot.js): an enemy sound is
+//                  replayed once and its stop is what ends it.
+//   soundStops     those stops.
+//   projectiles    the proxies the enemy fired, mirrored by the peer as visual-only copies.
+//
+// Nothing is captured for an enemy this client does NOT own: it is puppeting that enemy, so its own
+// action fx/sounds/projectiles are suppressed locally (./enemy-puppet.js's patches) and its owner
+// is the one sending them. That is the mutual exclusivity in both directions: owned -> forward,
+// never locally matched; puppet -> neither emitted by the engine nor forwarded here.
+
+// The enemy channel's queues, in one place: ./session.js's enemyQueues slots and - the same names -
+// the batches they become on the wire (see the MSG.ENEMY_STATE table in ../net/protocol.js).
+const ENEMY_EFFECT_KEYS = ["globalFx", "fxStops", "sounds", "soundStops", "projectiles"];
+
+// Drain this frame's enemy effect queues, keeping only what belongs to an enemy the frame
+// publishes. Returns null when nothing survived, so a frame with no enemy effects keeps exactly the
+// shape it had before this phase. Always empties the queues (see sendOwnerStates).
+function drainEnemyEffects(published) {
+	// The overwhelmingly common frame captures nothing, and these are per-frame queues: with every
+	// one of them empty (and no lasting fx alive) there is nothing to drain, no batch to build and
+	// no frame-shaped object to allocate.
+	if (!ENEMY_EFFECT_KEYS.some((key) => enemyQueues[key].length > 0) && activeEnemyFx.size === 0)
+		return null;
+	const out = {};
+	for (const key of ENEMY_EFFECT_KEYS)
+		out[key] = takeQueued(enemyQueues, key, published);
+	out.persistentFx = takePersistentEnemyFx(published);
+	let any = false;
+	for (const key of Object.keys(out)) {
+		if (out[key] === null)
+			delete out[key];
+		else
+			any = true;
+	}
+	return any ? out : null;
+}
+
+// The entries of one queue that belong to a published enemy, or null when none do. The queue itself
+// is ALWAYS emptied: an entry kept for a later frame could name an enemy that has since stopped
+// being ours, and a stale aim fx applied then would stick to an enemy we no longer simulate.
+function takeQueued(holder, key, published) {
+	const list = holder[key];
+	holder[key] = [];
+	if (list.length === 0)
+		return null;
+	const kept = [];
+	for (const entry of list) {
+		if (entry && published.has(entry.enemy))
+			kept.push(entry);
+	}
+	return kept.length > 0 ? kept : null;
+}
+
+// The full snapshot of our enemies' lasting (infinite) fx, for the enemies this frame publishes.
+// The liveness test is the one ./snapshot.js applies to the player channel: drop entries whose fx
+// is gone, reused for another fx, ended, or already stopping -- an infinite fx has duration -1
+// while alive and stop() sets it to 0, and `_ttFxId` is an identity check so a pooled FxEntity
+// recycled for a new fx cannot keep an old id alive. Both channels prune their own registry (they
+// are separate maps), so an entry cannot be kept alive by a frame that carries the other one.
+function takePersistentEnemyFx(published) {
+	if (activeEnemyFx.size === 0)
+		return null;
+	const persistent = [];
+	for (const [id, entry] of activeEnemyFx) {
+		if (!entry.fx || entry.fx._ttFxId !== id || entry.fx.hasEnded?.() || !(entry.fx.duration < 0)) {
+			activeEnemyFx.delete(id);
+			continue;
+		}
+		if (published.has(entry.desc.enemy))
+			persistent.push(entry.desc);
+	}
+	return persistent.length > 0 ? persistent : null;
 }
 
 // The other half of a takeover, one network hop earlier: when the server moves an enemy THIS client
@@ -840,6 +984,94 @@ function sendDespawnId(id) {
 		debugLog(`despawn sent for ${id}`);
 }
 
+// ────────────────── peer half: render an owned enemy's effects ──────────────────
+//
+// The effect half of the peer state: the fx/sounds/projectiles an enemy's owner sent in the same
+// enemy_state frame as its state, applied to OUR copy of that enemy. Everything here runs exactly
+// where the enemy is driven as a puppet (applyPeerState's fresh-state branch), for two reasons that
+// are the same reason:
+//   - an enemy this client SIMULATES locally must never take the owner's stream: its own engine fx
+//     are the real ones, and a stale telegraph with no stop coming would stick to it;
+//   - the fx are attached to the entity (spawnRemoteFx), so they must be attached to the entity the
+//     frame's state was just applied to -- the local copy of the enemy, not a peer player's ghost.
+// The batches are applied ONCE per frame entry (the `applied` mark), then dropped with it, so a
+// descriptor is never spawned twice.
+//
+// Per kind:
+//   globalFx      spawnRemoteFx -- the same replay the player channel uses (it takes any entity),
+//                 so the descriptor shape, the offset/rel handling, the screen-step suppression
+//                 and the "this is a peer replay" marks are all shared. Remembered under its sync
+//                 id, which is what lets a stop find it and the persistent reconcile below see
+//                 that a lasting fx reported by BOTH paths is already shown.
+//   persistentFx  reconcilePersistentFx, the same reconcile the player channel runs: spawn what we
+//                 are missing (a telegraph or status fx that started while we were away) and stop
+//                 what the owner no longer reports. `running` is the puppet's own driven speed for
+//                 the same reason the player path measures the ghost's: a run-group fx reported by
+//                 an owner that has stopped moving is stale. This and globalFx share the fx map,
+//                 so a lasting fx that came in as a one-shot is not spawned a second time.
+//   fxStops       stop the tracked fx (an infinite telegraph ends no other way).
+//   sounds        replay at the enemy's own position (./actors.js's playSyncedSound -- it needs
+//                 nothing but a core, and an enemy has one), remembering the playback per sync id.
+//   soundStops    stop that playback.
+//   projectiles   spawnRemoteProjectile on the enemy, which mirrors it as a visual-only copy (the
+//                 same `__ttVisual`/blocked-steps machinery the player channel uses): it shows and
+//                 flies, and can land nothing.
+function applyEnemyEffects(id, ent, entry) {
+	if (!entry || entry.applied)
+		return;
+	entry.applied = true;
+
+	const holder = enemyFxState(ent);
+	for (const fx of entry.globalFx ?? []) {
+		const live = spawnRemoteFx(ent, fx);
+		if (live && fx.id != null)
+			holder.fxMap[fx.id] = live;
+	}
+	const vel = ent.move?.vel;
+	const running = !!vel && typeof vel.lengthXY === "function" && vel.lengthXY() > RUN_FX_SPEED_EPS;
+	reconcilePersistentFx(ent, entry.persistentFx, running);
+	for (const stop of entry.fxStops ?? [])
+		stopSyncedEnemyFx(holder, stop);
+	for (const s of entry.sounds ?? []) {
+		const playback = playSyncedSound(ent, s);
+		if (playback && s.id != null)
+			holder.soundMap[s.id] = playback;
+	}
+	for (const stop of entry.soundStops ?? []) {
+		const playback = holder.soundMap[stop?.id];
+		if (!playback)
+			continue;
+		playback.stop();
+		delete holder.soundMap[stop.id];
+	}
+	for (const p of entry.projectiles ?? [])
+		spawnRemoteProjectile(ent, p);
+}
+
+// The per-enemy home of what an owner's stream has put on OUR copy of an enemy: the fx it spawned
+// (by sync id, so a stop can find one and the persistent reconcile can tell what is already shown)
+// and the sounds it started (by sync id). The same two maps ./fx-sync.js's replay keeps on a peer
+// PLAYER's ghost (./actors.js), created here on first use -- an enemy entity carries nothing of
+// ours until its owner's first effect arrives.
+function enemyFxState(ent) {
+	const holder = (ent.terraTogether ??= {});
+	holder.fxMap ??= {};
+	holder.soundMap ??= {};
+	if (holder.persistentIds === undefined)
+		holder.persistentIds = null;
+	return holder;
+}
+
+// Stop one synced fx the owner reported stopping. Unknown ids are ignored: an fx the owner spawned
+// before we started holding this enemy was never spawned here, and a stop for it means nothing.
+function stopSyncedEnemyFx(holder, stop) {
+	const live = holder.fxMap?.[stop?.id];
+	if (!live)
+		return;
+	try { live.stop(stop.delay ?? 0, stop.softStop ?? false); } catch (e) { /* already gone */ }
+	delete holder.fxMap[stop.id];
+}
+
 // ───────────────────── peer half: drive what we do not own ─────────────────────
 
 // The per-frame peer half, run before the frame's own update. For every live enemy this client
@@ -872,8 +1104,13 @@ function applyPeerState(live) {
 				despawnEnemyLocally(id);
 				continue;
 			}
-			if (puppets.delete(id))
+			if (puppets.delete(id)) {
 				releasePuppet(ent);
+				// The owner's effect stream stops being applied to this enemy the moment it becomes
+				// OURS (Phase 6): the fx it left on it are the previous owner's presentation of an
+				// enemy we now simulate, and nothing will ever stop them.
+				clearRemoteEnemyFx(ent);
+			}
 			takeOwnership(id, ent);
 			continue;
 		}
@@ -892,6 +1129,8 @@ function applyPeerState(live) {
 				puppets.set(id, ent);
 			}
 			drivePuppet(ent, entry.state);
+			// ...and the effects that arrived in the same frame as that state (Phase 6).
+			applyEnemyEffects(id, ent, entry);
 			// The owner's enemy is at 0 HP: it has been beaten (the engine's own defeat sets both
 			// `defeated` and currentHP 0, combat-params.js reduceHP, so the ratio is 0 for the whole
 			// dying window). Latch it dying and remember the death pose, so that when the owner STOPS
@@ -927,8 +1166,10 @@ function applyPeerState(live) {
 			drivePuppet(ent, held.state);
 			continue;
 		}
-		if (puppets.delete(id))
+		if (puppets.delete(id)) {
 			releasePuppet(ent);
+			clearRemoteEnemyFx(ent);       // the owner stopped speaking for it: drop its effects too
+		}
 	}
 	// Enemies that are gone (killed, unloaded, or no longer wire-addressable): nothing to drive,
 	// and nothing may stay suppressed. Their stored state goes too, or it would be applied to
@@ -938,6 +1179,7 @@ function applyPeerState(live) {
 			continue;
 		puppets.delete(id);
 		releasePuppet(ent);
+		clearRemoteEnemyFx(ent);
 	}
 	for (const id of peerState.keys()) {
 		if (!live.has(id))
@@ -1079,6 +1321,11 @@ function resetForNewMap() {
 	// The reward half's exactly-once marks belong to the world they were made in for the same reason
 	// (Phase 5b): its entities are the ones being torn down here.
 	clearKillRewardState();
+	// The lasting-fx registry of the enemy channel goes too (Phase 6): the fx entities it names are
+	// being torn down with the map, and an entry whose entity the engine never told us about would
+	// otherwise sit there for the rest of the session, re-sent for an enemy id that cannot come
+	// back. (The per-frame liveness prune cannot see it: a torn-down FxEntity is not "ended".)
+	activeEnemyFx.clear();
 	if (registry.size === 0)
 		return;
 	const ids = [...registry.keys()];
@@ -1143,6 +1390,12 @@ export function onEnemyOwner(msg) {
 // Routed here from ./client.js. Nothing is APPLIED from here — this only records what arrived
 // and when; the per-frame peer half decides whether it is still worth using, and releases the
 // enemy when it stops arriving.
+//
+// The frame also carries that owner's effects for those enemies (Phase 6: globalFx/fxStops/
+// persistentFx/sounds/soundStops/projectiles, each entry tagged with its enemy). They are stored
+// with the state they arrived with and applied by the same per-frame half, for exactly the same
+// reason: an effect belongs to the frame whose state it accompanied, and the enemy's own entity is
+// only steered on the frame path (see applyEnemyEffects).
 export function onEnemyState(msg) {
 	if (!isEnemySyncEnabled())
 		return;
@@ -1152,6 +1405,16 @@ export function onEnemyState(msg) {
 	const list = msg?.list;
 	if (!Array.isArray(list))
 		return;
+	// The frame's effect batches (Phase 6), grouped by the enemy each entry belongs to. Grouping
+	// once per message rather than scanning the arrays per enemy keeps this linear in the frame's
+	// size; a frame with none (the common case, and every frame from a client that owns no enemy)
+	// builds no maps at all.
+	const fx = groupEnemyEffects(msg.globalFx);
+	const fxStops = groupEnemyEffects(msg.fxStops);
+	const sounds = groupEnemyEffects(msg.sounds);
+	const soundStops = groupEnemyEffects(msg.soundStops);
+	const projectiles = groupEnemyEffects(msg.projectiles);
+	const persistentFx = groupEnemyEffects(msg.persistentFx);
 	const now = nowMs();
 	for (const state of list) {
 		// Malformed and partial entries are skipped, never thrown on: a peer's payload must not
@@ -1167,8 +1430,59 @@ export function onEnemyState(msg) {
 		// an id we do not hold at all, such as another room's enemy, fails it as well.
 		if (currentOwner(id) !== owner)
 			continue;
-		peerState.set(id, { state, at: now, from: owner });
+		// The effects that arrived with this state, carried over from a frame we have not applied
+		// yet (see carryBatch): the stored entry replaces the previous one, so without this a
+		// one-shot effect that arrived in two messages between two frames would lose the first.
+		const prev = peerState.get(id);
+		const carried = prev && prev.applied === false ? prev : null;
+		const entry = { state, at: now, from: owner, applied: false };
+		carryBatch(entry, "globalFx", carried, fx.get(id));
+		carryBatch(entry, "fxStops", carried, fxStops.get(id));
+		carryBatch(entry, "sounds", carried, sounds.get(id));
+		carryBatch(entry, "soundStops", carried, soundStops.get(id));
+		carryBatch(entry, "projectiles", carried, projectiles.get(id));
+		carryBatch(entry, "persistentFx", carried, persistentFx.get(id));
+		peerState.set(id, entry);
 	}
+}
+
+// Group one of an enemy frame's effect batches by the enemy each entry names (`enemy`), which is
+// the field that routes it back to the local copy of that enemy. Entries without a usable id are
+// dropped rather than thrown on, the same rule the state entries follow.
+function groupEnemyEffects(list) {
+	const out = new Map();
+	if (!Array.isArray(list))
+		return out;
+	for (const entry of list) {
+		if (!entry || typeof entry !== "object")
+			continue;
+		const enemyId = entry.enemy;
+		if (typeof enemyId !== "string" || enemyId === "")
+			continue;
+		const bucket = out.get(enemyId);
+		if (bucket)
+			bucket.push(entry);
+		else
+			out.set(enemyId, [entry]);
+	}
+	return out;
+}
+
+// Add one frame's batch for one enemy to the peer-state entry being stored, carrying over the
+// batch of a previous frame this module has not applied yet. The server relays a frame every tick
+// and the socket can deliver two before this client's next frame; the stored entry is replaced
+// wholesale, so without the carry-over a one-shot effect (a hit impact, a sound) that arrived in
+// the earlier message would simply vanish -- the same carry-over ./snapshot.js does for a peer
+// player's update. The order is the arrival order (prev first, then fresh), which is what a
+// spawn/stop pair needs: an fx spawned in the earlier message is stopped by the later one.
+function carryBatch(entry, key, carried, fresh) {
+	const prev = carried ? carried[key] : null;
+	if (!prev) {
+		if (fresh)
+			entry[key] = fresh;
+		return;
+	}
+	entry[key] = fresh ? prev.concat(fresh) : prev;
 }
 
 // ─────────────────────────── inbound ownership handoff ───────────────────────────
@@ -1288,6 +1602,10 @@ function despawnEnemyLocally(enemyId) {
 	const core = findCoreById(enemyId);
 	if (core) {
 		grantKillReward(enemyId, core.ent);
+		// The effects its owner's stream put on it go with it (Phase 6). Done before the removal
+		// because stopping a tracked fx needs the entity it was attached to; the ones that are
+		// world-position one-shots are not tracked and simply play out, as on the player path.
+		clearRemoteEnemyFx(core.ent);
 		removeDefeatedEnemy(core);
 	}
 
@@ -1305,6 +1623,7 @@ function despawnEnemyLocally(enemyId) {
 	if (puppeted) {
 		puppets.delete(enemyId);
 		releasePuppet(puppeted);
+		clearRemoteEnemyFx(puppeted);      // its owner's effects go with it (Phase 6)
 	}
 
 	const known = registry.get(enemyId);
@@ -2394,6 +2713,29 @@ addPeerMessageHandler(MSG.ENEMY_HIT, onEnemyHit);
 // module only reports the seam. Registering it is harmless while the feature is off (the sink
 // re-tests the option per call), and it must exist before the first hit of the session.
 setEnemyHitSink(onEnemyHitSeam);
+
+// The ownership probe ./fx-sync.js attributes an effect to an enemy with (Phase 6; see the note on
+// ./session.js's holder). Its capture hooks cannot import this module (it imports ./client.js), so
+// like the handler table above, the answer is registered rather than imported. It is deliberately a
+// RE-TEST per call rather than a cached list: ownership moves under a rebalance, the connection and
+// the feature flag can go at any time, and an effect must be attributed by what is true when it is
+// emitted. isOwner() is the whole test, so:
+//   - the local player's own entities are never an owned enemy (no registry entry, and the id they
+//     resolve to is a client-local `u:<uid>`);
+//   - an enemy ANOTHER client owns -- the one this client puppets -- is never one, which is what
+//     keeps a puppet from forwarding the effects it is being shown, or from forwarding the ones its
+//     own suppressed copy would have emitted (it emits none: see ./enemy-puppet.js);
+//   - a runtime spawn, which has no wire-addressable identity (`u:<uid>`, not correlated across
+//     clients), is never one: there is no id the peer could route an effect back on;
+//   - and an owned enemy we have not taken over yet IS one, which is deliberate: the fx we captured
+//     before its takeover are drained against the frame's published set instead (see
+//     drainEnemyEffects), the one place that knows what we are actually speaking for.
+enemyOwnership.ownedIdOf = (ent) => {
+	if (!ent || !isEnemySyncEnabled())
+		return null;
+	const id = enemyStableId(ent.core);
+	return id && isOwner(id) ? id : null;
+};
 
 // ──────────────────────────────────── addon ────────────────────────────────────
 
