@@ -1,8 +1,10 @@
 /**
  * src/client/enemies.js
- * Enemy identity, registry and ownership bookkeeping: the client half of the enemy-sync
- * split, Phase 1 (announce the enemies this client can see; learn who the server assigned
- * to simulate each of them). Nothing here changes what an enemy does.
+ * Enemy identity, registry and ownership bookkeeping, and the state wiring on top of it: the
+ * client half of the enemy-sync split (announce the enemies this client can see, learn who the
+ * server assigned to simulate each of them, publish the state of the ones we own, drive the
+ * ones we do not from the owner's snapshots). The only thing this module changes about an
+ * enemy is the one it drives as a puppet: everything else is observation and bookkeeping.
  * Responsibilities:
  *   - The canonical enemy identity helper enemyStableId() (moved here from
  *     ../debug/enemy-debug.js, which now imports it) and the wire-safe subset of those ids.
@@ -11,26 +13,35 @@
  *   - The enemyId -> { registered, owner, epoch } registry, fed by the server's enemy_owner
  *     broadcast and guarded against stale epochs.
  *   - The readers the debug overlay consumes: isOwner() / getEnemyOwnerName().
+ *   - Owner half of the state sync: one MSG.ENEMY_STATE per frame carrying every enemy this
+ *     client owns, and nothing at all when it owns none or has no peer to send to.
+ *   - Peer half: accept state only from an enemy's CURRENT owner, drive that enemy through
+ *     ./enemy-puppet.js while the state is fresh, and release the puppet as soon as it is not
+ *     (see PEER_STATE_FRESH_MS — the anti-freeze guarantee).
  * Public surface: ENEMY_SYNC_OPTION, enemyStableId, isEnemySyncEnabled, onEnemyOwner,
- *   isOwner, getEnemyOwnerName, EnemySync
+ *   onEnemyState, isOwner, getEnemyOwnerName, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
  *   g_game.map.active.path / g_scene.isRunning / EnemyCmp (and, through it, each enemy's
- *   sourceEntity.core, which is where identity comes from); window.terraTogether.playerId /
- *   playerNames (published by ./session.js). Inbound routing: ./client.js (see the note at
- *   the handler registration below).
- * Notes: Phase 1 is deliberately inert gameplay-wise — the module only observes and reports,
- *   so enemy AI, state, HP and rewards are untouched. It is a no-op, and holds no state, while
- *   its option is off or the client is not connected, which is what makes it safe to default
- *   on. The option KEY is declared here as a literal instead of being imported from
+ *   sourceEntity.core, which is where identity comes from); ./enemy-puppet.js, which owns the
+ *   prototype patches and the actual puppet drive; window.terraTogether.playerId / playerNames
+ *   (published by ./session.js); performance.now() (the freshness clock). Inbound routing:
+ *   ./client.js (see the note at the handler registration below).
+ * Notes: the module is a no-op, and holds no state, while its option is off or the client is
+ *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
+ *   are released too, so no enemy can stay suppressed (or frozen) because this module stopped
+ *   running. The option KEY is declared here as a literal instead of being imported from
  *   ../config/settings.js: that module imports ../debug/enemy-debug.js, which imports this
  *   one, so importing back would close a cycle (same reason ENEMY_DEBUG_OPTION is a literal
  *   in ../debug/enemy-debug.js).
  */
 
 import { send, isConnected, addPeerMessageHandler } from "./client.js";
-import { getRogueInfo } from "./session.js";
+import { getRogueInfo, hasPeers } from "./session.js";
 import { MSG } from "../net/protocol.js";
+import {
+	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet,
+} from "./enemy-puppet.js";
 
 // The option key declared in ../config/settings.js (see the header note on why it is a
 // literal here). Read through g_options.get(), which hands back the stored value as-is.
@@ -46,6 +57,18 @@ const LOCAL_FALLBACK_NAME = "Player";
 // Epoch of "no assignment seen yet" for an enemy in the registry. The server starts real
 // epochs at 1 (server/enemy-ownership.js), so a first assignment always beats this.
 const NO_EPOCH = 0;
+
+// How long a peer's enemy state stays usable — the anti-freeze threshold, and the number this
+// phase turns on. The owner publishes every frame (MSG.ENEMY_STATE, ~16ms apart at 60fps), so
+// healthy state is a frame or two old; 500ms is roughly thirty missed frames, i.e. far past
+// ordinary lag and into "that owner is not simulating this enemy any more": a hitch, a
+// disconnect, or an owner that never had the enemy to begin with. Below the threshold the peer
+// drives the enemy from the snapshot; at or above it the peer RELEASES the puppet and the
+// enemy resumes its own local simulation. That fallback is deliberate and load-bearing: a
+// failed sync must degrade to "both clients simulate this enemy" (harmless-ish, and
+// self-correcting as soon as state flows again), never to an enemy frozen at the last state
+// that did arrive.
+const PEER_STATE_FRESH_MS = 500;
 
 // True while the feature is on. Strict `=== true`, like the overlay's flag test: only a real
 // boolean switches it on, and an option that was never seeded counts as off.
@@ -146,6 +169,13 @@ function isWorldSceneActive() {
 	return !!terra.export.g_scene?.isRunning?.() && !terra.export.g_scene?.isCutscene?.();
 }
 
+// Data path of the map in play, "" while no map is loaded. The same expression enemySpotId()
+// reads for an id's map half, factored out so the register and the state publish read the map
+// the same way instead of each spelling out the lookup.
+function activeMapPath() {
+	return terra.export.g_game?.map?.active?.path ?? "";
+}
+
 // A live enemy = an entity carrying an EnemyCmp whose combatant is alive. Same guards as the
 // debug overlay (../debug/enemy-debug.js getLiveEnemy) so both agree on which enemies exist:
 // entities that have not finished initialising (no combatant yet) and already-killed entities
@@ -181,6 +211,64 @@ function clearRegistry() {
 	registry.clear();
 }
 
+// ──────────────────────────────── peer state ────────────────────────────────
+
+// Inbound state by enemy id: { state, at, from }. `state` is the owner's readEnemyState()
+// object, kept exactly as received (nothing here rewrites it); `at` is the clock reading it
+// arrived at (PEER_STATE_FRESH_MS is measured against that); `from` is the owner that sent it,
+// so state whose sender stops being the owner can be dropped. One small object per enemy per
+// message is the only allocation this half adds.
+const peerState = new Map();
+
+// The enemies THIS client is currently driving as puppets: enemyId -> entity. Kept so every
+// release path (stale state, ownership change, enemy gone, map change, disconnect, flag off)
+// can undo exactly what was done without a second enumeration of the entity list, and so
+// makePuppet() is called only on the transition into a puppet rather than every frame. The
+// module does not need to consult the puppet module's isPuppet(): this map is its own record of
+// what it puppeted.
+const puppets = new Map();
+
+// Drop every stored peer state. Part of the reset path: state stored for the map we are leaving
+// can never be applied to the next one.
+function clearPeerState() {
+	peerState.clear();
+}
+
+// Release every puppet and forget it. Called on every cleanup path: an enemy still puppeted
+// after its owner went away, or left puppeted across a map change, is exactly the frozen enemy
+// this module must not ship.
+function releaseAllPuppets() {
+	if (puppets.size === 0)
+		return;
+	for (const ent of puppets.values())
+		releasePuppet(ent);
+	puppets.clear();
+}
+
+// The prototype patches that make the puppet flag mean anything. Installed exactly once, never
+// per frame: at map start while the feature is on, or — for a flag switched on mid-map, which
+// never sees another map start — just before the first makePuppet(). installPuppetPatches() is
+// idempotent on its own side; this guard keeps even the call off the hot path.
+let puppetPatchesInstalled = false;
+function ensurePuppetPatches() {
+	if (puppetPatchesInstalled)
+		return;
+	puppetPatchesInstalled = true;
+	installPuppetPatches();
+}
+
+// The freshness clock: wall-clock milliseconds, monotonic and independent of the frame rate,
+// which is what lets the threshold be a duration rather than a frame count (one slow frame must
+// not look like a silent owner).
+function nowMs() {
+	return performance.now();
+}
+
+// The enemy's current owner per the registry (null while unassigned or unknown).
+function currentOwner(enemyId) {
+	return registry.get(enemyId)?.owner ?? null;
+}
+
 // Copy the variant currently in play (null outside a rogue run), i.e. the second half of the
 // `<map>#<variant>` room key the server arbitrates a registration against. ./session.js owns
 // how it is read.
@@ -189,22 +277,30 @@ function roomVariant() {
 }
 
 // The per-frame diff: announce what appeared, withdraw what vanished, send nothing otherwise.
+// Returns the live wire-addressable enemies as enemyId -> core, for the two state halves below
+// (each needs the entity behind an id: one to read its state, one to drive it), or null on a
+// frame that was skipped or gated off — the signal to touch nothing this frame.
 function syncEnemies() {
-	// Gated: switched off or offline. Nothing is enumerated, nothing is sent, and the registry
-	// goes too (see clearRegistry).
+	// Gated: switched off or offline. Nothing is enumerated, nothing is sent, and every piece of
+	// state this module holds goes with it — the registry (see clearRegistry), the peer state,
+	// and the puppets: with the feature off, or the connection gone, no enemy may stay
+	// suppressed or driven by a snapshot nobody will refresh.
 	if (!isEnemySyncEnabled() || !isConnected()) {
 		clearRegistry();
-		return;
+		clearPeerState();
+		releaseAllPuppets();
+		return null;
 	}
-	const map = terra.export.g_game?.map?.active?.path ?? "";
+	const map = activeMapPath();
 	// A map mid-transition / a paused world: the entity list is not the world it will be, and
 	// the map path an id is built from may not be the one the entities came from. Skip the
 	// frame instead of reporting on it, and keep the registry: the sweep below would read the
-	// transition as a mass despawn.
+	// transition as a mass despawn. Peer state and puppets are kept too — driving or releasing
+	// an entity out of a list that is being rebuilt is exactly the frame it must not happen on.
 	if (map === "" || !isWorldSceneActive())
-		return;
+		return null;
 
-	const live = new Set();
+	const live = new Map();
 	const added = [];
 	for (const core of terra.export.g_gState?.entities ?? []) {
 		if (!getLiveEnemy(core))
@@ -212,7 +308,7 @@ function syncEnemies() {
 		const id = wireEnemyId(core);
 		if (id === null)
 			continue;                      // runtime spawn / unknown map: not wire-addressable
-		live.add(id);
+		live.set(id, core);
 		const entry = registry.get(id);
 		if (entry) {
 			// Known enemy: only an entry we learned from the server still needs announcing.
@@ -247,12 +343,105 @@ function syncEnemies() {
 	}
 	if (gone.length > 0)
 		send({ type: MSG.ENEMY_UNREGISTER, ids: gone });
+
+	return live;
+}
+
+// ─────────────────────── owner half: publish our state ───────────────────────
+
+// One MSG.ENEMY_STATE per frame, carrying every enemy this client is the assigned owner of in
+// a single `list` (the frozen payload). Run after the frame's update, so what a peer receives
+// is the state this frame produced. Silent when there is nothing to say: no enemy we own, no
+// peer to say it to, or no enemy whose state could be read. Playing alone must not put anything
+// on the wire — an owner with no peers has nobody to keep in sync, and the whole point of the
+// split is that only the owner's word is authoritative, so there is nothing to fall back to.
+function sendOwnerStates(live) {
+	if (!live || live.size === 0 || !hasPeers())
+		return;
+	const list = [];
+	for (const [id, core] of live) {
+		if (!isOwner(id))
+			continue;
+		const state = readEnemyState(core.ent);
+		// An enemy whose state cannot be read simply does not appear: the peer's copy of it goes
+		// stale and resumes local simulation, which is better than publishing a half state.
+		if (state)
+			list.push(state);
+	}
+	if (list.length === 0)
+		return;
+	// `owner` is our own playerId — the identity the server validates the sender against and
+	// the one every recipient gates on. `map`/`variant` name the room this state belongs to,
+	// exactly as the register does (they are part of the frozen payload both directions).
+	send({ type: MSG.ENEMY_STATE, owner: localPlayerId(), map: activeMapPath(), variant: roomVariant(), list });
+}
+
+// ───────────────────── peer half: drive what we do not own ─────────────────────
+
+// The per-frame peer half, run before the frame's own update. For every live enemy this client
+// does NOT own: drive it from the owner's state while that state is fresh, and release it back
+// to local simulation the moment it is not. The release branch is not an error path — it is the
+// normal outcome of an owner going quiet, and it is what turns a failed sync into "both
+// clients simulate this enemy" instead of a frozen one.
+function applyPeerState(live) {
+	if (!live)
+		return;
+	const now = nowMs();
+	for (const [id, core] of live) {
+		const ent = core.ent;
+		// Ours: never a puppet. Becoming the owner (a rebalance) releases the enemy and starts
+		// simulating and publishing it instead.
+		if (isOwner(id)) {
+			if (puppets.delete(id))
+				releasePuppet(ent);
+			continue;
+		}
+		let entry = peerState.get(id);
+		// State whose sender is no longer the enemy's owner is stale by definition (the
+		// assignment moved since it arrived), so it is dropped rather than applied.
+		if (entry && entry.from !== currentOwner(id)) {
+			peerState.delete(id);
+			entry = undefined;
+		}
+		const age = entry ? now - entry.at : Infinity;
+		if (entry && age < PEER_STATE_FRESH_MS) {
+			if (!puppets.has(id)) {
+				ensurePuppetPatches();
+				makePuppet(ent);
+				puppets.set(id, ent);
+			}
+			drivePuppet(ent, entry.state);
+			continue;
+		}
+		// No usable state: nobody owns this enemy right now, the owner has gone quiet (or never
+		// had it), or its state predates the current assignment. Simulate it locally again.
+		if (puppets.delete(id))
+			releasePuppet(ent);
+	}
+	// Enemies that are gone (killed, unloaded, or no longer wire-addressable): nothing to drive,
+	// and nothing may stay suppressed. Their stored state goes too, or it would be applied to
+	// whatever holds the same id on the next map.
+	for (const [id, ent] of puppets) {
+		if (live.has(id))
+			continue;
+		puppets.delete(id);
+		releasePuppet(ent);
+	}
+	for (const id of peerState.keys()) {
+		if (!live.has(id))
+			peerState.delete(id);
+	}
 }
 
 // The map is gone: every id we announced embeds the old map path, so none of them can come
 // back, and the server's records for them should not outlive it. The new map's own enemies are
-// announced by the next frame's diff.
+// announced by the next frame's diff. Peer state and puppets go with it — the same ids on the
+// new map would otherwise resume driving from state read on the old one — and any enemy still
+// puppeted is released, which is the last thing standing between a map change and a frozen
+// enemy.
 function resetForNewMap() {
+	clearPeerState();
+	releaseAllPuppets();
 	if (registry.size === 0)
 		return;
 	const ids = [...registry.keys()];
@@ -292,6 +481,41 @@ export function onEnemyOwner(msg) {
 	entry.epoch = epoch;
 }
 
+// ──────────────────────────── inbound peer state ────────────────────────────
+
+// Inbound MSG.ENEMY_STATE (owner -> everyone but the sender, relayed after the server has
+// checked the sender against the assignment): the owner's snapshot of the enemies it simulates.
+// Routed here from ./client.js. Nothing is APPLIED from here — this only records what arrived
+// and when; the per-frame peer half decides whether it is still worth using, and releases the
+// enemy when it stops arriving.
+export function onEnemyState(msg) {
+	if (!isEnemySyncEnabled())
+		return;
+	const owner = msg?.owner == null ? null : String(msg.owner);
+	if (owner === null)
+		return;
+	const list = msg?.list;
+	if (!Array.isArray(list))
+		return;
+	const now = nowMs();
+	for (const state of list) {
+		// Malformed and partial entries are skipped, never thrown on: a peer's payload must not
+		// be able to break this frame, not even the one it arrives in.
+		if (!state || typeof state !== "object")
+			continue;
+		const id = state.id;
+		if (typeof id !== "string" || id === "")
+			continue;
+		// The cheap correctness gate: only the enemy's CURRENT owner may speak for it. The
+		// server validates the same thing before relaying, so this mainly catches what arrives
+		// after an assignment has moved (applyPeerState drops that too, on the next frame) — and
+		// an id we do not hold at all, such as another room's enemy, fails it as well.
+		if (currentOwner(id) !== owner)
+			continue;
+		peerState.set(id, { state, at: now, from: owner });
+	}
+}
+
 // ─────────────────────────────── public readers ───────────────────────────────
 
 // True when the local player is the server-assigned simulator of `enemyId`. False for an
@@ -328,29 +552,38 @@ export function getEnemyOwnerName(enemyId) {
 }
 
 // Routed by ./client.js, which the composition root owns: this module cannot be imported
-// there (it imports send() from it), so it registers its handler instead. Keeps the client
-// module graph a DAG.
+// there (it imports send() from it), so it registers its handlers instead. Keeps the client
+// module graph a DAG. ./session.js has the inbound cases that hand these two types to
+// ./client.js (see the dispatch there).
 addPeerMessageHandler(MSG.ENEMY_OWNER, onEnemyOwner);
+addPeerMessageHandler(MSG.ENEMY_STATE, onEnemyState);
 
 // ──────────────────────────────────── addon ────────────────────────────────────
 
-// The per-frame bookkeeping loop. onPreUpdate reads the frame's opening set — a freshly
-// loaded map's enemies are announced before this frame's update consumes them — and
-// onPostUpdate reads it again, so enemies the frame itself spawned or killed are reported in
-// the same frame rather than the next one. Both run the same diff, which is silent when
-// nothing changed, so the wire sees one message per identity change and never per-frame
-// chatter.
+// The per-frame loop, in two halves. onPreUpdate reads the frame's opening set — a freshly
+// loaded map's enemies are announced before this frame's update consumes them — and drives the
+// enemies this client does not own from the owner's state, before that same update runs, so a
+// release lands in time for the enemy to simulate this frame rather than the next. onPostUpdate
+// runs the same identity diff (so enemies the frame itself spawned or killed are reported in the
+// frame that did it) and then publishes this frame's state for the enemies we own. The diff is
+// silent when nothing changed, so registering still costs one message per identity change; only
+// the state publish is per-frame, and only while there is a peer and something we own to send.
 class EnemySync {
 	onGameMapStart() {
 		resetForNewMap();
+		// The map is the moment this module knows a world is about to be simulated, so the puppet
+		// patches go in here — once, and only while the feature is on (see ensurePuppetPatches
+		// for the mid-map case).
+		if (isEnemySyncEnabled())
+			ensurePuppetPatches();
 	}
 
 	onPreUpdate() {
-		syncEnemies();
+		applyPeerState(syncEnemies());
 	}
 
 	onPostUpdate() {
-		syncEnemies();
+		sendOwnerStates(syncEnemies());
 	}
 }
 

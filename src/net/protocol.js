@@ -61,7 +61,9 @@
  *   MSG.ENEMY_REGISTER    "enemy_register"   client -> server only, when this client learns of a
  *                                            map-placed enemy: both clients hold the same ones,
  *                                            so both register each id; the server de-dupes
- *                                            (keeping the first assignment). Server case:
+ *                                            (keeping the first assignment, though a second
+ *                                            client's announcement widens which clients may own
+ *                                            the enemy and can re-split its room). Server case:
  *                                            MSG.ENEMY_REGISTER (server.js:275); never relayed,
  *                                            it is answered with MSG.ENEMY_OWNER. Payload:
  *                                            { id, map, variant }.
@@ -76,17 +78,31 @@
  *                                            room's membership changes. `owner` null means the
  *                                            enemy is unowned, i.e. nobody simulates it. Client
  *                                            case: MSG.ENEMY_OWNER.
+ *   MSG.ENEMY_STATE       "enemy_state"      client -> server -> other clients, per frame, and only
+ *                                            from an enemy's CURRENT owner: the movement, animation
+ *                                            and HP of the enemies that client simulates, which the
+ *                                            other clients apply to their puppets. The one relayed
+ *                                            type the server does NOT forward verbatim -- it rechecks
+ *                                            every entry against the arbiter
+ *                                            (enemy-ownership.js validate()) and DROPS any the sender
+ *                                            does not own, then relays the surviving frame with
+ *                                            `owner` stamped to the sender (server.js, the
+ *                                            MSG.ENEMY_STATE case). Payload: { owner, map, variant,
+ *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
+ *                                            animTime, hp, state, action } ] }. Client case:
+ *                                            MSG.ENEMY_STATE.
  *
- * The server's inbound switch (server.js:189) has 9 cases: the 7 relayed types above, plus
- * ENEMY_REGISTER and ENEMY_UNREGISTER -- the two that are not relayed but answered with
- * ENEMY_OWNER. The client's dispatch has 12: every type except PROFILE, ENEMY_REGISTER and
- * ENEMY_UNREGISTER. The six server-only types (WELCOME, HOST_SETTING, PLAYER_PROFILE,
- * PLAYER_JOINED, PLAYER_LEFT, ENEMY_OWNER) are never accepted from a client -- a client that
- * sends one hits the server's default branch and is dropped, because they describe state only
- * the server can vouch for (ids it minted, settings it owns, membership it tracks, and the
+ * The server's inbound switch has 10 cases: the 7 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
+ * REVIVE, REVIVE_PROGRESS, AREA_HEAL forwarded verbatim; ENEMY_STATE forwarded entry-validated),
+ * PROFILE -- answered, not relayed -- and ENEMY_REGISTER / ENEMY_UNREGISTER, which are not relayed
+ * but answered with ENEMY_OWNER. The client's dispatch has 13: every type except PROFILE,
+ * ENEMY_REGISTER and ENEMY_UNREGISTER. The six server-only types (WELCOME, HOST_SETTING,
+ * PLAYER_PROFILE, PLAYER_JOINED, PLAYER_LEFT, ENEMY_OWNER) are never accepted from a client -- a
+ * client that sends one hits the server's default branch and is dropped, because they describe state
+ * only the server can vouch for (ids it minted, settings it owns, membership it tracks, and the
  * enemy ownership it arbitrates).
  */
 
-export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner" };
+export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state" };
 
 //# sourceURL=/mods/terra-together/net/protocol.js

@@ -5,7 +5,8 @@
  *   - Own the WebSocketServer lifecycle (start/stop, listening/error/close handlers).
  *   - Track per-player state, username and last scene, and replay them to late joiners.
  *   - Push host-authoritative settings (revive, estus-share) on change.
- *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients.
+ *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients, and
+ *     enemy_state to other clients once its entries are checked against the arbiter.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
  *     publish it, re-arbitrating when a room's membership changes.
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
@@ -17,7 +18,7 @@
  *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
  *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
  *     every inbound type is matched through MSG.*, so an unknown type falls to the default
- *     branch and is dropped. The direction table for all 15 types is documented there.
+ *     branch and is dropped. The direction table for all 16 types is documented there.
  *   - Enemy-sync ownership is arbitrated here, never simulated: the server is a single
  *     process, so its assignment is the consensus (see src/server/enemy-ownership.js). A
  *     client registers the map-placed enemies it can see and the server answers with the
@@ -34,7 +35,10 @@
  *   - The server is a dumb relay: it trusts the peer-supplied payload (state/scene/map/
  *     variant/username, and revive/area_heal wholesale) and only enforces the shapes its
  *     own caches dereference. Anything that matters is re-checked by the recipient
- *     (e.g. the area-heal distance test in src/features/area-heal.js).
+ *     (e.g. the area-heal distance test in src/features/area-heal.js). The one exception is
+ *     enemy_state, whose per-enemy entries the server authorises against the ownership arbiter
+ *     before relaying (see the MSG.ENEMY_STATE case): an owner is the only party that can be
+ *     allowed to drive an enemy, and that is a fact only the server can vouch for.
  *   - Ordering: each send is one synchronous socket.write, so per-connection order is
  *     preserved, but there is no rate limiting, batching or backpressure -- inbound
  *     traffic is paced by the clients' own tick (see src/client/snapshot.js).
@@ -400,12 +404,61 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						const roster = rosterOf(room);
 						const assignment = enemyOwnership.register(msg.id, room, playerId, roster);
 						if (netDebugEnabled())
-							netDebug(`in enemy_register ${msg.id} (msg map=${msg.map} variant=${msg.variant}) room=${room ?? "(none)"} from=${shortId(playerId)} roster=[${roster.map(shortId).join(",")}] -> owner=${shortId(assignment?.owner) || "none"} epoch ${assignment?.epoch ?? "-"}`);
+							netDebug(`in enemy_register ${msg.id} (msg map=${msg.map} variant=${msg.variant}) room=${room ?? "(none)"} from=${shortId(playerId)} roster=[${roster.map(shortId).join(",")}] -> owner=${shortId(assignment?.owner) || "none"} epoch ${assignment?.epoch ?? "-"} moved=${assignment?.changed?.length ?? 0}`);
 						// Everyone, the registrant included: it has to learn who owns the enemy it just
 						// registered, and a duplicate register is how a late joiner learns it.
-						if (assignment)
+						if (assignment) {
 							publishOwners([assignment]);
+							// Registering a second time widens the enemy's candidate set, so the arbiter
+							// re-split the room and handed back the assignments that moved. Publishing them
+							// is what converges a room whose split was made while only one client had
+							// announced the enemies (see register() in enemy-ownership.js); it is empty
+							// when nothing moved, so an idempotent re-register stays silent.
+							if (assignment.changed.length > 0)
+								publishOwners(assignment.changed);
+						}
 						break;
+
+					case MSG.ENEMY_STATE: {
+						// Owner -> server -> other clients, per frame: the position/animation/HP of the
+						// enemies this client simulates. Unlike every other relay here the frame is NOT
+						// taken on trust -- the server is the only party that can vouch for who owns an
+						// enemy, and only its owner may drive it -- so each entry is checked against the
+						// arbiter and an entry this sender does not own is DROPPED. Dropping per entry
+						// (not per message) is deliberate: a rebalance can move one enemy between friends,
+						// and the rest of the frame is still good. Wire shape (frozen): { owner, map,
+						// variant, list: [{ id, x, y, z, vx, vy, vz, fx, fy, anim, animTime, hp, state,
+						// action }] }.
+						const list = Array.isArray(msg.list) ? msg.list : null;
+						const count = list === null ? 0 : list.length;
+						// `kept` stays null while every entry passes, so the common frame is relayed
+						// without allocating a filtered copy; it is seeded from the entries before the
+						// first failure, which are exactly the ones that passed.
+						let kept = null;
+						let passed = 0;
+						for (let i = 0; i < count; i++) {
+							const entry = list[i];
+							if (entry && enemyOwnership.validate(entry.id, playerId)) {
+								passed++;
+								if (kept !== null)
+									kept.push(entry);
+							} else if (kept === null) {
+								kept = list.slice(0, i);
+							}
+						}
+						if (netDebugEnabled())
+							netDebug(`in enemy_state from=${shortId(playerId)} map=${msg.map} variant=${msg.variant ?? null} entries=${count} owner-pass=${passed} not-owner-drop=${count - passed}`);
+						// Nothing authorised: no frame, in particular no empty one, reaches the wire.
+						if (passed === 0)
+							break;
+						if (kept !== null)
+							msg.list = kept;
+						// The sender's own claim is never relayed: it is the socket's playerId that the
+						// arbiter just vouched for, and the frozen shape says owner is that id.
+						msg.owner = playerId;
+						broadcast(msg, socket);
+						break;
+					}
 
 					case MSG.ENEMY_UNREGISTER:
 						// The enemy no longer exists for THIS client (its death resolved, or its map unloaded):

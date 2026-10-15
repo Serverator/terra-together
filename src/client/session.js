@@ -321,12 +321,13 @@ export function joinServer(address, options = {}) {
 
 				// Types owned by a feature module rather than by this dispatch: the downed/revive
 				// + estus area-heal protocol (../features/revive.js, ../features/area-heal.js)
-				// and the enemy ownership broadcast (../client/enemies.js). ./client.js is the
-				// composition root that routes them on.
+				// and the enemy ownership broadcast + state snapshots (../client/enemies.js).
+				// ./client.js is the composition root that routes them on.
 				case MSG.REVIVE:
 				case MSG.REVIVE_PROGRESS:
 				case MSG.AREA_HEAL:
 				case MSG.ENEMY_OWNER:
+				case MSG.ENEMY_STATE:
 					deps.onPeerMessage(msg);
 					break;
 			}
