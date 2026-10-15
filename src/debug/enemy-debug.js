@@ -1,7 +1,9 @@
 /**
  * src/debug/enemy-debug.js
  * Enemy debug overlay: a small label above every live enemy showing the player who owns
- * (will simulate) it, the enemy's current logic state and the action its actor is running.
+ * (will simulate) it, its stable enemy id (the string the sync keys on, so the same enemy
+ * can be matched across clients' screens), the enemy's current logic state and the action
+ * its actor is running.
  * Responsibilities:
  *  - on/off from window.ttEnemyDebug (live) OR the tt-enemy-debug option
  *  - the ownership label: the SERVER-assigned owner when one is known (src/client/enemies.js,
@@ -44,7 +46,7 @@ const ENEMY_DEBUG_WINDOW_FLAG = "ttEnemyDebug";
 
 // The overlay always draws at 0.5x, unlike the nameplates (which follow the "Nameplate
 // Scale" option). Half of the nameplate default is deliberately small: the label is a
-// three-line debug readout over the head, so it is kept quieter than the name it sits next
+// four-line debug readout over the head, so it is kept quieter than the name it sits next
 // to, and it is a constant rather than an option because the overlay is a debug view.
 // Load-bearing value — keep it exact: ./labels.js multiplies the measured text size and the
 // stacking baseline by it.
@@ -208,16 +210,33 @@ function getLiveEnemy(core) {
 	return enemy;
 }
 
-// owner / state / running action. Both enemy fields can legitimately be null. The owner is the
+// The label's FIXED line set, in order: owner, enemy id, logic state, running action. All
+// four lines are emitted on every frame.
+//
+// Order: owner first (who simulates this enemy) and the id second, directly under it, because
+// the id is the cross-client key the owner is derived from -- reading the two together is what
+// makes "same enemy, two screens" checks quick. State then action, as before.
+//
+// Every line is emitted unconditionally, with the same `-` placeholder a missing state already
+// used, because a dropped line is not a cosmetic loss here: ./labels.js placeLabelAbove()
+// anchors the block by its BOTTOM edge (it subtracts the measured block height from the head
+// baseline), so a shorter block re-flows the remaining lines DOWNWARDS from the fixed head
+// anchor. The running action is usually empty, so emitting it only when present would make the
+// whole readout jump every time one starts or ends. A constant line count keeps the block
+// height constant and the lines still, frame to frame.
+//
+// Both enemy fields can legitimately be null. The owner and the id never are: the owner is the
 // server's assignment whenever we know it (offline / not yet assigned falls back to the local
 // rendezvous label below), so with the feature on this reads the same answer the enemy-sync
-// module acts on.
+// module acts on, and enemyStableId() always returns a string.
 function buildLabel(core, enemy) {
 	const id = enemyStableId(core);
 	const owner = getEnemyOwnerName(id) ?? enemyOwnerLabel(id);
 	const state = cleanText(enemy.currentState?.name) ?? "-";
-	const action = cleanText(core.ent?.actor?.actionState?.sequence?.name);
-	return action ? `${owner}\n${state}\n${action}` : `${owner}\n${state}`;
+	const action = cleanText(core.ent?.actor?.actionState?.sequence?.name) ?? "-";
+	// The id goes in VERBATIM, never through cleanText(): the whole point of the line is that
+	// it is byte-for-byte the string the sync exchanges, so the two clients' labels match.
+	return `${owner}\n${id}\n${state}\n${action}`;
 }
 
 // One TextGui per live enemy, positioned over its head each frame.
