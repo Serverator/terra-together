@@ -15,11 +15,16 @@
  *   - The readers the debug overlay consumes: isOwner() / getEnemyOwnerName().
  *   - Owner half of the state sync: one MSG.ENEMY_STATE per frame carrying every enemy this
  *     client owns, and nothing at all when it owns none or has no peer to send to.
+ *   - Handoff half: when the server moves an enemy away from this client, hand that enemy's final
+ *     state on in one MSG.ENEMY_HANDOFF (see sendHandoffs); when it moves one TO this client,
+ *     adopt the previous owner's state (a handoff, else the freshest cached peer state) onto the
+ *     local entity before simulating it, so a re-entering client does not reset the enemy to its
+ *     spawn point (see takeOwnership).
  *   - Peer half: accept state only from an enemy's CURRENT owner, drive that enemy through
  *     ./enemy-puppet.js while the state is fresh, and release the puppet as soon as it is not
  *     (see PEER_STATE_FRESH_MS — the anti-freeze guarantee).
  * Public surface: ENEMY_SYNC_OPTION, enemyStableId, isEnemySyncEnabled, onEnemyOwner,
- *   onEnemyState, isOwner, getEnemyOwnerName, EnemySync
+ *   onEnemyState, onEnemyHandoff, isOwner, getEnemyOwnerName, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
  *   g_game.map.active.path / g_scene.isRunning / EnemyCmp (and, through it, each enemy's
@@ -40,7 +45,7 @@ import { send, isConnected, addPeerMessageHandler } from "./client.js";
 import { getRogueInfo, hasPeers } from "./session.js";
 import { MSG } from "../net/protocol.js";
 import {
-	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet,
+	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet, adoptState,
 } from "./enemy-puppet.js";
 
 // The option key declared in ../config/settings.js (see the header note on why it is a
@@ -57,6 +62,23 @@ const LOCAL_FALLBACK_NAME = "Player";
 // Epoch of "no assignment seen yet" for an enemy in the registry. The server starts real
 // epochs at 1 (server/enemy-ownership.js), so a first assignment always beats this.
 const NO_EPOCH = 0;
+
+// The epoch of an enemy's FIRST assignment (server/enemy-ownership.js starts the counter at 1 and
+// bumps it on every move). Epoch 1 therefore means "nobody owned this enemy before", which is the
+// test that tells a takeover with a previous owner (its state is worth waiting for) from the
+// ordinary first assignment of a map start (there is no state anywhere to wait for).
+const FIRST_EPOCH = 1;
+
+// How long a takeover with nothing to adopt holds the enemy before it starts simulating it anyway.
+// The loss and the gain ride the SAME enemy_owner broadcast, so the state the outgoing owner sends
+// is one network hop away -- this covers roughly one round trip at 60fps. Deliberately counted in
+// FRAMES, not milliseconds: what has to be bounded is how long an ENEMY can stay suppressed, and
+// the frame loop is what ticks the hold (the same loop the enemy would be simulating in). It is a
+// wait, never a wait-forever: on expiry the enemy is released and simulates from wherever it is,
+// which is the same degraded outcome as before this path existed. Do not raise it much: the
+// freshness window below (PEER_STATE_FRESH_MS) is the same order of magnitude, and a hold longer
+// than that would outlive the state it is waiting for.
+const HANDOFF_HOLD_FRAMES = 10;
 
 // How long a peer's enemy state stays usable — the anti-freeze threshold, and the number this
 // phase turns on. The owner publishes every frame (MSG.ENEMY_STATE, ~16ms apart at 60fps), so
@@ -91,6 +113,21 @@ function cleanText(value) {
 function localPlayerId() {
 	const id = window.terraTogether?.playerId;
 	return id == null ? null : String(id);
+}
+
+// Opt-in trace for the handoff path. The server side is gated on window.ttEnemyNetDebug (a line
+// per relayed handoff); what that cannot show is whether the client on the receiving end actually
+// HAD a state to apply, which is the whole question when a takeover still looks like a teleport.
+// So the client half reuses the EXISTING client enemy-debug flag (../debug/enemy-debug.js, whose
+// overlay reads the same property) instead of adding a third switch: `window.ttEnemyDebug = true`
+// in the devtools console turns on both. Strict `=== true`, off by default, and the flag test is
+// the only cost when it is off.
+function debugEnabled() {
+	return window.ttEnemyDebug === true;
+}
+
+function debugLog(...parts) {
+	console.log("[TT enemy-sync]", ...parts);
 }
 
 // ────────────────────────────── enemy identity ──────────────────────────────
@@ -220,6 +257,34 @@ function clearRegistry() {
 // message is the only allocation this half adds.
 const peerState = new Map();
 
+// Inbound handoffs by enemy id: the state the previous owner sent for an enemy THIS client is now
+// the owner of, waiting to be spent by the takeover on the next frame (see onEnemyHandoff for the
+// gate and takeOwnership for the spend). One entry per enemy, newest wins. Only ever written while
+// we own the enemy, and cleared when we stop owning it or it leaves, so it can never be applied to
+// an unrelated later takeover of the same id.
+const handoffState = new Map();
+
+// Enemy ids this client owns AND has already taken over -- i.e. is simulating and publishing. The
+// takeover decision belongs to the transition, not to every frame: an entry is added once (adopt,
+// or hold expiry) and dropped as soon as the enemy stops being ours or leaves. It doubles as the
+// publish gate: an enemy this client owns but has not taken over yet must NOT be published, or the
+// peer would see exactly the spawn-point snapshot this path exists to avoid.
+const adopted = new Set();
+
+// Enemy ids we own but are deliberately not simulating yet: { ent, frames }, awaiting the previous
+// owner's handoff under the bounded hold above. An entry exists exactly while the entity is
+// suppressed, so every release path can find the entity to un-suppress without walking the entity
+// list -- and a held entity is ALWAYS released (adoption, expiry, loss, map change, feature off),
+// which is what keeps this module's no-frozen-enemy promise. `ent` is the entity currently behind
+// the id, not necessarily the one the entry was created with: a respawn can put a fresh entity on
+// the same wire id mid-hold, so takeOwnership re-points it on every held frame.
+const holding = new Map();
+
+// Enemy ids this client was simulating until the server moved them to someone else, waiting for the
+// next frame's post-update to read their final state and hand it on (sendHandoffs). One batch: the
+// whole set travels as a single message, however many assignments in it moved.
+const lostOwnership = new Set();
+
 // The enemies THIS client is currently driving as puppets: enemyId -> entity. Kept so every
 // release path (stale state, ownership change, enemy gone, map change, disconnect, flag off)
 // can undo exactly what was done without a second enumeration of the entity list, and so
@@ -232,6 +297,28 @@ const puppets = new Map();
 // can never be applied to the next one.
 function clearPeerState() {
 	peerState.clear();
+}
+
+// Release one held entity and forget the hold. The single exit from the hold, so the puppet mark
+// and the hold entry can never disagree.
+function releaseHold(id) {
+	const hold = holding.get(id);
+	if (!hold)
+		return;
+	holding.delete(id);
+	releasePuppet(hold.ent);
+}
+
+// Drop everything the takeover path holds: state waiting to be spent, the ids already simulating,
+// the entities held mid-takeover (released) and the losses still to be handed on. Part of every
+// reset that also drops the peer state -- see syncEnemies' gated branch and resetForNewMap.
+function clearTakeoverState() {
+	handoffState.clear();
+	adopted.clear();
+	lostOwnership.clear();
+	for (const hold of holding.values())
+		releasePuppet(hold.ent);
+	holding.clear();
 }
 
 // Release every puppet and forget it. Called on every cleanup path: an enemy still puppeted
@@ -289,6 +376,7 @@ function syncEnemies() {
 		clearRegistry();
 		clearPeerState();
 		releaseAllPuppets();
+		clearTakeoverState();
 		return null;
 	}
 	const map = activeMapPath();
@@ -362,6 +450,12 @@ function sendOwnerStates(live) {
 	for (const [id, core] of live) {
 		if (!isOwner(id))
 			continue;
+		// Ours, but not taken over yet: either a takeover that has not run this frame or one that is
+		// holding the enemy for the handoff. Our copy is not authoritative then -- it is the position
+		// the previous owner's state is about to replace -- so publishing it would be exactly the
+		// snap-to-spawn this path exists to prevent. See adopted and takeOwnership.
+		if (!adopted.has(id))
+			continue;
 		const state = readEnemyState(core.ent);
 		// An enemy whose state cannot be read simply does not appear: the peer's copy of it goes
 		// stale and resumes local simulation, which is better than publishing a half state.
@@ -374,6 +468,42 @@ function sendOwnerStates(live) {
 	// the one every recipient gates on. `map`/`variant` name the room this state belongs to,
 	// exactly as the register does (they are part of the frozen payload both directions).
 	send({ type: MSG.ENEMY_STATE, owner: localPlayerId(), map: activeMapPath(), variant: roomVariant(), list });
+}
+
+// The other half of a takeover, one network hop earlier: when the server moves an enemy THIS client
+// was simulating to somebody else, that enemy's final state has to travel with the assignment, or
+// whoever takes it over starts from ITS OWN copy of the enemy. That is the bug this whole path is
+// about -- the client that left and came back rebuilds the map, so its copy is at the spawn point.
+//
+// One-shot and batched: onEnemyOwner collects every enemy lost since the last frame, and this sends
+// them as ONE message (matching the one enemy_owner broadcast that moved them). Silent when nothing
+// was lost, when there is no peer to tell, and when no loss still has a readable state -- a dead or
+// unloaded enemy has nothing to hand on, and the taker falls back to its cached state or its own
+// copy, which beats a fabricated one.
+function sendHandoffs(live) {
+	if (lostOwnership.size === 0)
+		return;
+	const ids = [...lostOwnership];
+	lostOwnership.clear();                 // one-shot, whatever happens below
+	if (!live || !hasPeers())
+		return;                            // nothing to read / nobody to tell: do not hold it for later
+	const list = [];
+	for (const id of ids) {
+		const core = live.get(id);
+		if (!core)
+			continue;                      // gone locally (its death resolved, or this map unloaded)
+		const state = readEnemyState(core.ent);
+		if (state)
+			list.push(state);
+	}
+	if (list.length === 0)
+		return;
+	if (debugEnabled())
+		debugLog(`handoff: ${list.length}/${ids.length} lost ${ids.join(", ")}`);
+	// `owner` is our own playerId. It is the outgoing owner by definition -- the server does NOT
+	// check it against the arbiter (we have just lost these enemies), it only stamps the sender's
+	// id over it, which is what a recipient compares against.
+	send({ type: MSG.ENEMY_HANDOFF, owner: localPlayerId(), list });
 }
 
 // ───────────────────── peer half: drive what we do not own ─────────────────────
@@ -390,10 +520,12 @@ function applyPeerState(live) {
 	for (const [id, core] of live) {
 		const ent = core.ent;
 		// Ours: never a puppet. Becoming the owner (a rebalance) releases the enemy and starts
-		// simulating and publishing it instead.
+		// simulating and publishing it instead -- through takeOwnership(), which spends whatever
+		// the previous owner left for us before this frame's update runs.
 		if (isOwner(id)) {
 			if (puppets.delete(id))
 				releasePuppet(ent);
+			takeOwnership(id, ent);
 			continue;
 		}
 		let entry = peerState.get(id);
@@ -431,6 +563,112 @@ function applyPeerState(live) {
 		if (!live.has(id))
 			peerState.delete(id);
 	}
+	// The takeover bookkeeping is per-assignment, so it must not outlive one: a stored handoff, an
+	// "already simulating" mark or a hold belongs to the ownership that is ending, and spending any
+	// of them on a much later takeover of the same id would be worse than starting from scratch.
+	for (const id of handoffState.keys()) {
+		if (!live.has(id) || !isOwner(id))
+			handoffState.delete(id);
+	}
+	for (const id of adopted) {
+		if (!live.has(id) || !isOwner(id))
+			adopted.delete(id);
+	}
+	// A hold whose enemy is gone or is no longer ours ends here: the entity is released, which is
+	// the one thing a held (suppressed) enemy must never be left un-released without.
+	for (const [id, hold] of holding) {
+		if (live.has(id) && isOwner(id))
+			continue;
+		holding.delete(id);
+		releasePuppet(hold.ent);
+	}
+}
+
+// ────────────────────────── takeover: adopt, or hold ──────────────────────────
+
+// Our stored peer state for `id`, if it is still fresh enough to be worth adopting. Unlike the
+// per-frame peer half this does NOT require the sender to be the enemy's current owner: at a
+// takeover the sender is exactly the owner we are replacing, and its last frame is the position to
+// continue from. The age test is what makes that safe -- older state is a silent owner, not a
+// handoff, and applying it would teleport the enemy just as badly as starting from spawn.
+function freshPeerState(id) {
+	const entry = peerState.get(id);
+	return entry && nowMs() - entry.at < PEER_STATE_FRESH_MS ? entry.state : null;
+}
+
+// True when this enemy's assignment replaced an earlier one, i.e. it had a previous owner that may
+// owe us a handoff (the arbiter starts every enemy's epoch at FIRST_EPOCH and bumps it on every
+// move). A first assignment has no previous owner, so there is nothing to wait for.
+function assignmentMoved(id) {
+	return (registry.get(id)?.epoch ?? NO_EPOCH) > FIRST_EPOCH;
+}
+
+// The takeover path: run ONCE per enemy we own (the `adopted` mark is the guard), from the frame's
+// pre-update hook, so an enemy that just changed hands continues from where the previous owner left
+// it -- before this frame simulates it and before this frame's state is published.
+//
+// Which state to continue from, in order of preference:
+//   1. a handoff from the previous owner (the state it sent on losing the enemy);
+//   2. our freshest cached peer state (we may have been puppeting the enemy until a frame ago);
+//   3. the entity's own local state -- already in place, so no write at all. That is the correct
+//      answer for a first assignment and for a takeover with no news, and it is why the fallback
+//      needs no call.
+// With nothing but (3) on an assignment that DID have a previous owner, the previous owner's state
+// is one network hop away, so the enemy is held instead of simulated: suppressed, unpublished, for
+// at most HANDOFF_HOLD_FRAMES frames. That hold is what stops this client's own copy -- the spawn
+// point, on a map it has just rebuilt -- from being published to everyone as the enemy's position.
+function takeOwnership(id, ent) {
+	if (adopted.has(id))
+		return;                            // already simulating this enemy: nothing to do per frame
+	const handoff = handoffState.get(id);
+	const state = handoff ?? freshPeerState(id);
+	if (state) {
+		// One-shot: apply it now (this call IS "before the first simulation"), then forget it, so no
+		// later takeover can re-apply a snapshot that belongs to this one.
+		adoptState(ent, state);
+		handoffState.delete(id);
+		peerState.delete(id);
+		releaseHold(id);
+		adopted.add(id);
+		if (debugEnabled())
+			debugLog(`takeover ${id}: adopted ${handoff ? "handoff" : "cached peer"} state (x=${state.x} y=${state.y} z=${state.z})`);
+		return;
+	}
+	// Nothing to adopt. No hold without peers (nobody to hand anything on, nobody to be wrong on),
+	// and none on a FIRST assignment -- there is no previous owner and no handoff coming, so the
+	// local state really is the answer. This is what keeps map start on its previous behaviour.
+	if (!hasPeers() || !assignmentMoved(id)) {
+		adopted.add(id);
+		return;
+	}
+	const hold = holding.get(id);
+	if (hold === undefined) {
+		holding.set(id, { ent, frames: HANDOFF_HOLD_FRAMES });
+		makePuppet(ent);
+		if (debugEnabled())
+			debugLog(`takeover ${id}: holding ${HANDOFF_HOLD_FRAMES} frames for the previous owner's handoff`);
+		return;
+	}
+	if (hold.frames > 1) {
+		hold.frames--;
+		// Follow the entity behind the id. A hold is keyed by the enemy's WIRE id, and the entity
+		// behind that id can be REPLACED inside the hold's window (a spot that respawns builds a
+		// fresh TerraActor for the same source spot, so the same id): the entity passed in here is
+		// then not the one the hold was created with. Every path that ends a hold releases
+		// `hold.ent` -- releaseHold(), clearTakeoverState() and the gone/no-longer-ours sweep in
+		// applyPeerState() -- so re-pointing it is what keeps the puppet mark and the hold entry
+		// from disagreeing, and what stops a replacement being marked every frame and then never
+		// released by anyone. See the note on releaseHold.
+		hold.ent = ent;
+		makePuppet(ent);                   // re-assert: physics.skip is a single-frame flag
+		return;
+	}
+	// Bounded: the wait is over, so simulate from wherever we are. Release first, so the entity can
+	// act on this very frame.
+	releaseHold(id);
+	adopted.add(id);
+	if (debugEnabled())
+		debugLog(`takeover ${id}: hold expired without a handoff, simulating from the local state`);
 }
 
 // The map is gone: every id we announced embeds the old map path, so none of them can come
@@ -442,6 +680,7 @@ function applyPeerState(live) {
 function resetForNewMap() {
 	clearPeerState();
 	releaseAllPuppets();
+	clearTakeoverState();
 	if (registry.size === 0)
 		return;
 	const ids = [...registry.keys()];
@@ -463,6 +702,7 @@ export function onEnemyOwner(msg) {
 	if (!Number.isFinite(epoch))
 		return;
 	const owner = msg.owner == null ? null : String(msg.owner);
+	const localId = localPlayerId();
 
 	const entry = registry.get(id);
 	if (!entry) {
@@ -477,8 +717,25 @@ export function onEnemyOwner(msg) {
 	// epochs are the same assignment arriving twice and are applied harmlessly.
 	if (epoch < entry.epoch)
 		return;
+	// A LOSS: we were the simulator of this enemy and the server has just moved it elsewhere. Its
+	// final state has to reach whoever takes it over, or that client -- which may have just rebuilt
+	// the map this enemy lives on -- starts it from its own copy, i.e. the spawn point. Remember the
+	// id for this frame's post-update (sendHandoffs), and drop the takeover bookkeeping of the
+	// ownership that is ending: the two are per-assignment, and neither may be spent on a later one.
+	//
+	// Only an enemy we actually took over is handed on (see adopted): an assignment that moved on
+	// again before we ever simulated the enemy would otherwise hand on OUR copy, and on a map this
+	// client has just rebuilt that copy is the spawn point -- the very thing this message exists to
+	// prevent, sent in the other direction.
+	const wasLocal = entry.owner !== null && entry.owner === localId;
 	entry.owner = owner;
 	entry.epoch = epoch;
+	if (wasLocal && !(owner !== null && owner === localId)) {
+		if (adopted.has(id))
+			lostOwnership.add(id);
+		handoffState.delete(id);
+		adopted.delete(id);
+	}
 }
 
 // ──────────────────────────── inbound peer state ────────────────────────────
@@ -513,6 +770,45 @@ export function onEnemyState(msg) {
 		if (currentOwner(id) !== owner)
 			continue;
 		peerState.set(id, { state, at: now, from: owner });
+	}
+}
+
+// ─────────────────────────── inbound ownership handoff ───────────────────────────
+
+// Inbound MSG.ENEMY_HANDOFF (previous owner -> server -> everyone but the sender): the final state
+// of an enemy that just changed hands, stamped by the server with the id of the client that was
+// simulating it until this same rebalance. Routed here from ./client.js.
+//
+// The gate is "WE are this enemy's current owner" -- deliberately NOT "the sender is the enemy's
+// previous owner" (msg.owner is, by definition, a client that no longer owns it, so comparing it
+// against the registry would be comparing against the wrong side), and not "is the payload's
+// sender the owner our registry remembers" either, which lags the very broadcast this handoff
+// answers. A handoff for an enemy somebody else owns is not ours to apply: it is dropped, and in
+// particular it is NOT stored -- a state kept "just in case" would be spent on an unrelated later
+// takeover, teleporting the enemy to a position from an ownership that is long over.
+//
+// Nothing is applied here. Storing is all this does; the per-frame takeover (takeOwnership) decides
+// when the state is written onto the entity, which is what keeps every entity write on the frame
+// path and ahead of the first simulation of the enemy we just took over.
+export function onEnemyHandoff(msg) {
+	if (!isEnemySyncEnabled())
+		return;
+	const list = msg?.list;
+	if (!Array.isArray(list))
+		return;
+	for (const state of list) {
+		// Malformed and partial entries are skipped, never thrown on: a peer's payload must not be
+		// able to break this frame, not even the one it arrives in (same rule as onEnemyState).
+		if (!state || typeof state !== "object")
+			continue;
+		const id = state.id;
+		if (typeof id !== "string" || id === "")
+			continue;
+		if (!isOwner(id))
+			continue;
+		handoffState.set(id, state);
+		if (debugEnabled())
+			debugLog(`received handoff for ${id} from ${msg.owner} (x=${state.x} y=${state.y} z=${state.z})`);
 	}
 }
 
@@ -557,6 +853,7 @@ export function getEnemyOwnerName(enemyId) {
 // ./client.js (see the dispatch there).
 addPeerMessageHandler(MSG.ENEMY_OWNER, onEnemyOwner);
 addPeerMessageHandler(MSG.ENEMY_STATE, onEnemyState);
+addPeerMessageHandler(MSG.ENEMY_HANDOFF, onEnemyHandoff);
 
 // ──────────────────────────────────── addon ────────────────────────────────────
 
@@ -583,7 +880,11 @@ class EnemySync {
 	}
 
 	onPostUpdate() {
-		sendOwnerStates(syncEnemies());
+		// One identity diff for both halves of the publish: the state of the enemies we own, and the
+		// final state of the ones we have just lost (see sendHandoffs).
+		const live = syncEnemies();
+		sendOwnerStates(live);
+		sendHandoffs(live);
 	}
 }
 

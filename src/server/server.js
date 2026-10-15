@@ -6,7 +6,8 @@
  *   - Track per-player state, username and last scene, and replay them to late joiners.
  *   - Push host-authoritative settings (revive, estus-share) on change.
  *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients, and
- *     enemy_state to other clients once its entries are checked against the arbiter.
+ *     enemy_state to other clients once its entries are checked against the arbiter, and
+ *     enemy_handoff to other clients with the sender's id stamped on it.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
  *     publish it, re-arbitrating when a room's membership changes.
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
@@ -18,7 +19,7 @@
  *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
  *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
  *     every inbound type is matched through MSG.*, so an unknown type falls to the default
- *     branch and is dropped. The direction table for all 16 types is documented there.
+ *     branch and is dropped. The direction table for all 17 types is documented there.
  *   - Enemy-sync ownership is arbitrated here, never simulated: the server is a single
  *     process, so its assignment is the consensus (see src/server/enemy-ownership.js). A
  *     client registers the map-placed enemies it can see and the server answers with the
@@ -39,6 +40,11 @@
  *     enemy_state, whose per-enemy entries the server authorises against the ownership arbiter
  *     before relaying (see the MSG.ENEMY_STATE case): an owner is the only party that can be
  *     allowed to drive an enemy, and that is a fact only the server can vouch for.
+ *     enemy_handoff is relayed on the same trust as revive/area_heal -- deliberately NOT
+ *     entry-validated: it comes from a client that has just STOPPED being the owner of the
+ *     enemies in it, so the arbiter would reject the whole message (see the MSG.ENEMY_HANDOFF
+ *     case). The recipient is what makes it safe: it applies a handed-on state only to an enemy
+ *     it owns itself (src/client/enemies.js onEnemyHandoff).
  *   - Ordering: each send is one synchronous socket.write, so per-connection order is
  *     preserved, but there is no rate limiting, batching or backpressure -- inbound
  *     traffic is paced by the clients' own tick (see src/client/snapshot.js).
@@ -455,6 +461,34 @@ function startServer(host = '0.0.0.0', port = 17005) {
 							msg.list = kept;
 						// The sender's own claim is never relayed: it is the socket's playerId that the
 						// arbiter just vouched for, and the frozen shape says owner is that id.
+						msg.owner = playerId;
+						broadcast(msg, socket);
+						break;
+					}
+
+					case MSG.ENEMY_HANDOFF: {
+						// The client that was simulating these enemies has just LOST them (the same
+						// enemy_owner broadcast that told the recipients did): this is their final state,
+						// so whoever takes them over continues from where they were instead of from its
+						// own copy -- which, for a client re-entering a map, is the spawn point. That is
+						// the whole reason the type exists; see src/client/enemies.js sendHandoffs.
+						//
+						// Deliberately NOT entry-validated like ENEMY_STATE, and that difference is the
+						// point: `validate()` asks "is this sender the owner" and the honest answer here is
+						// no for every entry, so checking would drop the whole message and re-break the
+						// bug. It is coop traffic relayed on the same trust as revive/area_heal, and the
+						// recipient is what makes that safe (it applies a handed-on state only to an
+						// enemy it owns itself). Wire shape (frozen): { owner, list: [{ id, x, y, z, vx,
+						// vy, vz, fx, fy, anim, animTime, hp, state, action }] }.
+						const handoffList = Array.isArray(msg.list) ? msg.list : null;
+						if (netDebugEnabled())
+							netDebug(`in enemy_handoff from=${shortId(playerId)} entries=${handoffList === null ? 0 : handoffList.length}`);
+						// Nothing to hand on: no frame. An empty relay would only wake every client's
+						// handler for a message with nothing in it.
+						if (handoffList === null || handoffList.length === 0)
+							break;
+						// The sender's own claim is never relayed -- the socket identity is the id the
+						// recipients gate on, exactly as in the ENEMY_STATE case above.
 						msg.owner = playerId;
 						broadcast(msg, socket);
 						break;

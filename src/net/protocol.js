@@ -91,11 +91,26 @@
  *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
  *                                            animTime, hp, state, action } ] }. Client case:
  *                                            MSG.ENEMY_STATE.
+ *   MSG.ENEMY_HANDOFF     "enemy_handoff"    client -> server -> other clients, ONE-SHOT, from the
+ *                                            client that has just LOST an enemy (it reads that from
+ *                                            the same enemy_owner broadcast the new owner reads):
+ *                                            the enemy's final state, so the client that takes it
+ *                                            over continues from where it was instead of from its
+ *                                            own copy -- which, on a map that client has just
+ *                                            rebuilt, is the spawn point. Stamp-then-relay like
+ *                                            ENEMY_STATE (the server rewrites `owner` to the
+ *                                            sender's id), but deliberately NOT entry-validated
+ *                                            against the arbiter: the sender no longer owns these
+ *                                            enemies by definition, so validate() would drop the
+ *                                            whole message. It is coop traffic, like REVIVE. Payload:
+ *                                            { owner, list: [ <same state shape as ENEMY_STATE> ] }.
+ *                                            Client case: MSG.ENEMY_HANDOFF.
  *
- * The server's inbound switch has 10 cases: the 7 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
- * REVIVE, REVIVE_PROGRESS, AREA_HEAL forwarded verbatim; ENEMY_STATE forwarded entry-validated),
- * PROFILE -- answered, not relayed -- and ENEMY_REGISTER / ENEMY_UNREGISTER, which are not relayed
- * but answered with ENEMY_OWNER. The client's dispatch has 13: every type except PROFILE,
+ * The server's inbound switch has 11 cases: the 8 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
+ * REVIVE, REVIVE_PROGRESS, AREA_HEAL forwarded verbatim; ENEMY_STATE forwarded entry-validated;
+ * ENEMY_HANDOFF forwarded with `owner` stamped to the sender), PROFILE -- answered, not relayed --
+ * and ENEMY_REGISTER / ENEMY_UNREGISTER, which are not relayed but answered with ENEMY_OWNER. The
+ * client's dispatch has 14: every type except PROFILE,
  * ENEMY_REGISTER and ENEMY_UNREGISTER. The six server-only types (WELCOME, HOST_SETTING,
  * PLAYER_PROFILE, PLAYER_JOINED, PLAYER_LEFT, ENEMY_OWNER) are never accepted from a client -- a
  * client that sends one hits the server's default branch and is dropped, because they describe state
@@ -103,6 +118,6 @@
  * enemy ownership it arbitrates).
  */
 
-export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state" };
+export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff" };
 
 //# sourceURL=/mods/terra-together/net/protocol.js
