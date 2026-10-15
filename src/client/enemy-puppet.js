@@ -10,7 +10,12 @@
  *   - makePuppet/releasePuppet/isPuppet: the per-ENTITY puppet mark plus the entity state the
  *     mechanism pins (actor.animationFixed, actor.facing.type, move.physics.skip), its exact
  *     restoration on release, and the ACTION hygiene both transitions run (clearAction, below), so
- *     an entity can neither inherit a half-finished action nor be handed back holding one.
+ *     an entity can neither inherit a half-finished action nor be handed back holding one. Every
+ *     press is in makePuppet and every undo in releasePuppet, including the two pieces of state
+ *     this module's CALLER hangs on the entity -- the HUD's combat bit (clearPuppetAggro) and the
+ *     hit acts an owner's stream started on it (clearPuppetHitActs, the peer half of the
+ *     enemy-attack sync in ./enemies.js): releasePuppet is the only place the mark is removed, so
+ *     it is the one place an undo cannot be missed.
  *   - readEnemyState (OWNER side) / drivePuppet (PEER side, every frame) / adoptState (ONCE, for an
  *     entity this client is about to simulate itself): the per-frame state snapshot and its
  *     application to an entity.
@@ -240,6 +245,10 @@ export function releasePuppet(ent) {
 	// each of them.
 	clearPuppetAggro(ent);
 
+	// ...and the hit acts an owner's stream started on it, for the same reason and with the same
+	// coverage (see clearPuppetHitActs).
+	clearPuppetHitActs(ent);
+
 	// The mark is gone, so the patches are transparent again and the AI is allowed to decide from the
 	// next tick -- but only if nothing is still "running". Our patches never stopped the sequence
 	// itself, and an action can also be started on a puppet by an engine path we do not patch (parry,
@@ -351,6 +360,30 @@ function clearPuppetAggro(ent) {
 	const hud = enemyHudOf(ent);
 	if (hud)
 		hud.setAggressive(ent.enemy?.aggressive === true);
+}
+
+// ...and the hit acts an owner's stream started on the entity while it was a puppet
+// (./enemies.js's hit-act section: owner act id -> the local CombatAct). Same reasoning as
+// clearPuppetAggro -- engine state this module's caller put on the entity, which must not outlive
+// the mark: these acts are updated by g_combat every frame for as long as they exist, and a
+// repeating one (a dash or a spin whose hit act has duration -1) would go on damaging whoever is in
+// its way on an enemy this client now simulates itself. cancel() is the engine's own teardown
+// (CombatAct.cancel, combat-act.js:32-39): it clears the act's subscriptions and drops its damager,
+// which is what makes g_combat's next update remove and release it. releasePuppet is the ONLY place
+// the mark is removed, so every path out of puppeting comes through here.
+//
+// PUPPET_HIT_ACTS IS DUPLICATED IN ./enemies.js (the lockstep note there): it is the entity key that
+// module's replay registers the acts under, and this module cannot import it. Edit one, edit both.
+const PUPPET_HIT_ACTS = "__ttPuppetHitActs";
+
+function clearPuppetHitActs(ent) {
+	const acts = ent?.[PUPPET_HIT_ACTS];
+	if (!acts)
+		return;
+	delete ent[PUPPET_HIT_ACTS];
+	for (const act of acts.values()) {
+		try { act?.cancel?.(); } catch (e) { /* already gone */ }
+	}
 }
 
 // ─────────────────────────────── patch table ───────────────────────────────

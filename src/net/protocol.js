@@ -92,15 +92,27 @@
  *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
  *                                            animTime, hp, state, action } ], plus whichever of
  *                                            globalFx, fxStops, persistentFx, sounds, soundStops,
- *                                            projectiles and hitNumbers this frame has }. Six of
+ *                                            projectiles, hitNumbers, hitActs and hitActStops this
+ *                                            frame has }. Six of
  *                                            those batches are the shapes the player snapshot's own
  *                                            arrays already carry (see MSG.UPDATE), so the recipient
- *                                            replays them through the same code; the seventh
- *                                            (hitNumbers) has no player-channel twin -- it is the
+ *                                            replays them through the same code; the rest have no
+ *                                            player-channel twin. hitNumbers is the
  *                                            damage numbers a client drew for the hits forwarded to
  *                                            it, which are a GUI element rather than an fx and are
  *                                            replayed through the engine's own hit-number API
- *                                            (src/client/enemies.js). Every entry of every batch
+ *                                            (src/client/enemies.js). The last two are the melee
+ *                                            and splash half of the same idea: hitActs carries the
+ *                                            IDENTITY of a hit act that owner's enemy has just
+ *                                            started ({ id, enemy, action, idx, kind } -- the step,
+ *                                            not its geometry) and the recipient re-runs that step
+ *                                            on its own copy of the enemy, so the hitbox is resolved
+ *                                            against that client's own world and can only damage its
+ *                                            own player; hitActStops is that act ending (a hit act
+ *                                            with duration -1 repeats until its action ends, which
+ *                                            nothing on the recipient would ever do). See the
+ *                                            hit-act section in src/client/enemies.js. Every entry
+ *                                            of every batch
  *                                            names the enemy it
  *                                            belongs to in an `enemy` field: the id of a `list` entry
  *                                            of the same frame, which is how the recipient routes it

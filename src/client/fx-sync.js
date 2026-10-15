@@ -51,6 +51,10 @@ let projectileHooksInstalled = false;
 let projSyncId = 0;
 // True only during a receiver-initiated mirror spawn (see spawnRemoteProjectile).
 let spawningVisualCopy = false;
+// True only during a receiver-initiated mirror spawn of an ENEMY's own proxy, i.e. the one kind of
+// mirror whose hit is allowed to land on this client's own player (see the HitForce guard in the
+// projectile hooks, and spawnRemoteProjectile). Cleared with `spawningVisualCopy`.
+let spawningVictimMirror = false;
 
 let soundSyncId = 0;
 
@@ -249,8 +253,11 @@ function isSyncableBus(type) {
 // --- Projectile sync ---------------------------------------------------
 // Ranged projectiles are real `Projectile` entities created at one choke point
 // (ProxyDef.spawn). Peers mirror them as "visual" copies owned by the sending
-// player's ghost actor -- or, since Phase 6, by the local copy of the enemy that fired them;
-// damage is suppressed so shots only show up.
+// player's ghost actor -- or, since Phase 6, by the local copy of the enemy that fired them.
+// A mirror carries no damage (see the HitForce guard below) with ONE exception: an ENEMY's own
+// shot is replayed so that it lands on whoever it reaches, which is the victim-side model -- the
+// client that receives the hit decides it, so a mirrored enemy shot is allowed through the
+// engine's own hit path and damages the local player it collides with (`__ttVictimMirror`).
 
 // Resolve a proxy def by name. An entity that fired the shot is asked FIRST when one is given: an
 // enemy's own proxies live on its enemy sheet (enemy-type.js:83-85 builds `EnemySheet.proxies`,
@@ -349,6 +356,15 @@ const VISUAL_BLOCKED_STEPS = [
 // side). Either way it is a VISUAL copy: `spawningVisualCopy` below makes the ProxyDef.spawn
 // wrapper mark the proxy `__ttVisual`, which is what makes HitForce.isHitCompatible ignore every
 // hit it could land, the blocked action steps no-op and its sub-proxies refuse to spawn.
+//
+// The ONE exception is an ENEMY's own proxy: it is the enemy's real attack, replayed on the client
+// that can receive it, so it is marked a VICTIM mirror as well (`__ttVictimMirror`) and the HitForce
+// guard lets its hit reach the engine. It still lands only on what the engine's own rules allow --
+// the enemy-party filter keeps it off the enemy that fired it and off every other enemy, and a peer
+// PLAYER's ghost is refused by TerraActor.onHitCheck (no combatant) -- so in practice it lands on
+// this client's own player, at the position this client SEES the enemy and the projectile at. That
+// is the whole fairness property of the model: the victim resolves the hit, no arbitration, no
+// rewind, and it cannot be applied twice because no other client can damage this player.
 export function spawnRemoteProjectile(actor, p) {
 	const def = resolveProxyDef(p.name, actor);
 	if (!def)
@@ -367,13 +383,17 @@ export function spawnRemoteProjectile(actor, p) {
 	const dir = new Vec3(p.dir[0], p.dir[1], p.dir[2] ?? 0);
 
 	// Mark the spawn as a mirror for the ProxyDef.spawn wrapper. Proxies are pooled,
-	// so the flag is (re)assigned on every spawn rather than trusting the instance.
+	// so the flag is (re)assigned on every spawn rather than trusting the instance. An enemy's
+	// mirror is additionally a VICTIM mirror: the one kind whose hit is allowed to land (see the
+	// HitForce guard and the note on spawnRemoteProjectile).
 	spawningVisualCopy = true;
+	spawningVictimMirror = !!actor.enemy;
 	try {
 		visualDef(def).spawn(pos, dir, damager, p.group ?? null);
 	}
 	finally {
 		spawningVisualCopy = false;
+		spawningVictimMirror = false;
 	}
 }
 
@@ -750,10 +770,21 @@ export function installFxSyncHooks() {
 				// Universal no-damage guard: a hit-force owned by a mirrored proxy can
 				// never land a hit, whichever act produced it (projectile hits or HIT_*
 				// steps). Movement, wall/ground collide and despawn are untouched.
+				//
+				// The one exception is a VICTIM mirror: a proxy mirrored from an ENEMY this client
+				// is holding (spawnRemoteProjectile with `actor.enemy`, marked `__ttVictimMirror` at
+				// spawn). That one IS the enemy's own attack -- the enemy is simulated by the other
+				// client, which sends the shot instead of resolving it here -- so its hit is left to
+				// the engine's own path, where the party filter (HitForce.getParty, the enemy's own
+				// party) and the receiver's own onHitCheck leave it with exactly one possible victim:
+				// the local player it reaches, resolved where THIS client sees the shot. A mirror of
+				// a peer PLAYER's shot is not marked, so player-fired mirrors behave exactly as they
+				// did before.
 				if (HitForce?.prototype?.isHitCompatible) {
 					let originalIsHitCompatible = HitForce.prototype.isHitCompatible;
 					HitForce.prototype.isHitCompatible = function (...args) {
-						if (this.damager?.ent?.__ttVisual)
+						const mirrored = this.damager?.ent;
+						if (mirrored?.__ttVisual && !mirrored.__ttVictimMirror)
 							return 0; // HIT_RESULT.IGNORE
 						return originalIsHitCompatible.apply(this, args);
 					};
@@ -796,6 +827,9 @@ export function installFxSyncHooks() {
 					// initiated it; assign unconditionally to clear recycled state.
 					const isMirror = spawningVisualCopy;
 					proxy.__ttVisual = isMirror;
+					// ...and the victim-mirror mark, cleared on the same rule: only a mirror
+					// spawned for an ENEMY (see spawnRemoteProjectile) may land its hit.
+					proxy.__ttVictimMirror = isMirror && spawningVictimMirror;
 
 					// Ranged attacks spawn both Projectile and Generic proxies (e.g. the
 					// crossbow's "shoot down" fires Generic arrowUp), so mirror both. Only from

@@ -91,6 +91,18 @@
  *     (captureForwardedHitNumber) and it rides the same enemy frame as one more batch (`hitNumbers`,
  *     ENEMY_EFFECT_KEYS); the peer replays it through the engine's own HitNumbers.addCustom
  *     (replayEnemyHitNumber). Nothing about the reward path or the HP write changes.
+ *   - Melee/splash hits on the player who RECEIVES them (the hit-act half), both halves: an enemy's
+ *     melee or splash hitbox was resolved only on the client simulating the enemy, so it could only
+ *     ever hit the OWNER's player. The owner captures the hit ACT its own enemies start -- the
+ *     identity of the authored step (action name, step index, step kind) taken off the
+ *     ACTION_STEP.{HIT_CIRCLE,HIT_SWEEP,HIT_LINE} step seam and its end off
+ *     CombatAct.prototype.cancel -- and sends it in the same enemy frame as two more batches
+ *     (`hitActs`/`hitActStops`, ENEMY_EFFECT_KEYS); the peer re-runs that very step on its OWN copy
+ *     of the enemy (applyRemoteHitAct), so the hitbox resolves against that peer's own world and can
+ *     only damage that peer's own player. Nothing arbitrates and nothing can apply twice: each
+ *     client resolves the hits it receives, at the position it sees the enemy at. Ranged attacks need
+ *     none of this -- the synced projectile is a real one (./fx-sync.js) and simply has its damage
+ *     guard lifted for an enemy's own shot.
  * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
  *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
  *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
@@ -121,8 +133,14 @@
  *   CombatantCmp.prototype.dealDamage (wrapped once, as the capture point) with the engine's own hit
  *   results (`dmgResult.damage`/`critical`/`defCritical`) and GUI (g_combat.gui.hitNumbers,
  *   HIT_NUM_STYLE, CRIT_TYPE), plus g_combat.hasDamageDisplay (the engine's own "would a number be
- *   drawn at all" gate) and Vec3 (the replayed number's position). Inbound routing: ./client.js (see
- *   the note at the handler registration below).
+ *   drawn at all" gate) and Vec3 (the replayed number's position). For the hit-act half,
+ *   additionally ACTION_STEP.[HIT_CIRCLE|HIT_SWEEP|HIT_LINE].prototype.start (the owner's capture
+ *   seam: the step owns its authored props and creates the act), CombatAct.prototype.cancel (the
+ *   owner's stop seam, and the peer's teardown call), g_combat.acts (where the step's own act is
+ *   taken from, addCombatAct having just pushed it) and g_gState.pushContextEnt/popContextEnt (the
+ *   engine's own context stack, which is what makes a step's self-relative Target resolve to the
+ *   enemy -- and what makes running a hit act on the peer possible at all). Inbound routing:
+ *   ./client.js (see the note at the handler registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
  *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
  *   are released too, so no enemy can stay suppressed (or frozen) because this module stopped
@@ -802,7 +820,7 @@ function sendOwnerStates(live) {
 
 // The enemy channel's queues, in one place: ./session.js's enemyQueues slots and - the same names -
 // the batches they become on the wire (see the MSG.ENEMY_STATE table in ../net/protocol.js).
-const ENEMY_EFFECT_KEYS = ["globalFx", "fxStops", "sounds", "soundStops", "projectiles", "hitNumbers"];
+const ENEMY_EFFECT_KEYS = ["globalFx", "fxStops", "sounds", "soundStops", "projectiles", "hitNumbers", "hitActs", "hitActStops"];
 
 // Drain this frame's enemy effect queues, keeping only what belongs to an enemy the frame
 // publishes. Returns null when nothing survived, so a frame with no enemy effects keeps exactly the
@@ -1080,6 +1098,13 @@ function applyEnemyEffects(id, ent, entry) {
 		spawnRemoteProjectile(ent, p);
 	for (const n of entry.hitNumbers ?? [])
 		replayEnemyHitNumber(n);
+	// The melee/splash half: run the act on OUR copy of the enemy (applyRemoteHitAct) and cancel
+	// the ones the owner has finished with (stopRemoteHitAct). Starts before stops, in the order
+	// the owner queued them, so an act that began and ended within one frame nets out to nothing.
+	for (const a of entry.hitActs ?? [])
+		applyRemoteHitAct(ent, a);
+	for (const s of entry.hitActStops ?? [])
+		stopRemoteHitAct(ent, s);
 }
 
 // The per-enemy home of what an owner's stream has put on OUR copy of an enemy: the fx it spawned
@@ -1104,6 +1129,409 @@ function stopSyncedEnemyFx(holder, stop) {
 		return;
 	try { live.stop(stop.delay ?? 0, stop.softStop ?? false); } catch (e) { /* already gone */ }
 	delete holder.fxMap[stop.id];
+}
+
+// ─────────── hit acts: melee and splash damage on the client that RECEIVES it ───────────
+//
+// The problem this closes. An enemy's hitbox is resolved by whoever SIMULATES the enemy, and an
+// enemy this client owns is simulated here while the other client only holds a driven copy of it
+// (Phase 2). So an enemy's melee/splash could only ever land on the OWNER's player: the other
+// player's body is not on the owner's client as a combatant at all (its ghost has no CombatantCmp,
+// so TerraActor.onHitCheck refuses every hit). The two players therefore lived in different fights
+// with the same enemy.
+//
+// The model that closes it, and why it needs no arbitration: damage is resolved where it LANDS.
+// Each client runs the enemy's hit act on its OWN copy of the enemy, against its OWN colliders, so
+// a client can only ever damage its own player -- never the peer's, never an enemy's (the enemy's
+// own attack carries the enemy party, which no enemy passes). A hit cannot be applied twice, and
+// no client has to trust another's word about where anybody was: the peer resolves the hit at the
+// position it SEES the enemy at, which is the fairness property the whole approach exists for.
+//
+// WHAT TRAVELS: the IDENTITY of the act, not its geometry and not the action around it.
+//   action/idx/kind   which authored hit step fired: the enemy action's name, the step's index in
+//                     a canonical walk of that action, and its step type. Both sides read the SAME
+//                     shared game data: an enemy's actions are built from its sheet's own JSON
+//                     (`EnemySheet.onJsonBuild`, enemy-type.js:87-90) and both clients load the same
+//                     file, so the peer can look the very step up instead of being sent its
+//                     parameters -- and it must, because the step's own props are live engine
+//                     objects (HitCircleProps.target is a `Target` whose "self" resolves through
+//                     g_gState.contextEntity, and hitDirFace/hitFaceFlip/hitFaceRot are
+//                     NumExpressions): they cannot be serialised, and an act built from raw numbers
+//                     could not be one.
+// Nothing else rides: not a position (the enemy's position is already in the same frame's state,
+// and the act is anchored to the enemy), not a duration (authored, and identical on both sides),
+// not the action's other steps.
+//
+// WHY THE ACT CAN SIMPLY BE RE-RUN. The hit test is a WORLD COLLIDER QUERY, not a search for the
+// player: HitCircleAct.update asks PhysicsQuery.getCollsInCircle for every coll in a circle
+// (hit-circle-act.js:155), and the circle's centre is authored SELF-RELATIVELY -- the shipped
+// HIT_CIRCLE uses all centre on the enemy or one of its own body nodes (the only exceptions are
+// three hedgebird jump impacts that read a position out of a script var; see the gap below). So the
+// same act started on the peer's copy of the enemy resolves the same shape, at the enemy's synced
+// position, against the peer's own world -- and its hitbox finds that player's body and nothing
+// else it may hit. HIT_SWEEP is the same argument one level down (its geometry is a hook of the
+// enemy's own figure, sweep-act.js:169-177) and HIT_LINE's two ends are authored self-relative
+// too.
+//
+// WHY NOT REPLAY THE WHOLE ACTION INSTEAD. Two independent reasons:
+//   - it would not reach the hit step at all. 62 of the 96 shipped actions that contain a hit step
+//     run an arrival step (TARGET_FOLLOW_JUMP, POINT_APPROACH, FALL_APPROACH, JUMP,
+//     WAIT_UNTIL_ON_GROUND, NAV_TO) BEFORE that hit step, and a puppet's physics are pinned
+//     (./enemy-puppet.js pinPuppet) precisely so it cannot move itself: those steps can never
+//     complete, so the hit step behind them would never run. That is also why they were left out of
+//     the puppet drive in Phase 2.
+//   - the steps around the hit would fight the drive and duplicate what is already synced: pose
+//     steps (SHOW_ANIMATION) set the very animationFixed pin the puppet owns, SPAWN_FX/CLEAR_FX
+//     would double every fx Phase 6 already sends, and SET_COLL/SET_SPEED/SET_PHASE would fight the
+//     position and velocity stream.
+// The act is therefore run the engine's own way -- the step's `start` -- and nothing else of the
+// action is.
+//
+// The four seams, both halves, in one place:
+//   owner, capture   ACTION_STEP.{HIT_CIRCLE,HIT_SWEEP,HIT_LINE}.prototype.start, wrapped once.
+//                    The step creates its act (HitCircleAct.get -> g_combat.addCombatAct) inside
+//                    that call, so the act is taken from `g_combat.acts` immediately after it, and
+//                    the capture only happens for an enemy THIS client owns (`ownedIdOf`, the same
+//                    ownership answer ./fx-sync.js attributes an enemy fx with -- the owner is the
+//                    only client simulating the attack, so it is the only one with anything to
+//                    say about it).
+//   owner, stop      CombatAct.prototype.cancel, wrapped once, for the acts the capture tagged: it
+//                    is the engine's own "this act is over" path (`update` returning done ->
+//                    updateActs' act.cancel(); STOP_COMBAT_ACTS -> entry.cancel(); the action
+//                    ending -> onSubscriptionEnd -> cancel), and a repeating act (duration -1)
+//                    ends no other way.
+//   peer,  start     applyRemoteHitAct: resolve the step from the enemy's own sheet, run its
+//                    `start` with the local copy of the enemy as the acting entity -- inside
+//                    g_gState.pushContextEnt(core), which is what makes the step's self-relative
+//                    `Target` resolve to that enemy -- and remember the act under the owner's id.
+//   peer,  stop      stopRemoteHitAct: cancel that act; and enemy-puppet.js's clearPuppetHitActs,
+//                    run from releasePuppet, is the backstop for a stream that stopped without
+//                    saying so (owner gone, feature off, map change, ownership taken): an act left
+//                    running on a released enemy is the one failure mode with no natural end, so it
+//                    is cancelled everywhere the puppet itself is.
+//
+// Deliberately NOT replayed: HIT_DIRECT. Its step resolves its own target -- `actor.targetColl` /
+// actor.getTarget() (combat-act-steps.js:261-268) -- and a puppet has no target: the AI seams that
+// would acquire one are exactly what a puppet suppresses (./enemy-puppet.js patch (a)), and
+// handing it the local player as a target would hand it the AI's own input. Two shipped attacks use
+// it (swamp/scorpion shockFreeze/shockFreezeFly, both `party: PLAYER`, i.e. the attack hits its own
+// party anyway) and both are left as a gap. Also not replayable, and left as a gap on the same
+// rule: a hit act whose centre is not anchored on the enemy itself (the three hedgebird jump
+// impacts read `ent.vars.tmpPos1`, a position the action wrote into a script var that the peer
+// never ran) -- hitActAnchorIsSelf rejects those rather than resolving a circle at the peer's
+// world origin.
+
+// The hit-shaped steps, by ACTION_STEP key. These are the acts whose geometry is self-relative and
+// whose effect is "damage whatever the engine finds in a shape around this enemy".
+const HIT_ACT_KINDS = ["HIT_CIRCLE", "HIT_SWEEP", "HIT_LINE"];
+
+// Install-once flags. The step wrappers and the act-cancel wrapper are installed together, from
+// the same per-frame hook the other owner-side seams use (see onPreUpdate): the first frame is
+// early enough (an enemy cannot attack before the world runs), and a build whose ACTION_STEP or
+// CombatAct is missing leaves the flag alone so a later frame can retry.
+let hitActPatchesInstalled = false;
+
+// Ids for the acts this client forwards. One namespace per client, like fxSyncId/`projSyncId` in
+// ./fx-sync.js: the peer keys its live acts by this id inside one enemy's frame, so it only has to
+// be unique among the acts one owner is reporting.
+let hitActSyncId = 0;
+
+// Set only while THIS module is starting a peer's hit act on a puppet (applyRemoteHitAct). The step
+// wrapper below is the same wrapper that captures our own enemies' attacks, and the peer's copy of
+// the step goes through it: this flag is what tells the wrapper that the call it is looking at is
+// the replay, not an attack of ours to forward.
+let replayingHitAct = false;
+
+// The live step registry, the same lookup ./fx-sync.js patches its blocked steps through.
+function actionStepRegistry() {
+	return terra.export.ACTION_STEP ?? terra.file.stepBase?.ACTION_STEP ?? null;
+}
+
+// The act the call just started, taken from the engine's own list of running acts
+// (CombatManager.addCombatAct pushes it, combat.js:276-278, synchronously inside the step's
+// start). Exactly one act is expected: zero means the step found no attacker and started nothing
+// (which is the answer we need -- the peer must not run an act the owner did not), and more than
+// one means something else ran in between on a build we do not know, so the call is left alone.
+function takenCombatAct(acts, before) {
+	if (!Array.isArray(acts) || before < 0)
+		return null;
+	return acts.length === before + 1 ? acts[before] : null;
+}
+
+// The step type of a hit step, by identity against the live registry (the classes carry their key
+// as a static, `_a.key = "HIT_CIRCLE"`, combat-act-steps.js:196, so instanceof is the fidelity
+// check that matters). null for anything we do not replay.
+function hitActKindOf(step) {
+	const ACTION_STEP = actionStepRegistry();
+	if (!ACTION_STEP || !step)
+		return null;
+	for (const kind of HIT_ACT_KINDS) {
+		const StepClass = ACTION_STEP[kind];
+		if (StepClass && step instanceof StepClass)
+			return kind;
+	}
+	return null;
+}
+
+// ONE canonical walk of an action's steps, used by BOTH sides: the owner finds the index of the
+// step that just fired, and the peer takes the step at that index out of its own copy of the same
+// action. The two structures are built by the same code from the same JSON (StepSequence.build,
+// step-base.js:470-520), so a deterministic walk over them yields the same index on both clients --
+// which is what makes `idx` a usable identity without sending any of the step's data. `nextStep` is
+// the sequence order, `branches` the sub-sequences of a branching step, and the guard set keeps a
+// structure the engine linked into a cycle from walking forever.
+function sequenceSteps(action) {
+	const out = [];
+	const seen = new Set();
+	const walk = (step) => {
+		while (step && !seen.has(step)) {
+			seen.add(step);
+			out.push(step);
+			const branches = step.branches;
+			if (branches) {
+				for (const key of Object.keys(branches))
+					walk(branches[key]);
+			}
+			step = step.nextStep;
+		}
+	};
+	walk(action?.rootStep);
+	return out;
+}
+
+// Where a hit act's shape is anchored, as the engine resolved it at init, so that the peer's own
+// resolution can be trusted to land in the same place: the act's own target(s) must be the acting
+// enemy. HIT_SWEEP needs no such test -- SweepProps has no target at all; its geometry is a hook of
+// `damer.ent.view`'s own figure (sweep-act.js:169-177), i.e. self-relative by construction.
+function hitActAnchorIsSelf(act, kind, ent) {
+	if (kind === "HIT_CIRCLE")
+		return act?.target?.entity === ent;
+	if (kind === "HIT_LINE")
+		return act?.target1?.entity === ent && act?.target2?.entity === ent;
+	return kind === "HIT_SWEEP";
+}
+
+// Which action of this enemy is running the step, and where in it the step sits. The name is taken
+// from the running sequence and then checked by IDENTITY against the enemy sheet's own action of
+// that name: only an action the peer can also look up by name may travel. A sequence that is not in
+// the sheet (the engine's own shared call-sequences, e.g. the boom/hide fades, which are not enemy
+// actions) fails that check and is left alone.
+function describeHitAct(step, ctx, ent) {
+	const sequence = ctx?.sequenceState?.sequence;
+	const name = typeof sequence?.name === "string" ? sequence.name : null;
+	if (name === null)
+		return null;
+	const actions = ent?.enemy?.enemyType?.sheet?.actions;
+	const action = actions?.[name];
+	if (!action || action !== sequence)
+		return null;
+	const idx = sequenceSteps(action).indexOf(step);
+	if (idx < 0)
+		return null;
+	return { action: name, idx };
+}
+
+// One hit act an enemy we simulate has just started: tag the act so its end can be reported, and
+// queue its identity for the frame. A step that started no act has nothing to report (the engine
+// found no attacker either), and an act anchored anywhere but on the enemy itself is not forwarded
+// at all (see the gap note above) -- better an unreplayed attack than a hitbox resolved in the
+// wrong place.
+function captureHitAct(step, ctx, ent, enemyId, act) {
+	if (!act)
+		return;
+	const kind = hitActKindOf(step);
+	if (!kind || !hitActAnchorIsSelf(act, kind, ent))
+		return;
+	const ref = describeHitAct(step, ctx, ent);
+	if (!ref)
+		return;
+	const tag = { id: ++hitActSyncId, enemy: enemyId };
+	act.__ttHitAct = tag;
+	enemyQueues.hitActs.push({ id: tag.id, enemy: enemyId, action: ref.action, idx: ref.idx, kind });
+	if (debugEnabled())
+		debugLog(`enemy ${enemyId}: hit act ${kind} (#${tag.id}) of ${ref.action}[${ref.idx}] forwarded`);
+}
+
+// The per-enemy registry of the hit acts an owner's stream has put on OUR copy of an enemy: owner's
+// act id -> the local act, so the owner's stop can cancel exactly that one. Kept ON THE ENTITY (not
+// in the terraTogether holder the fx/sound maps use) for one reason: ./enemy-puppet.js's
+// releasePuppet has to drop it, and that module cannot import this one (this module imports it), so
+// the key is a convention both files spell out -- exactly like `stateId`'s two lockstep copies. The
+// KEY IS DUPLICATED IN ./enemy-puppet.js (PUPPET_HIT_ACTS): edit one, edit both.
+const PUPPET_HIT_ACTS = "__ttPuppetHitActs";
+
+function remoteHitActsOf(ent) {
+	return (ent[PUPPET_HIT_ACTS] ??= new Map());
+}
+
+// The peer's step, resolved from the shared data: the enemy's own action of the sent name, the step
+// at the sent index, checked against the live registry for the sent kind. Any mismatch (a build
+// whose data differs, a stale or malformed entry, an action the enemy no longer has) resolves to
+// null and the entry is dropped -- never acted on.
+function resolveHitActStep(ent, entry) {
+	const name = entry?.action;
+	const idx = entry?.idx;
+	const kind = entry?.kind;
+	if (typeof name !== "string" || !Number.isInteger(idx) || idx < 0 || !HIT_ACT_KINDS.includes(kind))
+		return null;
+	const StepClass = actionStepRegistry()?.[kind];
+	const action = ent?.enemy?.enemyType?.sheet?.actions?.[name];
+	if (!StepClass || !action)
+		return null;
+	const step = sequenceSteps(action)[idx];
+	if (!(step instanceof StepClass) || typeof step.start !== "function")
+		return null;
+	return step;
+}
+
+// The engine's own context stack, around the replay: the step's `Target` ("how the circle is
+// centred") resolves "self" through g_gState.contextEntity (step-arguments.js:67-72), NOT through
+// the context it is handed, so the enemy has to be the pushed context while the act initialises --
+// which is exactly what the engine does for every act it updates itself (combat.js:212-215). Null
+// when the stack is not reachable on this build, in which case the act is not run at all rather than
+// run around the world origin.
+function pushActContext(core, fn) {
+	const gState = terra.export.g_gState;
+	const usable = gState && typeof gState.pushContextEnt === "function"
+		&& typeof gState.popContextEnt === "function";
+	if (!usable)
+		return undefined;
+	gState.pushContextEnt(core);
+	try {
+		return fn();
+	}
+	finally {
+		gState.popContextEnt(core);
+	}
+}
+
+// Run one peer's hit act on our copy of the enemy. The step's own `start` is the whole mechanism:
+// it builds the act from the step's authored props (identical here, they came from the same game
+// data), attaches it to the enemy's real attacker/damager -- so the damage, the party, the hit
+// direction and the hit-stop all ride the engine's own path -- and hands it to g_combat, which
+// updates every act every frame (combat.js:197-225) with the enemy as the pushed context. Nothing
+// here enables the AI, restarts the action, or touches FX: only the act runs.
+//
+// Fail-soft and bounded: an unresolvable step, a missing context stack, a step that throws, or a
+// step that starts no act all end in "nothing happens on this client" (a peer's payload is not
+// trusted input, and this runs on the frame path).
+function applyRemoteHitAct(ent, entry) {
+	if (!entry || typeof entry !== "object")
+		return;
+	const id = entry.id;
+	if (typeof id !== "number")
+		return;
+	const core = ent?.core;
+	if (!core)
+		return;
+	const step = resolveHitActStep(ent, entry);
+	if (!step)
+		return;
+	const acts = terra.export.g_combat?.acts;
+	const before = Array.isArray(acts) ? acts.length : -1;
+	let act = null;
+	replayingHitAct = true;
+	try {
+		pushActContext(core, () => step.start({ entity: ent }));
+		act = takenCombatAct(acts, before);
+	}
+	catch (e) {
+		act = takenCombatAct(acts, before);
+		if (debugEnabled())
+			debugLog(`hit act ${entry.kind} of ${entry.action} was not replayed: ${e?.message ?? e}`);
+	}
+	finally {
+		replayingHitAct = false;
+	}
+	if (!act)
+		return;
+	remoteHitActsOf(ent).set(id, act);
+	if (debugEnabled())
+		debugLog(`enemy ${entry.enemy}: hit act ${entry.kind} (#${id}) of ${entry.action} `
+			+ `[${entry.idx}] replayed on our copy`);
+}
+
+// The owner has finished with one of its acts: cancel ours. `CombatAct.cancel` is the engine's own
+// teardown (it clears the act's subscriptions and drops its damager, which is what makes
+// g_combat's next update remove and release it), so this is the same call the engine would make if
+// the act had ended here -- which, on the peer, is a thing that can only be told to it.
+function stopRemoteHitAct(ent, stop) {
+	const acts = ent?.[PUPPET_HIT_ACTS];
+	const id = stop?.id;
+	if (!acts || typeof id !== "number")
+		return;
+	const act = acts.get(id);
+	acts.delete(id);
+	if (!act || typeof act.cancel !== "function")
+		return;
+	try { act.cancel(); } catch (e) { /* already gone */ }
+}
+
+// Install the four seams above, once (see hitActPatchesInstalled).
+function ensureHitActPatches() {
+	if (hitActPatchesInstalled)
+		return;
+	const ACTION_STEP = actionStepRegistry();
+	const CombatAct = terra.export.CombatAct;
+	if (!ACTION_STEP || !CombatAct?.prototype || typeof CombatAct.prototype.cancel !== "function") {
+		if (debugEnabled())
+			debugLog("cannot install the hit-act patches: ACTION_STEP or CombatAct is missing");
+		return;
+	}
+
+	// A step class that is missing means a game build this mod does not know: naming it in a warning
+	// is the difference between "this attack kind is not synced" and "enemy attacks are not synced",
+	// which is a distinction nobody can make in game.
+	const missing = [];
+	for (const kind of HIT_ACT_KINDS) {
+		const StepClass = ACTION_STEP[kind];
+		if (!StepClass?.prototype || typeof StepClass.prototype.start !== "function") {
+			missing.push(kind);
+			continue;
+		}
+		if (StepClass.prototype.start.__ttHitActPatched === true)
+			continue;
+		const originalStart = StepClass.prototype.start;
+		const wrapper = function (...args) {
+			const ctx = args[0];
+			const ent = ctx?.entity;
+			// An enemy this client owns is the only one whose attacks travel (see ownedIdOf): for
+			// everything else -- the local player's own hit acts, an enemy we only puppet, a call
+			// while the feature is off -- this is a transparent passthrough.
+			const enemyId = replayingHitAct ? null : enemyOwnership.ownedIdOf(ent);
+			const acts = enemyId === null ? null : terra.export.g_combat?.acts;
+			const before = Array.isArray(acts) ? acts.length : -1;
+			const result = originalStart.apply(this, args);
+			if (enemyId !== null)
+				captureHitAct(this, ctx, ent, enemyId, takenCombatAct(acts, before));
+			return result;
+		};
+		wrapper.__ttHitActPatched = true;
+		StepClass.prototype.start = wrapper;
+	}
+
+	const proto = CombatAct.prototype;
+	if (proto.cancel.__ttHitActStopPatched !== true) {
+		const originalCancel = proto.cancel;
+		const wrapper = function (...args) {
+			// Only an act the capture above tagged reports a stop; every other act in the game
+			// (including our own replays, which are never tagged this way) goes straight through.
+			const tag = this.__ttHitAct;
+			if (tag) {
+				this.__ttHitAct = null;            // one stop per act, whatever calls cancel twice
+				enemyQueues.hitActStops.push({ id: tag.id, enemy: tag.enemy });
+				if (debugEnabled())
+					debugLog(`enemy ${tag.enemy}: hit act #${tag.id} ended`);
+			}
+			return originalCancel.apply(this, args);
+		};
+		wrapper.__ttHitActStopPatched = true;
+		proto.cancel = wrapper;
+	}
+
+	hitActPatchesInstalled = true;
+	if (missing.length)
+		console.warn("[TT enemy-sync] hit acts not synced for (unknown game build?): " + missing.join(", "));
 }
 
 // ──────────── damage numbers for a forwarded hit (owner capture / peer replay) ────────────
@@ -1666,6 +2094,8 @@ export function onEnemyState(msg) {
 	const projectiles = groupEnemyEffects(msg.projectiles);
 	const persistentFx = groupEnemyEffects(msg.persistentFx);
 	const hitNumbers = groupEnemyEffects(msg.hitNumbers);
+	const hitActs = groupEnemyEffects(msg.hitActs);
+	const hitActStops = groupEnemyEffects(msg.hitActStops);
 	const now = nowMs();
 	for (const state of list) {
 		// Malformed and partial entries are skipped, never thrown on: a peer's payload must not
@@ -1694,6 +2124,8 @@ export function onEnemyState(msg) {
 		carryBatch(entry, "projectiles", carried, projectiles.get(id));
 		carryBatch(entry, "persistentFx", carried, persistentFx.get(id));
 		carryBatch(entry, "hitNumbers", carried, hitNumbers.get(id));
+		carryBatch(entry, "hitActs", carried, hitActs.get(id));
+		carryBatch(entry, "hitActStops", carried, hitActStops.get(id));
 		peerState.set(id, entry);
 	}
 }
@@ -3015,18 +3447,20 @@ class EnemySync {
 
 	onPreUpdate() {
 		// The engine seams that hang off a per-entity decision -- the death seam (ensureDespawnPatch),
-		// the rest seam (ensureRespawnPatch), Phase 5b's reward gate (ensureRewardPatch) and the
-		// damage-number capture for a forwarded hit (ensureHitNumberPatch, which wraps dealDamage) --
-		// are installed once, and this hook is where it happens because it runs before this frame's entity
-		// updates: an enemy can die in any frame, and a player can rest in any frame, whether or not this
-		// module has driven anything yet, so the map-start install the puppet patches use would not cover
-		// a flag switched on mid-map. Installed while the option is off too: the wrappers are inert then
-		// (they re-test the option per call), and there is no hook that fires on the moment the option
-		// changes.
+		// the rest seam (ensureRespawnPatch), Phase 5b's reward gate (ensureRewardPatch), the
+		// damage-number capture for a forwarded hit (ensureHitNumberPatch, which wraps dealDamage) and
+		// the hit-act seams (ensureHitActPatches: the HIT_* step starts an enemy's attack is captured
+		// from, and the CombatAct.cancel that reports its end) -- are installed once, and this hook is
+		// where it happens because it runs before this frame's entity updates: an enemy can die, and
+		// another can attack, in any frame, whether or not this module has driven anything yet, so the
+		// map-start install the puppet patches use would not cover a flag switched on mid-map.
+		// Installed while the option is off too: the wrappers are inert then (they re-test the option
+		// per call), and there is no hook that fires on the moment the option changes.
 		ensureDespawnPatch();
 		ensureRespawnPatch();
 		ensureRewardPatch();
 		ensureHitNumberPatch();
+		ensureHitActPatches();
 		applyPeerState(syncEnemies());
 	}
 

@@ -153,6 +153,20 @@ export const enemyQueues = {
 	// carries it as one more batch, and filled by ./enemies.js itself rather than by fx-sync.js:
 	// the capture point is the owner's damage pipeline, not an fx spawn.
 	hitNumbers: [],
+	// Melee/splash hit acts an owned enemy has just STARTED this frame: `{ id, action, idx, kind }`,
+	// the identity of one authored hit step (a HIT_CIRCLE / HIT_SWEEP / HIT_LINE of one of that
+	// enemy's own actions) which the peer re-runs on ITS copy of the enemy, so the hitbox resolves
+	// against that peer's own world and can only ever land on that peer's own player. Same story as
+	// hitNumbers: this is not an fx, so no fx slot can carry it, and it is filled by the engine's own
+	// action-step seam in ./enemies.js rather than by fx-sync.js (see the hit-act section there).
+	// One-shot, and one entry per act.
+	hitActs: [],
+	// Those acts ENDING: `{ id }`. A hit act with a negative duration repeats until its action ends
+	// (or a STOP_COMBAT_ACTS step), which on the peer nothing would ever do -- the peer never runs
+	// the action, only the act -- so the owner's own stop is the only thing that can end the peer's
+	// copy. Finite acts self-terminate on both ends and are sent for symmetry (the peer's registry
+	// of live acts is then never stale).
+	hitActStops: [],
 };
 
 // Enemy-owned *infinite* fx (attack telegraphs, status markers) currently alive on the local
