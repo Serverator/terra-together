@@ -1,5 +1,23 @@
-// Downed / revive system (multiplayer).
-//
+/**
+ * src/features/revive.js
+ * Multiplayer "downed" state: with a living ally in the room a death becomes a
+ * bleed-out a nearby teammate can undo, instead of the vanilla checkpoint reload.
+ * Responsibilities:
+ *   - Divert PlayerCmp.onDeathHit into the downed state while the mechanic applies.
+ *   - Keep enemies off a downed player (EnemyCmp aggro patches).
+ *   - Drive bleed-out, peer revive progress (send/recv), and the revive-radius ring FX.
+ *   - Publish UI state (window.terraTogether.reviveState) and tunables
+ *     (window.terraTogether.reviveConfig).
+ * Public surface: Reviver
+ * Engine touchpoints: terra.export.PlayerCmp, EnemyCmp, FxEntity, Effect, ENT_ALIGN,
+ *   Vec3, COMBATANT_STATE, g_player, g_rogue, g_tick.real, g_system.loopPaused,
+ *   g_attackFreq.activeEnemies. Host callbacks are injected by client.js
+ *   (send/isConnected/hasPeers/getLocalId/getPlayerActors/getPeerDowned/setLocalDowned).
+ * Notes: Gated by window.terraTogether.reviveEnabled (mirrored by
+ *   config/settings.js); host-authoritative, default OFF. client.js owns the
+ *   addon/loop wiring and forwards net messages to onMessage/onPreUpdate.
+ */
+
 // Vanilla death (PlayerCmp.onDeathHit, player-cmp.js:1207) adds a 0.1x "playerDeath"
 // slow-motion and reloads the checkpoint. In multiplayer that wrecks enemy sync: the
 // dead client reloads the map (re-creating enemies) and its death slow-motion is
@@ -496,4 +514,4 @@ function clamp01(v) {
 	return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
 }
 
-//# sourceURL=/mods/terra-together/revive.js
+//# sourceURL=/mods/terra-together/features/revive.js

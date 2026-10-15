@@ -1,3 +1,22 @@
+/**
+ * src/features/skins.js
+ * Juno skin picker: loads skin folders from the mod's skins/ directory and swaps the
+ * local player's figure when the "tt-skin" option changes.
+ * Responsibilities:
+ *   - Scan the skins/<name>/skin.json manifests and build the skin table.
+ *   - Apply the selected skin to g_player (Juno only) on map start / option change.
+ *   - Provide the RADIO_GROUP option values + labels and register the addon.
+ * Public surface: SkinManager, skins, createSkinSetting
+ * Engine touchpoints: terra.export.Figure, SpriteSheet, OptionTypeBuilder,
+ *   g_options (listProviders/observers/settings), g_player.entity.view.setFigure;
+ *   terra.addAddon(SkinManager, { onAddonInit: 35000, onLoopStart: -10000,
+ *   onGameMapStart: 35000 }) runs at import time — main.js imports this module for
+ *   that side effect. Node fs/path via require() (the mod host provides them).
+ * Notes: Skins do not sync between players (each client needs the same skins/ folder).
+ *   `changeSkin` no-ops unless the local player is CHA:main#Juno.
+ *   Pre-existing: onOptionEvent's `if (key = 'tt-skin')` is an assignment, not a
+ *   comparison, so it re-applies on any option event; left as-is (behaviour frozen).
+ */
 
 export { SkinManager, skins }
 
@@ -86,7 +105,7 @@ class SkinManager extends terra.export.Observable {
     }
 
 	onLoopStart() {
-		
+		// No loop work: the manager is driven by option events and map starts.
 	}
 }
 
@@ -122,4 +141,4 @@ terra.addAddon(new SkinManager(), { onAddonInit: 35000, onLoopStart: -10000, onG
 
 export { createSkinSetting }
 
-//# sourceURL=/mods/terra-together/skin.js
+//# sourceURL=/mods/terra-together/features/skins.js

@@ -1,3 +1,19 @@
+/**
+ * src/net/ws.js
+ * Hand-rolled RFC6455 WebSocket server: HTTP upgrade handshake plus frame encode/decode.
+ * Responsibilities:
+ *   - Perform the RFC6455 opening handshake (Sec-WebSocket-Key -> Sec-WebSocket-Accept).
+ *   - Frame outbound text messages (0x81) with 7/16/64-bit payload lengths.
+ *   - Parse inbound frames, unmask client payloads, and handle close/ping/pong opcodes.
+ * Public surface: WebSocketServer, WebSocketConnection
+ * Engine touchpoints: node built-ins only (http/crypto/events) supplied by the mod host; no terra.*
+ * Notes:
+ *   - This is transport plumbing only: no game logic and no knowledge of message types
+ *     (the wire type table lives in src/net/protocol.js and is consumed by the server).
+ *   - Only single-frame text messages are decoded; continuation/binary frames are ignored,
+ *     which is fine for the small JSON messages exchanged here.
+ *   - WebSocketConnection.send() emits unmasked frames, correct for server->client.
+ */
 const { createServer } = require("http");
 const { createHash } = require("crypto");
 const { EventEmitter } = require("events");
@@ -136,4 +152,4 @@ class WebSocketServer extends EventEmitter {
 	}
 }
 
-//# sourceURL=/mods/terra-together/ws.js
+//# sourceURL=/mods/terra-together/net/ws.js

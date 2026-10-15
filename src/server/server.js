@@ -1,6 +1,28 @@
+/**
+ * src/server/server.js
+ * Authoritative Terra Together host server: relays player state between connected clients.
+ * Responsibilities:
+ *   - Own the WebSocketServer lifecycle (start/stop, listening/error/close handlers).
+ *   - Track per-player state, username and last scene, and replay them to late joiners.
+ *   - Push host-authoritative settings (revive, estus-share) on change.
+ *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients.
+ * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
+ * Engine touchpoints: window.addEventListener('beforeunload') (stops the server on reload);
+ *   crypto.randomUUID() from the ambient global; no direct terra.* usage.
+ * Notes:
+ *   - The host process also runs a client, so a broadcast reaches the host's own client too;
+ *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
+ *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
+ *     every inbound type is matched through MSG.*, so an unknown type falls to the default
+ *     branch and is dropped.
+ *   - Pre-existing: the default branch's warn string uses single quotes, so ${playerId} there
+ *     never interpolates. Not changed (behaviour-preserving move).
+ */
+
 export { startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting };
 
-import { WebSocketServer } from "./ws.js";
+import { WebSocketServer } from "../net/ws.js";
+import { MSG } from "../net/protocol.js";
 
 let server = null;
 let hostPort = 17005;
@@ -18,7 +40,7 @@ function setHostSetting(key, value) {
 	if (hostSettings[key] === value)
 		return;
 	hostSettings[key] = value;
-	broadcast({ type: "host_setting", key, value });
+	broadcast({ type: MSG.HOST_SETTING, key, value });
 }
 
 // Server need to store current location of players to send to new players
@@ -53,64 +75,60 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		console.log(`[TT Server] Client '${playerId}' connected`);
 		clientsSockets.set(socket, { id: playerId });
 
-		send(socket, { type: "welcome", id: playerId });
+		send(socket, { type: MSG.WELCOME, id: playerId });
 
 		// Replay the host's settings to the newcomer.
 		for (const [key, value] of Object.entries(hostSettings))
-			send(socket, { type: "host_setting", key, value });
+			send(socket, { type: MSG.HOST_SETTING, key, value });
 
 		// Existing players broadcast their state every frame, and the "join_map"
 		// handler syncs on map entry, so no extra state sync is needed here.
-		broadcast({ type: "player_joined", id: playerId }, socket);
+		broadcast({ type: MSG.PLAYER_JOINED, id: playerId }, socket);
 
 		socket.on('message', (raw) => {
 			try {
 				let msg = JSON.parse(raw);
 				
-				// Handle message types
+				// Handle message types. Types come from ../net/protocol.js (single source of truth).
 				switch (msg.type) {
-					case "update":
+					case MSG.UPDATE:
 						playerData.set(playerId, msg.state);
-						broadcast({ type: "update", id: playerId, state: msg.state }, socket);
+						broadcast({ type: MSG.UPDATE, id: playerId, state: msg.state }, socket);
 						break;
 
-					case "scene_changed":
+					case MSG.SCENE_CHANGED:
 						// Remember the scene so stale state can't resurrect a player who left
 						// the world (e.g. for clients that join the map later).
 						if (playerData.has(playerId))
 							playerData.get(playerId).scene = msg.scene;
-						broadcast({ type: "scene_changed", id: playerId, scene: msg.scene }, socket);
+						broadcast({ type: MSG.SCENE_CHANGED, id: playerId, scene: msg.scene }, socket);
 						break;
 
-					case "actor_fx":
-						broadcast({ type: "actor_fx", id: playerId, actorFx: msg.actorFx }, socket);
-						break;
-
-					case "profile":
+					case MSG.PROFILE:
 						playerNames.set(playerId, msg.username);
 						clientsSockets.get(socket).username = msg.username;
 						// Tell everyone else who just connected...
-						broadcast({ type: "player_profile", id: playerId, username: msg.username }, socket);
+						broadcast({ type: MSG.PLAYER_PROFILE, id: playerId, username: msg.username }, socket);
 						// ...and tell the newcomer about everyone already here.
 						for (const [id, username] of playerNames) {
 							if (id != playerId)
-								send(socket, { type: "player_profile", id, username });
+								send(socket, { type: MSG.PLAYER_PROFILE, id, username });
 						}
 						break;
 
-					case "join_map":
-						broadcast({ type: "join_map", id: playerId, map: msg.map, variant: msg.variant ?? null }, socket);
+					case MSG.JOIN_MAP:
+						broadcast({ type: MSG.JOIN_MAP, id: playerId, map: msg.map, variant: msg.variant ?? null }, socket);
 						for (const [id, state] of playerData) {
 							// Rogue rooms share a map name but differ per seeded sublayout, so match
 							// on variant too (both null outside rogue).
 							if (state.scene == "MENU" && playerId != id && msg.map == state.map && (msg.variant ?? null) == (state.variant ?? null))
-								send(socket, { type: "update", id, state });
+								send(socket, { type: MSG.UPDATE, id, state });
 						}
 						break;
 
-					case "revive":
-					case "revive_progress":
-					case "area_heal":
+					case MSG.REVIVE:
+					case MSG.REVIVE_PROGRESS:
+					case MSG.AREA_HEAL:
 						// Downed/revive handshake and area estus heals: relay verbatim to everyone
 						// but the sender (the sender already healed itself locally).
 						broadcast(msg, socket);
@@ -130,7 +148,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 			playerData.delete(playerId);
 			playerNames.delete(playerId);
 			console.log(`Player ${playerId} disconnected. Total: Disconnect`);
-			broadcast({ type: "player_left", id: playerId });
+			broadcast({ type: MSG.PLAYER_LEFT, id: playerId });
 		});
 
 		socket.on("error", (err) => {
@@ -138,7 +156,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 			playerData.delete(playerId);
 			playerNames.delete(playerId);
 			console.log(`Player ${playerId} crashed. Reason: ${err}`);
-			broadcast({ type: "player_left", id: playerId });
+			broadcast({ type: MSG.PLAYER_LEFT, id: playerId });
 		});
 	});
 
@@ -196,4 +214,4 @@ window.addEventListener('beforeunload', () => {
 	stopServer()
 });
 
-//# sourceURL=/mods/terra-together/server.js
+//# sourceURL=/mods/terra-together/server/server.js

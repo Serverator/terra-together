@@ -1,10 +1,31 @@
-// Adds two option types to the game's Options menu: TEXT (editable string) and
-// BUTTON (clickable, runs a mod callback). Each needs a data model and a renderer.
+/**
+ * src/config/option-types.js
+ * Defines two custom option types (TEXT: editable string, BUTTON: clickable mod callback)
+ * for the game's Options menu, plus the small helpers that create options of any type.
+ * Responsibilities:
+ *   - Data models (OptionText / OptionButton, both extending terra.export.Option).
+ *   - Menu renderers (OptionTextGui / OptionButtonGui) and their keyboard/mouse handling.
+ *   - registerOptionTypes(): register both halves, idempotently, before any menu is built.
+ *   - Factories: createTextOption, createButtonOption, createOption, setButtonHandler.
+ * Public surface: registerOptionTypes, createTextOption, createButtonOption, createOption,
+ *   setButtonHandler, OptionText, OptionButton, OptionTextGui, OptionButtonGui
+ * Engine touchpoints: terra.export (aliased `g` below) — Option, OptionTypeBuilder,
+ *   OptionTypeGui, OptionGuiTypeBuilder, g_options, ColorDecorator, ColorGui, TextGui,
+ *   TextButton, LangEntry, g_tick, g_input, g_menuSFX, GUI_ALIGN_X/Y, FONT_SIZE,
+ *   BUTTON_TYPES, NP_CUT_DIR; window keydown/mousedown capture listeners while a TEXT field
+ *   is being edited. g.ColorDecorator.WHITE is installed at module load.
+ * Notes: createOption was merged in from the deleted src/helper.js — it is the generic
+ *   factory the settings modules use for option types the game already registers (e.g.
+ *   CHECKBOX). registerOptionTypes() is a no-op after the first call, so every factory may
+ *   call it unconditionally. All helpers must run once the Options menu is being built
+ *   (main.js onLoopStart), after terra.export exists.
+ */
 
 export {
 	registerOptionTypes,
 	createTextOption,
 	createButtonOption,
+	createOption,
 	setButtonHandler,
 	OptionText,
 	OptionButton,
@@ -436,3 +457,26 @@ function createButtonOption(key, data, onPress) {
 		option.onPress = onPress;
 	return addSetting(key, option);
 }
+
+// Creates a new option in the game menu, for any option type the game already knows
+// (used for the CHECKBOX settings). Should run in `onLoopStart`. Merged verbatim from
+// the deleted src/helper.js, minus its option-types.js import.
+function createOption(id, data, type) {
+	registerOptionTypes();
+
+	let builder = terra.export.OptionTypeBuilder.builders.get(type);
+	if (!builder)
+		throw new Error("[TerraTogether] Unknown option type: " + type);
+
+	let option = new builder(id, data);
+
+	let options = terra.export.g_options;
+	options.settings[id] = option;
+	// Keep a value restored from localStorage/save, otherwise use the default.
+	if (options.values[id] === undefined || options.values[id] === null)
+		options.values[id] = option.default;
+
+	return option;
+}
+
+//# sourceURL=/mods/terra-together/config/option-types.js

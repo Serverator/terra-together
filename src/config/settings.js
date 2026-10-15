@@ -1,12 +1,29 @@
-// Options-menu glue: the mod's settings category (createModSettings) and its tab
-// (SettingsTab). main.js wires these in.
+/**
+ * src/config/settings.js
+ * Options-menu glue: the mod's settings category (createModSettings) and its tab (SettingsTab).
+ * Responsibilities:
+ *   - Declare every TerraTogether option: Appearance, Gameplay, Connection, Hosting,
+ *     Miscellaneous and Debug.
+ *   - Own the host-authoritative revive / estus-share toggles and their runtime mirrors.
+ *   - Patch the game's CHECKBOX gui so a host-only option greys out and refuses changes.
+ * Public surface: CATEGORY, TAB_LABEL, REVIVE_OPTION, ESTUS_OPTION, isReviveEnabled,
+ *   syncRevive, isEstusShareEnabled, syncEstusShare, createModSettings, SettingsTab
+ * Engine touchpoints: terra.export.g_options, OptionTypeBuilder, OptionGuiTypeBuilder,
+ *   g_menuSFX, ColorDecorator, g_gui, g_label, Observable; window.terraTogether.{reviveEnabled,
+ *   estusShareEnabled}; addon hooks — main.js calls createModSettings() from its
+ *   Multiplayer.onLoopStart and registers SettingsTab as an addon at onLoopStart: 40000.
+ * Notes: the stored option value is the source of truth; the terraTogether mirrors are read
+ *   by revive.js (reviveEnabled) and area-heal.js (estusShareEnabled), and are re-pushed to
+ *   clients by server.js setHostSetting -> host_setting -> client.js. Option keys (tt-*) are
+ *   read by main.js, nameplates.js and enemy-debug.js — do not rename them. See option-types.js
+ *   for the TEXT/BUTTON types and for createOption().
+ */
 
-import { createTextOption, createButtonOption } from "./option-types.js";
-import { createOption } from "./helper.js";
-import { ENEMY_DEBUG_OPTION } from "./enemy-debug.js";
-import * as client from "./client.js";
-import * as server from "./server.js";
-import { createSkinSetting } from "./skin.js";
+import { createTextOption, createButtonOption, createOption } from "./option-types.js";
+import { ENEMY_DEBUG_OPTION } from "../debug/enemy-debug.js";
+import * as client from "../client/client.js";
+import * as server from "../server/server.js";
+import { createSkinSetting } from "../features/skins.js";
 
 // Options category; also used as the Options-menu tab key.
 export const CATEGORY = "MULTIPLAYER";
@@ -356,3 +373,5 @@ export class SettingsTab extends terra.export.Observable {
 			tabTitles[CATEGORY] = { entry: localeEntry };
 	}
 }
+
+//# sourceURL=/mods/terra-together/config/settings.js

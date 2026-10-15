@@ -1,5 +1,22 @@
-// Area estus heal (multiplayer).
-//
+/**
+ * src/features/area-heal.js
+ * Drinking an estus flask also heals every player within `radius` (host-controlled).
+ * Responsibilities:
+ *   - Detect the local flask use (PlayerCuisine.useItem) and wait for the user's own
+ *     heal to finish before broadcasting.
+ *   - Allow a full-HP flask use when a nearby ally needs it (isHotFullyHealed shadow).
+ *   - Apply incoming heals to the local g_player, reviving a downed self first.
+ * Public surface: AreaHealer
+ * Engine touchpoints: terra.export.PlayerCuisine.useItem, PlayerCmp.handleItemUse,
+ *   PLAYER_ITEM_DIR, g_player(.combat.params, .cuisine.estus), g_tick.real,
+ *   g_system.loopPaused, g_playerHeal.playHealFx. Host callbacks are injected by
+ *   client.js (send/isConnected/hasPeers/getLocalId/getPlayerActors/getPeerDowned/
+ *   isSelfDowned/reviveLocal).
+ * Notes: Gated by window.terraTogether.estusShareEnabled, falling back to the
+ *   "tt-estus-share" option. Recipients never spend their own charges. client.js owns
+ *   the addon/loop wiring and forwards net messages to onMessage/onPreUpdate.
+ */
+
 // When a player drinks their estus flask, every other player within `radius` is healed
 // too. The heal is exactly what the *user's* flask produces (same amount + HoT duration),
 // but recipients do NOT spend their own charges — only the user spends one.
@@ -278,3 +295,5 @@ class AreaHealer {
 		}
 	}
 }
+
+//# sourceURL=/mods/terra-together/features/area-heal.js

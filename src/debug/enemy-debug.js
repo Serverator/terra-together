@@ -1,44 +1,49 @@
-// Enemy debug overlay: a small label above every live enemy showing
-//   line 1 - the player who owns (will simulate) that enemy,
-//   line 2 - the enemy's current logic state (IDLE / COMBAT / WEAK / ...),
-//   line 3 - the action the enemy actor is currently running (idle / runCloser / ...).
-//
-// It reuses the player-nameplate mechanism from nameplates.js (a game-GUI TextGui
-// positioned with hook.transformToMapPos) but is drawn at a fixed 0.5 scale.
-//
-// ─────────────────────────────── HOW TO TOGGLE ───────────────────────────────
-//   1) Live / per-session — NW.js devtools console (F12, or Ctrl+Shift+I):
-//        window.ttEnemyDebug = true;    // on
-//        window.ttEnemyDebug = false;   // off
-//      The flag is re-read every frame, so toggling is immediate and needs no reload.
-//      Delete the property (delete window.ttEnemyDebug) to fall back to the option.
-//   2) Persistent across restarts — Options > Multiplayer > Debug >
-//      "Enemy Debug Overlay" (the tt-enemy-debug checkbox, declared in settings.js).
-//
-//   Enabled = window flag OR option. The overlay is off by default.
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// This module deliberately imports nothing so it stays self-contained; the option
-// itself is declared in settings.js, which owns the option/menu plumbing.
+/**
+ * src/debug/enemy-debug.js
+ * Enemy debug overlay: a small label above every live enemy showing the player who owns
+ * (will simulate) it, the enemy's current logic state and the action its actor is running.
+ * Responsibilities:
+ *  - on/off from window.ttEnemyDebug (live) OR the tt-enemy-debug option
+ *  - the ownership label: a deterministic rendezvous hash over the peer roster (SWAP-POINT)
+ *  - one TextGui per live enemy, drawn at a fixed 0.5 scale via ./labels.js
+ * Public surface: ENEMY_DEBUG_OPTION, ENEMY_DEBUG_SCALE, enemyStableId, enemyOwnerLabel,
+ *  EnemyDebug, EnemyDebugGui
+ * Engine touchpoints: terra.addAddon (src/main.js registers EnemyDebug at onLoopStart 50001),
+ *  terra.export GuiElement / TextGui / g_gui / g_scene / g_gState.entities / g_options /
+ *  g_game.map.active.path / EnemyCmp; window.terraTogether.playerId / peers / playerNames
+ *  (see src/client/client.js)
+ * Notes: label building/anchoring is shared with src/features/nameplates.js via ./labels.js;
+ *  ENT_ALIGN.CENTER head-node ref: engine/entity/entity.js:416. Off by default.
+ *
+ * ─────────────────────────────── HOW TO TOGGLE ───────────────────────────────
+ *   1) Live / per-session — NW.js devtools console (F12, or Ctrl+Shift+I):
+ *        window.ttEnemyDebug = true;    // on
+ *        window.ttEnemyDebug = false;   // off
+ *      The flag is re-read every frame, so toggling is immediate and needs no reload.
+ *      Delete the property (delete window.ttEnemyDebug) to fall back to the option.
+ *   2) Persistent across restarts — Options > Multiplayer > Debug >
+ *      "Enemy Debug Overlay" (the tt-enemy-debug checkbox, declared in src/config/settings.js).
+ *
+ *   Enabled = window flag OR option.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 
-const Vec3 = terra.export.Vec3;
+import { createLabel, headLabelPos, anchorLabel, placeLabelAbove, hideLabel } from "./labels.js";
 
-// Option key (declared in settings.js, read here) and the console flag property name.
+// Option key (declared in src/config/settings.js, read here) and the console flag name.
 export const ENEMY_DEBUG_OPTION = "tt-enemy-debug";
 const ENEMY_DEBUG_WINDOW_FLAG = "ttEnemyDebug";
 
-// Required by the task: the overlay always draws at 0.5x, unlike the nameplates
-// (which follow the "Nameplate Scale" option).
+// The overlay always draws at 0.5x, unlike the nameplates (which follow the "Nameplate
+// Scale" option). Load-bearing value — keep it exact.
 export const ENEMY_DEBUG_SCALE = 0.5;
 
-const FONT_SIZE = terra.export.FONT_SIZE.SMALL;      // FONT_SIZE.SMALL === 0
-const FONT_OUTLINE = terra.export.FONT_OUTLINE.ON;   // FONT_OUTLINE.ON === 2
-const FONT_ALIGN = terra.export.FONT_ALIGN.CENTER;
-const HEAD_OFFSET = 0.4;      // matches nameplates.js NAMEPLATE_HEAD_OFFSET
-const HIDDEN_X = -100000;     // matches nameplates.js NAMEPLATE_HIDDEN_X
-const LABEL_GAP = 0.15;       // extra world-space z so the label clears the head node
+// Extra world-space z on top of the shared head offset, so the label clears the head node.
+// Passed to labels.js headLabelPos() as its `extraZ`.
+const LABEL_GAP = 0.15;
 
-// The username option, same source nameplates.js/main.js use for the local player.
+// The username option, same source src/features/nameplates.js and src/main.js use for the
+// local player.
 const USERNAME_OPTION = "tt-username";
 
 // True when the overlay should draw this frame. Cheap enough to call every frame
@@ -168,40 +173,12 @@ function getLiveEnemy(core) {
 	return enemy;
 }
 
-const debugWorld = new Vec3();
-
-// Just above the head, from the stable collision box (not the bobbing head bone).
-// Mirrors nameplates.js getNameplateHeadPos().
-function enemyHeadPos(entity) {
-	const core = entity?.core;
-	if (!core)
-		return null;
-
-	const sizeZ = core.colls?.[0]?.size?.z ?? 2;
-
-	const tools = terra.export.EntityTools;
-	const align = terra.export.ENT_ALIGN;
-	if (tools?.getAlignedPos && align) {
-		const pos = tools.getAlignedPos(debugWorld, entity, align.CENTER);
-		if (pos) {
-			pos.z += sizeZ * 0.5 + HEAD_OFFSET + LABEL_GAP;
-			return pos;
-		}
-	}
-
-	return debugWorld.setC(core.pos.x, core.pos.y, core.pos.z + sizeZ + HEAD_OFFSET + LABEL_GAP);
-}
-
 // owner / state / running action. Both enemy fields can legitimately be null.
 function buildLabel(core, enemy) {
 	const owner = enemyOwnerLabel(enemyStableId(core));
 	const state = cleanText(enemy.currentState?.name) ?? "-";
 	const action = cleanText(core.ent?.actor?.actionState?.sequence?.name);
 	return action ? `${owner}\n${state}\n${action}` : `${owner}\n${state}`;
-}
-
-function hideEntry(entry) {
-	entry.text.hook.pos.setC(HIDDEN_X, 0);
 }
 
 // One TextGui per live enemy, positioned over its head each frame.
@@ -215,16 +192,7 @@ class EnemyDebugGui extends terra.export.GuiElement {
 	}
 
 	createEntry(key) {
-		const text = new terra.export.TextGui("", {
-			size: FONT_SIZE,
-			outline: FONT_OUTLINE,
-			align: FONT_ALIGN,
-			dynamic: true,
-			skipAutoPivot: true
-		});
-		text.setAlign(terra.export.GUI_ALIGN_X.LEFT, terra.export.GUI_ALIGN_Y.TOP);
-		text.setPivot(0, 0);
-		text.hook.scale = ENEMY_DEBUG_SCALE;
+		const text = createLabel(ENEMY_DEBUG_SCALE);
 		const entry = { text, label: null };
 		this.entries.set(key, entry);
 		this.addChild(text);
@@ -239,28 +207,16 @@ class EnemyDebugGui extends terra.export.GuiElement {
 			entry.text.setText(label);
 		}
 
-		const pos = core.isVisible?.() ? enemyHeadPos(core.ent) : null;
+		const pos = core.isVisible?.() ? headLabelPos(core.ent, LABEL_GAP) : null;
 		if (!pos) {
-			hideEntry(entry);
+			hideLabel(entry.text);
 			return;
 		}
 
 		const text = entry.text;
-		// ignoreScale=true: transformToMapPos must not overwrite hook.scale, we own it.
-		text.hook.scale = ENEMY_DEBUG_SCALE;
-		text.hook.transformToMapPos(pos, true);
-
 		// Screen-space anchor at the head; centre horizontally and sit fully above it.
-		const anchorX = text.hook.pos.x;
-		const anchorY = text.hook.pos.y;
-		let width = text.hook.size.x * ENEMY_DEBUG_SCALE;
-		let height = text.hook.size.y * ENEMY_DEBUG_SCALE;
-		if (!Number.isFinite(width))
-			width = 0;
-		if (!Number.isFinite(height))
-			height = 0;
-		text.hook.pos.x = anchorX - width * 0.5;
-		text.hook.pos.y = anchorY - height;
+		anchorLabel(text, ENEMY_DEBUG_SCALE, pos);
+		placeLabelAbove(text, text.hook.pos.x, text.hook.pos.y, ENEMY_DEBUG_SCALE);
 	}
 
 	update() {
@@ -302,4 +258,4 @@ class EnemyDebug {
 
 export { EnemyDebug, EnemyDebugGui };
 
-//# sourceURL=/mods/terra-together/enemy-debug.js
+//# sourceURL=/mods/terra-together/debug/enemy-debug.js

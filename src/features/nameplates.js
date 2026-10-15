@@ -1,16 +1,27 @@
-// Player nameplates, drawn with the game's Gui/TextGui and positioned above each
-// character via hook.transformToMapPos(). Actor/username data comes from client.js.
+/**
+ * src/features/nameplates.js
+ * Player nameplates and HP bars, drawn above each character with the game's Gui/TextGui.
+ * Responsibilities:
+ *  - NameplateGui, a GuiElement added to g_gui on loop start, one entry per visible actor
+ *  - name text, scaled by the tt-nameplate-scale option
+ *  - HP bar ColorGuis: fill ramp, pending-heal preview, lost-HP flash, downed/revive slices
+ *  - what peers/self show, from the tt-nameplates / tt-hpbar options
+ * Public surface: NameplateGui (also self-registers the addon that creates it)
+ * Engine touchpoints: terra.addAddon (onLoopStart 50000), terra.export g_gui / g_options /
+ *  g_scene / g_player / g_system / g_tick, GuiElement, TextGui, ColorGui, Color;
+ *  window.terraTogether.playerActors / playerNames / reviveState (see src/client/client.js)
+ * Notes: building and anchoring the label text lives in ../debug/labels.js, shared with
+ *  src/debug/enemy-debug.js. Bar geometry is in nameplate text pixels, so it scales with
+ *  the text at any Nameplate Scale. Font/outline/align enum refs:
+ *  features/font/font-system-types.js:5-14.
+ */
 
-const Vec3 = terra.export.Vec3;
+import { createLabel, headLabelPos, anchorLabel, placeLabelAbove, hideLabel, LABEL_HIDDEN_X } from "../debug/labels.js";
 
 const NAMEPLATE_OPTION = "tt-nameplates";
 const HPBAR_OPTION = "tt-hpbar";
 const USERNAME_OPTION = "tt-username";
 const NAMEPLATE_SCALE_OPTION = "tt-nameplate-scale";
-const NAMEPLATE_FONT_SIZE = terra.export.FONT_SIZE.SMALL;
-const NAMEPLATE_OUTLINE = terra.export.FONT_OUTLINE.ON;
-const NAMEPLATE_FONT_ALIGN = terra.export.FONT_ALIGN.CENTER;
-const NAMEPLATE_HEAD_OFFSET = 0.4;
 
 // HP bar drawn under each nameplate. Solid rectangles via ColorGui; auto-disabled
 // (nameplates still work) if the exports are missing.
@@ -52,7 +63,7 @@ function setBarColor(color, src) {
 	color.r = src.r; color.g = src.g; color.b = src.b; color.a = src.a;
 }
 
-// Radio index -> scale; must match the "Nameplate Scale" list in settings.js.
+// Radio index -> scale; must match the "Nameplate Scale" list in src/config/settings.js.
 const NAMEPLATE_SCALES = [0.5, 1.0, 1.5];
 const NAMEPLATE_SCALE_DEFAULT = 1.0;
 
@@ -62,9 +73,6 @@ function getNameplateScale() {
 }
 
 const NAMEPLATE_SELF_ID = "__tt_self__";
-const NAMEPLATE_HIDDEN_X = -100000;
-
-const nameplateWorld = new Vec3();
 
 // Empty/whitespace nicknames have no nameplate at all.
 function getNameplateText(name) {
@@ -72,46 +80,20 @@ function getNameplateText(name) {
 	return trimmed === "" ? null : trimmed;
 }
 
-// Just above the head, from the stable collision box (not the bobbing head bone).
-function getNameplateHeadPos(actor) {
-	const core = actor?.core;
-	if (!core) return null;
-
-	const coll = core.colls?.[0];
-	const sizeZ = coll?.size?.z ?? 2;
-
-	const tools = terra.export.EntityTools;
-	const align = terra.export.ENT_ALIGN;
-	if (tools?.getAlignedPos && align) {
-		const pos = tools.getAlignedPos(nameplateWorld, actor, align.CENTER);
-		if (pos) {
-			pos.z += sizeZ * 0.5 + NAMEPLATE_HEAD_OFFSET;
-			return pos;
-		}
-	}
-
-	const z = core.pos.z + sizeZ + NAMEPLATE_HEAD_OFFSET;
-	return nameplateWorld.setC(core.pos.x, core.pos.y, z);
-}
-
-function hideText(entry) {
-	entry.text.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
-}
-
 function hideBar(entry) {
-	if (entry.barOutline) for (const seg of entry.barOutline) seg.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
-	entry.barBg?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
-	entry.barRegen?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
-	entry.barDamage?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
-	entry.barFill?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
-	entry.barGloss?.hook.pos.setC(NAMEPLATE_HIDDEN_X, 0);
+	if (entry.barOutline) for (const seg of entry.barOutline) seg.hook.pos.setC(LABEL_HIDDEN_X, 0);
+	entry.barBg?.hook.pos.setC(LABEL_HIDDEN_X, 0);
+	entry.barRegen?.hook.pos.setC(LABEL_HIDDEN_X, 0);
+	entry.barDamage?.hook.pos.setC(LABEL_HIDDEN_X, 0);
+	entry.barFill?.hook.pos.setC(LABEL_HIDDEN_X, 0);
+	entry.barGloss?.hook.pos.setC(LABEL_HIDDEN_X, 0);
 	// Forget the last-shown HP so a re-shown bar doesn't flash a stale drop.
 	entry.hpShown = null;
 	entry.damageHold = 0;
 }
 
 function hideEntry(entry) {
-	hideText(entry);
+	hideLabel(entry.text);
 	hideBar(entry);
 }
 
@@ -169,16 +151,7 @@ class NameplateGui extends terra.export.GuiElement {
 	}
 
 	createEntry(id) {
-		const text = new terra.export.TextGui("", {
-			size: NAMEPLATE_FONT_SIZE,
-			outline: NAMEPLATE_OUTLINE,
-			align: NAMEPLATE_FONT_ALIGN,
-			dynamic: true,
-			skipAutoPivot: true
-		});
-		text.setAlign(terra.export.GUI_ALIGN_X.LEFT, terra.export.GUI_ALIGN_Y.TOP);
-		text.setPivot(0, 0);
-		text.hook.scale = getNameplateScale();
+		const text = createLabel(getNameplateScale());
 		const entry = { text, name: null, barOutline: null, barBg: null, barRegen: null, barDamage: null, barFill: null, barGloss: null, hpShown: null, damage: 0, damageHold: 0 };
 		if (HP_BAR_ENABLED) {
 			// Outline as 4 edges with the corner pixels omitted, so the bar looks rounded.
@@ -222,7 +195,7 @@ class NameplateGui extends terra.export.GuiElement {
 			entry.text.setText(label);
 		}
 
-		const pos = actor?.core?.isVisible?.() ? getNameplateHeadPos(actor) : null;
+		const pos = actor?.core?.isVisible?.() ? headLabelPos(actor) : null;
 		if (!pos) {
 			hideEntry(entry);
 			return;
@@ -230,21 +203,14 @@ class NameplateGui extends terra.export.GuiElement {
 
 		const text = entry.text;
 		const scale = getNameplateScale();
-		text.hook.scale = scale;
-		text.hook.transformToMapPos(pos, true);
 
 		// Screen-space anchor at the head. The name and the bar are stacked bottom-up from
 		// this baseline, so a lone element sits at the same height whether it is the name
 		// or the bar. When both are shown, the bar keeps the baseline and the name is
 		// raised above it by the bar's height (fill + one outline, plus the gap).
+		anchorLabel(text, scale, pos);
 		const anchorX = text.hook.pos.x;
 		let stackY = text.hook.pos.y;
-		let nameW = text.hook.size.x * scale;
-		let nameH = text.hook.size.y * scale;
-		if (!Number.isFinite(nameW) || !Number.isFinite(nameH)) {
-			nameW = 0;
-			nameH = 0;
-		}
 
 		const o = HP_BAR_OUTLINE;
 		const H = HP_BAR_HEIGHT;
@@ -330,11 +296,10 @@ class NameplateGui extends terra.export.GuiElement {
 		}
 
 		if (wantName) {
-			text.hook.pos.x = anchorX - nameW * 0.5;
-			text.hook.pos.y = stackY - nameH;
+			placeLabelAbove(text, anchorX, stackY, scale);
 		}
 		else {
-			hideText(entry);
+			hideLabel(text);
 		}
 	}
 
@@ -401,4 +366,4 @@ terra.addAddon(new Nameplates(), { onLoopStart: 50000 });
 
 export { NameplateGui };
 
-//# sourceURL=/mods/terra-together/nameplates.js
+//# sourceURL=/mods/terra-together/features/nameplates.js

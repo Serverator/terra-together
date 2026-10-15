@@ -1,55 +1,33 @@
-import { registerOptionTypes } from "./option-types.js";
-import { createModSettings, SettingsTab, syncRevive, REVIVE_OPTION, syncEstusShare, ESTUS_OPTION } from "./settings.js";
-import * as skin from './skin.js';
-import * as client from './client.js';
-import * as server from './server.js';
-import * as nameplates from './nameplates.js';
-import { EnemyDebug } from './enemy-debug.js';
+/**
+ * src/main.js
+ * Mod entry point (manifest.json "main") — a thin registration/wiring table that
+ * hooks the multiplayer features into the engine.
+ * Responsibilities:
+ *   - Import the feature/config modules (skins + nameplates are side-effect imports:
+ *     each registers its own addon at import time).
+ *   - Multiplayer addon: option observer, profile send, revive/estus host sync,
+ *     always-focused, auto-host, and installing the logo-skip patch.
+ *   - Register the SettingsTab and EnemyDebug addons.
+ * Public surface: none (side effects only; seeds window.terraTogether)
+ * Engine touchpoints: terra.addAddon, terra.export.Observable, g_options, g_party,
+ *   g_system, GAME_CONF, OPTION_EVENT; window.terraTogether.steps (+ the globals the
+ *   features publish themselves).
+ * Notes: The addon priority numbers below are load-order significant — do not
+ *   renumber (see the comment on each terra.addAddon call).
+ */
+
+import { registerOptionTypes } from "./config/option-types.js";
+import { createModSettings, SettingsTab, syncRevive, REVIVE_OPTION, syncEstusShare, ESTUS_OPTION } from "./config/settings.js";
+// Imported for its side effect only: registers the SkinManager addon.
+import "./features/skins.js";
+import * as client from './client/client.js';
+import * as server from './server/server.js';
+// Imported for its side effect only: registers the Nameplates addon.
+import "./features/nameplates.js";
+import { EnemyDebug } from './debug/enemy-debug.js';
+import { installLogoSkip, skipLogosNow } from './features/logo-skip.js';
 
 window.terraTogether ??= {};
-
-// The game shows a LogoScreen (developer + promo logos) once the title scene appears,
-// and only reveals the title menu when that sequence ends (TitleScreen.onLogoDown ->
-// startBackground). We intercept the TitleScreen as it is added so we can short-circuit
-// the sequence when the option is on.
-function patchLogoScreen(logoScreen) {
-	if (!logoScreen || logoScreen.__ttPatched)
-		return;
-	const originalStart = logoScreen.start;
-	logoScreen.start = function (...args) {
-		if (terra.export.g_options.get("tt-skip-logos") ?? false) {
-			// Fire the same ENDED callback the sequence would, jumping to the title menu.
-			this.end();
-			return;
-		}
-		return originalStart.apply(this, args);
-	};
-	logoScreen.__ttPatched = true;
-}
-
-function installLogoScreenSkip() {
-	const g_gui = terra.export.g_gui;
-	if (!g_gui || g_gui.__ttLogosPatched)
-		return;
-	const originalAddElement = g_gui.addElement;
-	g_gui.addElement = function (element, ...rest) {
-		const result = originalAddElement.call(this, element, ...rest);
-		try {
-			if (element?.constructor?.name === "TitleScreen")
-				patchLogoScreen(element.logoScreen);
-		}
-		catch (err) {
-			console.warn("[TerraTogether] Failed to hook the title logo screen:", err);
-		}
-		return result;
-	};
-	g_gui.__ttLogosPatched = true;
-}
-
-function findTitleScreen() {
-	const hook = terra.export.g_gui?.hooks?.find(h => h.gui?.constructor?.name === "TitleScreen");
-	return hook?.gui ?? null;
-}
 
 class Multiplayer extends terra.export.Observable {
 	onGameMapStart() {
@@ -112,11 +90,7 @@ class Multiplayer extends terra.export.Observable {
 
 	// Ends an in-progress intro logo sequence when the option is switched on.
 	applySkipLogos() {
-		if (!(terra.export.g_options.get("tt-skip-logos") ?? false))
-			return;
-		const logoScreen = findTitleScreen()?.logoScreen;
-		if (logoScreen && !logoScreen.hasEnded())
-			logoScreen.end();
+		skipLogosNow();
 	}
 
 	applyAlwaysFocused() {
@@ -154,7 +128,7 @@ class Multiplayer extends terra.export.Observable {
 
 		// Wrap g_gui.addElement before the game creates its TitleScreen, so the intro
 		// logo sequence can be skipped.
-		installLogoScreenSkip();
+		installLogoSkip();
 
 		// Apply the stored Always Focused value at startup (a load re-applies it too).
 		this.applyAlwaysFocused();
