@@ -12,7 +12,7 @@
  *     reads — declared here because the client module graph is a DAG rooted at this file.
  *   - Lifecycle: joinServer/leaveServer/disconnect/send + detachClient/clearPeers/
  *     onDisconnected, and the inbound dispatch (MSG.* -> peer state, snapshot ingest,
- *     revive/area-heal routing).
+ *     revive/area-heal/enemy-owner routing).
  * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send,
  *   hasClient, hasPeers, initSession, getLocalId, getDownedFraction, setLocalDowned,
  *   getPeerDowned, isLocalDowned, getRogueInfo, getPeerRogueSeed, playerActors, playerNames,
@@ -44,8 +44,9 @@ const deps = {
 	setActorTimeFactor: () => { },
 	// ./fx-sync.js
 	clearPeerFx: () => { },
-	// ../features/revive.js + ../features/area-heal.js: the "revive" / "revive_progress" /
-	// "area_heal" messages, and both modules' onConnectionReset().
+	// The feature modules' own inbound types and both of their onConnectionReset()s:
+	// "revive" / "revive_progress" / "area_heal" (../features/revive.js,
+	// ../features/area-heal.js) and "enemy_owner" (./enemies.js, routed by ./client.js).
 	onPeerMessage: () => { },
 	onConnectionReset: () => { },
 	// host.reviver.downedFraction() (published to peers in the state snapshot).
@@ -318,11 +319,14 @@ export function joinServer(address, options = {}) {
 					console.log(`[TT Client] Player ${msg.id} joined map '${msg.map}'`);
 					break;
 
-				// Downed/revive + estus area-heal protocol, handled by their own modules
-				// (../features/revive.js, ../features/area-heal.js).
+				// Types owned by a feature module rather than by this dispatch: the downed/revive
+				// + estus area-heal protocol (../features/revive.js, ../features/area-heal.js)
+				// and the enemy ownership broadcast (../client/enemies.js). ./client.js is the
+				// composition root that routes them on.
 				case MSG.REVIVE:
 				case MSG.REVIVE_PROGRESS:
 				case MSG.AREA_HEAL:
+				case MSG.ENEMY_OWNER:
 					deps.onPeerMessage(msg);
 					break;
 			}

@@ -4,18 +4,20 @@
  * (will simulate) it, the enemy's current logic state and the action its actor is running.
  * Responsibilities:
  *  - on/off from window.ttEnemyDebug (live) OR the tt-enemy-debug option
- *  - the ownership label: a deterministic rendezvous hash over the peer roster (SWAP-POINT)
+ *  - the ownership label: the SERVER-assigned owner when one is known (src/client/enemies.js,
+ *    which owns enemy identity too), else the local rendezvous hash (SWAP-POINT)
  *  - one TextGui per live enemy, drawn at a fixed 0.5 scale via ./labels.js
- * Public surface: ENEMY_DEBUG_OPTION, ENEMY_DEBUG_SCALE, enemyStableId, enemyOwnerLabel,
- *  EnemyDebug, EnemyDebugGui
+ * Public surface: ENEMY_DEBUG_OPTION, ENEMY_DEBUG_SCALE, enemyStableId (re-exported from
+ *  ../client/enemies.js, which now owns it), enemyOwnerLabel, EnemyDebug, EnemyDebugGui
  * Engine touchpoints: terra.addAddon (src/main.js registers EnemyDebug at onLoopStart 50001),
  *  terra.export GuiElement / g_gui / g_system.size / g_scene / g_gState.entities /
- *  g_options / g_game.map.active.path / EnemyCmp; window.terraTogether.playerId / peers /
- *  playerNames (published by src/client/session.js). TextGui itself is reached through
- *  ./labels.js.
+ *  g_options / EnemyCmp; window.terraTogether.playerId / peers / playerNames (published by
+ *  src/client/session.js). TextGui itself is reached through ./labels.js; the enemy ids and
+ *  the assigned owners come from ../client/enemies.js.
  * Notes: label building/anchoring is shared with src/features/nameplates.js via ./labels.js;
- *  ENT_ALIGN.CENTER head-node ref: engine/entity/entity.js:416. Off by default. Enemy
- *  ownership is a placeholder: the entire policy is the SWAP-POINT section below.
+ *  ENT_ALIGN.CENTER head-node ref: engine/entity/entity.js:416. Off by default. Ownership is
+ *  read from the server assignment when there is one and falls back to a local policy
+ *  otherwise: the entire fallback is the SWAP-POINT section below.
  *
  * ─────────────────────────────── HOW TO TOGGLE ───────────────────────────────
  *   1) Live / per-session — NW.js devtools console (F12, or Ctrl+Shift+I):
@@ -31,6 +33,10 @@
  */
 
 import { createLabel, headLabelPos, anchorLabel, placeLabelAbove, hideLabel } from "./labels.js";
+// Enemy identity (enemyStableId, re-exported at the bottom so this module's surface is
+// unchanged) and the server-assigned owner. Identity lives in one place: ../client/enemies.js
+// builds the ids this overlay labels and the registry that turns them into owners.
+import { enemyStableId, getEnemyOwnerName } from "../client/enemies.js";
 
 // Option key (declared in src/config/settings.js, read here) and the console flag name.
 export const ENEMY_DEBUG_OPTION = "tt-enemy-debug";
@@ -75,14 +81,18 @@ function cleanText(value) {
 
 // ─────────────────────────── enemy owner (SWAP-POINT) ───────────────────────────
 //
-// Enemy simulation ownership is not implemented yet, so this is the placeholder policy; ALL of
-// it lives in enemyStableId() + enemyOwnerLabel() and the helpers between them. The point of
-// that shape is that both are pure functions of state every client already has: no client
-// tells another who owns what, they agree because they run the same arithmetic over the same
-// inputs. When the real (server-arbitrated) scheme lands, only these two functions change.
+// Enemy simulation ownership is not implemented yet, so what follows is the FALLBACK policy,
+// used only for enemies whose server-assigned owner is not known (no connection, or no
+// assignment yet -- see getEnemyOwnerName() in ../client/enemies.js, which the label reads
+// first). ALL of that fallback lives in enemyOwnerLabel() and the helpers between it and the
+// identity helper that used to sit here (now enemyStableId() in ../client/enemies.js). The
+// point of that shape is that it is a pure function of state every client already has: no
+// client tells another who owns what, they agree because they run the same arithmetic over the
+// same inputs. When the real (server-arbitrated) scheme lands, only this fallback stops being
+// used.
 //
 // Contract, in the order the invariants build on each other:
-//   1. enemyStableId() gives the same enemy the same id on every client.
+//   1. enemyStableId() (../client/enemies.js) gives the same enemy the same id on every client.
 //   2. ownerRoster() gives every client the same roster, in the same order, for the same set
 //      of connected players.
 //   3. enemyOwnerLabel() turns those two into a total, deterministic choice, so two clients
@@ -144,32 +154,10 @@ function ownerRoster() {
 		.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 }
 
-// The enemy's stable identity — the same string on every client for the same enemy.
-//
-// Map-placed enemies are identified by their source spot, `m:<mapPath>#<core.mapId>`. mapId
-// is the index the map file gave the entity (game-map.js: `entry.mapId = parseInt(id)`), so 0
-// is a real id and the test has to be `>= 0`; mapPath is the active map's data path, the same
-// string for everyone. While no map is loaded that path is "" (and the map object can be
-// missing outright, hence `?? "?"`), so ids degenerate to `m:#7` for that frame — harmless,
-// nothing is drawn then, but not something to persist.
-//
-// Anything else was created at runtime. Entity.reConstruct() takes the mapId from the spawn
-// settings and falls back to -1 there, so such enemies only have the local id, `u:<core.uid>`.
-// uid is a per-process counter (`++Entity.globalUid`), which is unique inside one client but
-// NOT correlated across clients — these enemies may show different owners per client until the
-// real ownership scheme lands. (One caveat this test cannot resolve: an entity reconstructed
-// with no settings at all keeps the CoreCmp constructor default mapId 0, which is
-// indistinguishable from a real map id 0 — harmless for enemies, which always come from map
-// data or the spawner.) `?? "?"` is only there so a settings-less entity cannot put the string
-// "undefined" in an id.
-export function enemyStableId(core) {
-	const mapId = core?.mapId;
-	if (typeof mapId === "number" && mapId >= 0) {
-		const mapPath = terra.export.g_game?.map?.active?.path ?? "?";
-		return "m:" + mapPath + "#" + mapId;
-	}
-	return "u:" + (core?.uid ?? "?");
-}
+// The enemy's stable identity moved to ../client/enemies.js (exported there, imported at the
+// top of this file and re-exported below): this overlay labels the ids that module builds, so
+// the two cannot drift apart. See the identity note there for what the ids mean and why
+// anything without a map id only has a client-local one.
 
 // SWAP-POINT: which player owns this enemy. Rendezvous ("highest random weight") hashing:
 // every roster member scores hash(enemyId|key) and the highest score wins. Each client has
@@ -220,9 +208,13 @@ function getLiveEnemy(core) {
 	return enemy;
 }
 
-// owner / state / running action. Both enemy fields can legitimately be null.
+// owner / state / running action. Both enemy fields can legitimately be null. The owner is the
+// server's assignment whenever we know it (offline / not yet assigned falls back to the local
+// rendezvous label below), so with the feature on this reads the same answer the enemy-sync
+// module acts on.
 function buildLabel(core, enemy) {
-	const owner = enemyOwnerLabel(enemyStableId(core));
+	const id = enemyStableId(core);
+	const owner = getEnemyOwnerName(id) ?? enemyOwnerLabel(id);
 	const state = cleanText(enemy.currentState?.name) ?? "-";
 	const action = cleanText(core.ent?.actor?.actionState?.sequence?.name);
 	return action ? `${owner}\n${state}\n${action}` : `${owner}\n${state}`;
@@ -313,6 +305,6 @@ class EnemyDebug {
 	}
 }
 
-export { EnemyDebug, EnemyDebugGui };
+export { EnemyDebug, EnemyDebugGui, enemyStableId };
 
 //# sourceURL=/mods/terra-together/debug/enemy-debug.js

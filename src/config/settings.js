@@ -48,6 +48,14 @@ export const REVIVE_OPTION = "tt-revive";
 // Host-authoritative area-heal toggle ("Estus Heals Allies"). Off by default.
 export const ESTUS_OPTION = "tt-estus-share";
 
+// Enemy sync: the client-side identity + ownership bookkeeping in src/client/enemies.js
+// (Phase 1: it announces the enemies this client can see and records which client the server
+// assigned to simulate each one — it changes no enemy behaviour). Defaults ON: on its own it
+// is harmless, and it is what makes the assignment known to everyone. src/client/enemies.js
+// reads this key as a literal for the same cycle reason ../debug/enemy-debug.js does — do not
+// rename it.
+export const ENEMY_SYNC_OPTION = "tt-enemy-sync";
+
 export function isReviveEnabled() {
 	return terra.export.g_options?.get(REVIVE_OPTION) === true;
 }
@@ -233,6 +241,18 @@ export function createModSettings() {
 	// Mirror the stored host preference into the runtime flag at start-up.
 	syncRevive();
 	syncEstusShare();
+
+	// Enemy sync (src/client/enemies.js): identity + ownership bookkeeping only, so it is on
+	// by default — switching it off makes that module completely inert (it then reports no
+	// enemies and knows no owners). Per-machine, like the other client-side toggles: the
+	// assignment itself is the server's, not a setting.
+	createOption(ENEMY_SYNC_OPTION, {
+		category: CATEGORY,
+		local: true,
+		label: { en_US: "Enemy Sync" },
+		description: { en_US: "Let the server decide which player simulates each enemy, so the work is split between players instead of every client simulating everything.\n\nSafe to leave on: this only shares enemy identity and ownership." },
+		type: { default: true, type: "CHECKBOX" }
+	}, "CHECKBOX");
 
 	// === Connection ===
 

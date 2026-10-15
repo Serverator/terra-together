@@ -8,13 +8,16 @@
  *   - Build the feature modules (../features/revive.js, ../features/area-heal.js) with
  *     their host callbacks, then inject the collaborators session.js cannot import back.
  *   - Re-export the public API (../main.js and ../config/settings.js consume it).
- * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send
+ * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send,
+ *   addPeerMessageHandler
  * Engine touchpoints: terra.export.{Observable,System,g_scene,g_options,g_game},
  *   terra.addAddon (onGameMapStart 35000, onLoopStart 35000), System.prototype.setWindowFocus
  * Notes: keep this file thin — it orchestrates only. The peer maps/connection live in
  *   ./session.js, the snapshot ends in ./snapshot.js, the peer actors in ./actors.js and
  *   the fx/sound/projectile sync in ./fx-sync.js. Module graph (DAG):
- *   session <- fx-sync <- actors <- snapshot <- client.
+ *   session <- fx-sync <- actors <- snapshot <- client; the enemy identity/ownership
+ *   bookkeeping in ./enemies.js also imports this file (for send()), which is why its
+ *   inbound type is routed through the handler table below instead of an import.
  *   The collaborators handed to initSession() are the ones session.js cannot import
  *   without closing a cycle (it is the leaf) and mirror the host-callback shape the
  *   feature modules already use.
@@ -67,6 +70,15 @@ const areaHealer = new AreaHealer({
 	reviveLocal: () => reviver.reviveLocal(),
 });
 
+// Inbound handlers for the message types a module owns but this file must not import: a
+// module that imports ./client.js for send() cannot be imported back without closing a
+// module cycle, so it registers its handler here at load time (./enemies.js does this for
+// MSG.ENEMY_OWNER -- see its own note). Keyed by message type.
+const peerMessageHandlers = new Map();
+export function addPeerMessageHandler(type, handler) {
+	peerMessageHandlers.set(type, handler);
+}
+
 // Hand ./session.js the collaborators it must not import (see the header / its own header).
 initSession({
 	isHosting,
@@ -79,6 +91,10 @@ initSession({
 			reviver.onMessage(msg);
 		else if (msg.type === MSG.AREA_HEAL)
 			areaHealer.onMessage(msg);
+		else
+			// A type owned by a module outside this composition root (see the note on the
+			// handler table above).
+			peerMessageHandlers.get(msg.type)?.(msg);
 	},
 	onConnectionReset: () => {
 		reviver.onConnectionReset();

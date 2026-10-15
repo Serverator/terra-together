@@ -7,7 +7,7 @@
  *     each registers its own addon at import time).
  *   - Multiplayer addon: option observer, profile send, revive/estus host sync,
  *     always-focused, auto-host, and installing the logo-skip patch.
- *   - Register the SettingsTab and EnemyDebug addons.
+ *   - Register the SettingsTab, EnemyDebug and EnemySync addons.
  * Public surface: none (side effects only; seeds window.terraTogether)
  * Engine touchpoints: terra.addAddon, terra.export.Observable, g_options, g_party,
  *   g_system, GAME_CONF, OPTION_EVENT; window.terraTogether.steps (+ the globals the
@@ -25,6 +25,7 @@ import * as server from './server/server.js';
 // Imported for its side effect only: registers the Nameplates addon.
 import "./features/nameplates.js";
 import { EnemyDebug } from './debug/enemy-debug.js';
+import { EnemySync } from './client/enemies.js';
 import { installLogoSkip, skipLogosNow } from './features/logo-skip.js';
 
 window.terraTogether ??= {};
@@ -149,6 +150,10 @@ class Multiplayer extends terra.export.Observable {
 // blur 990), so -10000 runs before the menus/title screen exist and 40000+ after. Do not
 // renumber.
 terra.addAddon(new Multiplayer(), { onAddonInit: -10000, onLoopStart: -10000, onGameMapStart: 35000 });
+// Enemy identity/ownership bookkeeping (src/client/enemies.js): 35010, just after
+// MultiplayerClient (src/client/client.js, onGameMapStart 35000), so the room this client is
+// in has already been announced (MSG.JOIN_MAP) by the time its enemies are registered.
+terra.addAddon(new EnemySync(), { onGameMapStart: 35010, onPreUpdate: 35010, onPostUpdate: 35010 });
 // 40000: after the game's own loop-start hooks, so MainMenu already exists.
 terra.addAddon(new SettingsTab(), { onLoopStart: 40000 });
 // Enemy debug overlay: 50001, just after the nameplates (50000, features/nameplates.js)
