@@ -176,7 +176,6 @@ export function createModSettings() {
 
 	// Host-authoritative boolean: drinking your flask also heals nearby players. Off by default.
 	const estusShareOption = createOption(ESTUS_OPTION, {
-		header: "Gameplay",
 		category: CATEGORY,
 		local: true,
 		label: { en_US: "Estus Heals Allies" },

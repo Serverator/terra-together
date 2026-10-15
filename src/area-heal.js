@@ -68,11 +68,6 @@ class AreaHealer {
 		window.terraTogether.areaHealConfig = CONFIG;
 	}
 
-	debug(...args) {
-		if (window.terraTogether?.areaHealDebug)
-			console.debug("[TT heal]", ...args);
-	}
-
 	// ---- addon hooks --------------------------------------------------------
 
 	onLoopStart() {
@@ -150,8 +145,6 @@ class AreaHealer {
 		else {
 			console.warn("[TT heal] PlayerCmp.handleItemUse not found; full-HP flask use stays blocked.");
 		}
-
-		console.debug("[TT heal] estus area-heal hooks installed (enabled=" + enabled() + ")");
 	}
 
 	onPreUpdate() {
@@ -223,7 +216,6 @@ class AreaHealer {
 		}
 		this.pending = { params, hot, data };
 		this.wait = 0;
-		this.debug("pending area heal", data, hot ? "waiting for HoT" : "immediate");
 		if (!hot)
 			this.flush();
 	}
@@ -238,7 +230,6 @@ class AreaHealer {
 			return;
 		const { amount, duration } = pending.data;
 		this.host.send?.({ type: "area_heal", from: this.host.getLocalId?.(), amount, duration });
-		this.debug("sent area heal", amount, duration);
 	}
 
 	// ---- incoming -----------------------------------------------------------
@@ -274,7 +265,6 @@ class AreaHealer {
 			catch (err) { console.warn("[TT heal] revive failed:", err); }
 			const instant = Math.max(0, params.currentHP - before);
 			healAmount = Math.max(0, amount - instant);
-			this.debug("downed ally: revived for", instant, "-> estus HoT", healAmount);
 		}
 
 		try {

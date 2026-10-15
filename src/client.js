@@ -123,6 +123,14 @@ const activeSyncedSounds = new Map();
 // dropped while apart.
 const activePersistentFx = new Map();
 
+// Groups the peer *ghost* can spawn on its own through player-side run logic (the sprint /
+// float glow). Those local copies are never owner-reported, so nothing else removes them and
+// they stick after the owner stops. We clear any fx in these groups that we did not spawn
+// from the sync (see clearUntrackedRunFx).
+const RUN_FX_GROUPS = ["playerRunFx", "__runFX__"];
+// Ghost XY speed below which the owner counts as "not running" (used to drop a stale run glow).
+const RUN_FX_SPEED_EPS = 0.15;
+
 // Effects aligned to a figure-indexed node fall back to the entity center when
 // the peer's figure lacks that index; clamp to the base figure so they land on it.
 function clampAlignToFigure(ent, align) {
@@ -295,8 +303,6 @@ function installRogueSeedHook() {
 	g.startRun = function (seed) {
 		// The game treats 0/null as "random"; prefer a running peer's seed instead.
 		const effective = seed || getPeerRogueSeed() || null;
-		if (effective && window.terraTogether?.rogueDebug)
-			console.debug("[TT rogue] adopting peer seed", effective);
 		return originalStartRun.call(this, effective);
 	};
 }
@@ -414,6 +420,12 @@ class MultiplayerClient extends terra.export.Observable {
 
 	onPostUpdate() {
 		sendPlayerData();
+		// The ghost can spawn its own run glow during its entity update(), which runs after
+		// movePlayerActor — strip it again here, before draw, so it never shows.
+		for (const actor of playerActors.values()) {
+			if (actor?.core?.isVisible?.() && !actor.terraTogether?.fxHidden)
+				clearUntrackedRunFx(actor);
+		}
 	}
 
 	// Clear peer actors when entering a new map.
@@ -654,8 +666,6 @@ class MultiplayerClient extends terra.export.Observable {
 						const tied = client && !soundSyncSuppress && this.path &&
 							isSyncableBus(this.settings?.type) &&
 							(isPlayerTied(args[0]?.targetRes?.entity) || isPlayerTied(ctxEnt));
-						if (window.terraTogether?.soundDebug)
-							console.debug("[TT sound]", this.path, "bus=" + (this.settings?.type?.bus ?? "?"), "tied=" + tied, "suppress=" + soundSyncSuppress);
 						if (tied) {
 							const id = ++soundSyncId;
 							playback._ttSoundId = id;
@@ -684,8 +694,6 @@ class MultiplayerClient extends terra.export.Observable {
 						const tied = client && !soundSyncSuppress && this.cacheKey &&
 							isSyncableBus(this.type) &&
 							(isPlayerTied(args[0]?.targetRes?.entity) || isPlayerTied(ctxEnt));
-						if (window.terraTogether?.soundDebug)
-							console.debug("[TT event]", this.cacheKey, "bus=" + (this.type?.bus ?? "?"), "tied=" + tied, "suppress=" + soundSyncSuppress);
 						if (tied) {
 							const id = ++soundSyncId;
 							instance.playback._ttSoundId = id;
@@ -1128,7 +1136,7 @@ function send(data) {
 
 // Spawn one synced fx on a peer actor from a descriptor sent by its owner. Shared by the
 // one-shot globalFx path and the persistent-fx reconcile below.
-function spawnRemoteFx(actor, fxState) {
+function spawnRemoteFx(actor, fxState, source = "oneshot") {
 	if (!fxState?.effect)
 		return null;
 
@@ -1160,14 +1168,35 @@ function spawnRemoteFx(actor, fxState) {
 	// Mark this spawn as a peer replay: its screen-global steps (vignette/blur/shake) are
 	// suppressed so they don't affect the local player's screen.
 	fx._ttRemotePending = true;
+	fx._ttSynced = true;
 	fx.start(fxState.duration);
 	return fx;
+}
+
+// Remove run-glow fx the *ghost* spawned through its own player-side logic (the peer actor
+// ends up running PlayerCmp show/dash/float code, which spawns sprint/float fx locally).
+// Those copies are not owner-reported, so no stop ever arrives for them and they outlive the
+// owner's run. Only untagged fx are cleared, so the synced copies (tagged in spawnRemoteFx)
+// are left alone. This runs per visible frame and is cheap (a handful of subscribers).
+function clearUntrackedRunFx(actor) {
+	const watcher = actor?.core?.broadcast;
+	if (!watcher?.list)
+		return;
+	for (let i = watcher.list.length - 1; i >= 0; i--) {
+		const entry = watcher.list[i];
+		if (!(entry instanceof terra.export.FxEntity))
+			continue;
+		if (entry._ttSynced || !RUN_FX_GROUPS.includes(entry.attachGroup))
+			continue;
+		watcher.removeIdx(i, entry);
+		try { entry.stop(0, false); } catch (e) { /* already gone */ }
+	}
 }
 
 // Keep a peer's lasting (infinite) fx in step with the owner's current snapshot: spawn the
 // ones we're missing (e.g. a debuff gained while they were away) and stop the ones they no
 // longer have. The owner re-sends the snapshot every frame.
-function reconcilePersistentFx(actor, list) {
+function reconcilePersistentFx(actor, list, running) {
 	const map = actor.terraTogether.fxMap;
 	const prev = actor.terraTogether.persistentIds ?? new Set();
 	const next = new Set();
@@ -1175,13 +1204,18 @@ function reconcilePersistentFx(actor, list) {
 	for (const fxState of list ?? []) {
 		if (fxState?.id == null || !fxState.effect)
 			continue;
+		// The sprint/float glow only exists while the owner is actually running. If the ghost
+		// isn't moving, treat run-group entries as absent — the owner can otherwise keep
+		// reporting a stale run fx that it never stopped.
+		if (!running && RUN_FX_GROUPS.includes(fxState.group))
+			continue;
 		next.add(fxState.id);
 		// Already shown (matched by id, whether spawned here or by the one-shot globalFx
 		// path): leave the live instance alone.
 		const existing = map[fxState.id];
 		if (existing && !existing.hasEnded?.())
 			continue;
-		const fx = spawnRemoteFx(actor, fxState);
+		const fx = spawnRemoteFx(actor, fxState, "persist");
 		if (fx)
 			map[fxState.id] = fx;
 	}
@@ -1236,15 +1270,21 @@ function createPlayerActor(id) {
 	actor.actorExt.actorFx.dust = terra.export.g_fxConnect.effects.dust.entries.ActorM;
 	actor.actorExt.actorFx.sound = terra.export.g_fxConnect.sounds.actor.entries.Cloth1;
 
-	// Client-side step sound/fx is inconsistent, so suppress it for peer actors and
-	// replay from the server instead. TODO: visual fx can still get lost.
+	// Client-side movement fx is inconsistent and, worse, the ghost never settles: it is
+	// driven by teleported position, so `move.acceleration`/`runStopTimer` can latch. The
+	// POST_MOVE run glow (actor-fx.js:77-89, group "__runFX__") is spawned per-observer from
+	// that local state and then never stops, so it sticks after the owner stops running.
+	// STEP dust is likewise unreliable. Both are replayed from the owner instead — the run
+	// glow is an infinite fx synced through globalFx/persistentFx — so don't let the ghost
+	// produce its own. TODO: visual fx can still get lost.
+	const ACTOR_FX_TYPE = terra.export.ACTOR_FX_TYPE;
 	let originalOnPostMove = actor.actor.onPostMove;
 	actor.actor.onPostMove = function (...args) {
 		const originalOnActorFx = this.fxCallback?.onActorFx;
 
 		if (originalOnActorFx) {
 			this.fxCallback.onActorFx = function (core, type, vary) {
-				if (type === terra.export.ACTOR_FX_TYPE.STEP || type === terra.export.ACTOR_FX_TYPE.STEP_2) {
+				if (type === ACTOR_FX_TYPE.STEP || type === ACTOR_FX_TYPE.STEP_2 || type === ACTOR_FX_TYPE.POST_MOVE) {
 					return;
 				}
 				return originalOnActorFx.call(this, core, type, vary);
@@ -1347,8 +1387,13 @@ function movePlayerActor(id, state) {
 	}
 
 	// Rebuild our lasting fx the peer missed while we were apart (e.g. a debuff gained
-	// while away), and drop the ones they no longer report.
-	reconcilePersistentFx(actor, state.persistentFx);
+	// while away), and drop the ones they no longer report. Run-group fx are additionally
+	// dropped when the ghost isn't moving, in case the owner never stopped reporting them.
+	const moveVel = actor.move?.vel;
+	const running = !!moveVel && moveVel.lengthXY() > RUN_FX_SPEED_EPS;
+	reconcilePersistentFx(actor, state.persistentFx, running);
+	// Strip the ghost's own sprint/float glow (it runs player-side run logic locally).
+	clearUntrackedRunFx(actor);
 
 	for (const windbox of state.windboxes ?? []) {
 		let handle = terra.export.g_windboxManager.add();
@@ -1631,7 +1676,10 @@ function sendPlayerData(forceSend = false, scene = null) {
 	// apart. Ended instances are pruned here as a backstop.
 	const persistent = [];
 	for (const [id, entry] of activePersistentFx) {
-		if (!entry.fx || entry.fx.hasEnded?.()) {
+		// Drop entries whose fx is gone, reused for another fx, ended, or already stopping: an
+		// infinite fx has duration -1 while alive and stop() sets it to 0. `_ttFxId` is an
+		// identity check so a pooled FxEntity recycled for a new fx can't keep an old id alive.
+		if (!entry.fx || entry.fx._ttFxId !== id || entry.fx.hasEnded?.() || !(entry.fx.duration < 0)) {
 			activePersistentFx.delete(id);
 			continue;
 		}

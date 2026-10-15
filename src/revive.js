@@ -20,6 +20,7 @@
 export { Reviver };
 
 const COMBATANT_STATE_ALIVE = terra.export.COMBATANT_STATE?.ALIVE ?? 0;
+const Vec3 = terra.export.Vec3;
 // Frame delta is clamped so a hitch (or an unpause) can't fast-forward the timers.
 const MAX_DT = 0.1;
 
@@ -31,14 +32,16 @@ const CONFIG = {
 	hpFactor: 0.25,    // HP fraction restored on revive
 	cooldown: 1,      // seconds before a reviver can start another revive
 	resend: 0.02,     // min progress change between revive-progress updates
-	decay: 3.0,       // progress lost per second when nobody is reviving (0 = instant reset)
+	decay: 3.5,       // progress lost per second when nobody is reviving (0 = instant reset)
 	reviveHold: 0.6,  // how long one progress update keeps the incoming bar alive
-	moveFactor: 0.5,  // revive speed multiplier while the reviver is moving (0.5 = twice as slow)
-	moveSpeed: 0.2,   // world units/sec below which the reviver counts as standing still
+	moveFactor: 0.6,  // revive speed multiplier while the reviver is moving (0.5 = twice as slow)
+	moveSpeed: 0.3,   // world units/sec below which the reviver counts as standing still
 	// Ground ring shown on each downed teammate so helpers can see where to stand.
 	// Set to null to disable. Any "FX:<sheet>#<name>" key works, e.g.
 	// "FX:combat.targeting#circle3".
-	ringEffect: "FX:combat.targeting#circle3",
+	ringEffect: null,
+	ringScale: 1.5,     // ring size multiplier (1 = the effect's native size)
+	ringZOffset: -0.1,  // world units to drop the ring toward the ground (negative = lower)
 };
 
 // The infinite red blink loop the engine spawns on death (combatant-cmp.js:985). We
@@ -98,11 +101,6 @@ class Reviver {
 
 		window.terraTogether ??= {};
 		window.terraTogether.reviveConfig = CONFIG;
-	}
-
-	debug(...args) {
-		if (window.terraTogether?.reviveDebug)
-			console.debug("[TT revive]", ...args);
 	}
 
 	// Fraction of bleed-out time left (0..1), or null when not downed.
@@ -243,7 +241,6 @@ class Reviver {
 		// loops forever and is local to us, so drop it: we are staying alive, not dying.
 		terra.export.FxEntity?.clearEntity?.(playerCmp.ent?.core, BLINK_GROUP, 0, false);
 		this.dropEnemyAggro();
-		this.debug("downed for", CONFIG.bleedOut, "s");
 		return true;
 	}
 
@@ -266,7 +263,6 @@ class Reviver {
 		catch (err) {
 			console.warn("[TT revive] revive failed:", err);
 		}
-		this.debug("revived");
 	}
 
 	// No ally could save us: hand back to the vanilla death (checkpoint reload).
@@ -281,7 +277,6 @@ class Reviver {
 	hardDeath(reason) {
 		const playerCmp = terra.export.g_player?.entity?.player;
 		this.stopDowned(false);
-		this.debug(reason, "-> checkpoint");
 		if (!playerCmp)
 			return;
 		try {
@@ -415,7 +410,6 @@ class Reviver {
 		}
 		if (frac >= 1) {
 			this.host.send?.({ type: "revive", target: this.target });
-			this.debug("revived peer", this.target);
 			this.resetReviver();
 			this.cooldown = CONFIG.cooldown;
 		}
@@ -463,17 +457,22 @@ class Reviver {
 			if (!effect)
 				return null;
 			const align = terra.export.ENT_ALIGN;
-			// Anchor to the peer's feet so the ring sits on the ground under them.
-			const fx = effect.spawnEntity(actor, align?.Z_BASE ?? 0);
+			// Anchor to the peer's feet, nudged down toward the ground (the effect hovers),
+			// and scaled up a touch so it reads as a ground marker.
+			const offset = CONFIG.ringZOffset
+				? new Vec3(0, 0, CONFIG.ringZOffset)
+				: undefined;
+			const fx = effect.spawnEntity(actor, align?.Z_BASE ?? 0, offset);
 			if (!fx)
 				return null;
+			if (CONFIG.ringScale && CONFIG.ringScale !== 1)
+				fx.scale = CONFIG.ringScale;
 			fx.setTarget2Entity?.(actor, align?.CENTER ?? 0);
 			fx.setGroup(RING_GROUP);
 			fx.start(-1);
 			return fx;
 		}
 		catch (err) {
-			this.debug("ring fx failed:", err);
 			return null;
 		}
 	}
