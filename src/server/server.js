@@ -7,8 +7,8 @@
  *   - Push host-authoritative settings (revive, estus-share) on change.
  *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients, and
  *     enemy_state to other clients once its entries are checked against the arbiter, and
- *     enemy_handoff, enemy_despawn and enemy_respawn to other clients with the sender's id stamped
- *     on them.
+ *     enemy_handoff, enemy_despawn, enemy_respawn and enemy_hit to other clients with the
+ *     sender's id stamped on them.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
  *     publish it, re-arbitrating when a room's membership changes.
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
@@ -20,7 +20,7 @@
  *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
  *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
  *     every inbound type is matched through MSG.*, so an unknown type falls to the default
- *     branch and is dropped. The direction table for all 19 types is documented there.
+ *     branch and is dropped. The direction table for all 20 types is documented there.
  *   - Enemy-sync ownership is arbitrated here, never simulated: the server is a single
  *     process, so its assignment is the consensus (see src/server/enemy-ownership.js). A
  *     client registers the map-placed enemies it can see and the server answers with the
@@ -51,7 +51,10 @@
  *     validate() would drop the very message that removes a ghost (see the MSG.ENEMY_DESPAWN
  *     case). enemy_respawn is relayed on that same coop trust for the mirror-image reason: it is
  *     not about an enemy at all, but about the map's whole population having been reset by a rest
- *     (see the MSG.ENEMY_RESPAWN case).
+ *     (see the MSG.ENEMY_RESPAWN case). enemy_hit is relayed on that same coop trust for the same
+ *     shape of reason: any client may hit any enemy, so there is no ownership claim in it to
+ *     validate -- the sender is never the owner of the enemies in the frame (see the
+ *     MSG.ENEMY_HIT case).
  *   - Ordering: each send is one synchronous socket.write, so per-connection order is
  *     preserved, but there is no rate limiting, batching or backpressure -- inbound
  *     traffic is paced by the clients' own tick (see src/client/snapshot.js).
@@ -551,6 +554,34 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// The sender's own claim is never relayed -- the socket identity is the id the
 						// recipients log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF / ENEMY_DESPAWN cases.
 						msg.from = playerId;
+						broadcast(msg, socket);
+						break;
+					}
+
+					case MSG.ENEMY_HIT: {
+						// A hit that landed on an enemy the SENDER does not simulate: its local damage is
+						// suppressed on its own side, so the hit has to be applied by whoever owns that
+						// enemy (src/client/enemies.js onEnemyHit, queued by the onHit seam in
+						// src/client/enemy-puppet.js). Relayed on the same coop trust as revive/area_heal:
+						// ANY client may hit any enemy, so there is nothing about an ownership claim here
+						// for the arbiter to validate -- and the sender is, by construction, never the
+						// owner of the enemies in the frame. The recipient is what makes it safe: it
+						// applies an entry only to an enemy it holds itself, and only once. Batched per
+						// frame like ENEMY_STATE. Wire shape (frozen): { owner, list: [{ id, attacker,
+						// dmgFactor, element, weaponKey, level, impact, fly, fx, triggerFactor,
+						// statusFactor, spGain, hints, hitPause, hitPoint, hitVel, hitDir, hitRotDir,
+						// part, ranged }] }.
+						const hitList = Array.isArray(msg.list) ? msg.list : null;
+						if (netDebugEnabled())
+							netDebug(`in enemy_hit from=${shortId(playerId)} entries=${hitList === null ? 0 : hitList.length}`);
+						// Nothing to apply: no frame, in particular no empty one (the same rule as the
+						// handoff/despawn cases above).
+						if (hitList === null || hitList.length === 0)
+							break;
+						// The sender's own claim is never relayed -- the socket identity is the id the
+						// recipients attribute the hit to, exactly as in the ENEMY_STATE / ENEMY_HANDOFF /
+						// ENEMY_DESPAWN cases.
+						msg.owner = playerId;
 						broadcast(msg, socket);
 						break;
 					}

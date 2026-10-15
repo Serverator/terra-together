@@ -43,12 +43,35 @@
  *     normal registration diff re-announces and re-splits the enemies. Both ends of a rest ALSO calm
  *     every enemy that was already alive and attacking: a rest leaves a fresh map's whole population
  *     calm, not just the spots that had to be respawned (see calmAllEnemies).
- * Public surface: ENEMY_SYNC_OPTION, enemyStableId, isEnemySyncEnabled, onEnemyOwner,
- *   onEnemyState, onEnemyHandoff, onEnemyDespawn, onEnemyRespawn, isOwner, getEnemyOwnerName,
- *   EnemySync
+ *   - Hit forwarding (Phase 5a), the peer half: a PLAYER hit that lands on an enemy this client only
+ *     PUPPETS has its local damage suppressed (./enemy-puppet.js patch (c)), so the hit is described
+ *     (readHitDescriptor) and queued (onEnemyHitSeam -> pendingHits -> sendHitQueue) for one
+ *     MSG.ENEMY_HIT per frame. Nothing is applied locally: the owner is the only party that writes
+ *     an enemy's HP.
+ *   - Hit application (Phase 5a), the owner half: onEnemyHit rebuilds an equivalent force from the
+ *     forwarded descriptor (getForwardedRig -> applyForwardedHit) and applies it with the engine's
+ *     own `ent.onHit(force, coll)`, so HP, part damage, the hit reaction/stun, the damage FX and the
+ *     hit number all behave exactly as a local hit -- once per hit (recentHits), only for the enemies
+ *     we hold. The peer's whole damage factor AND its resolved attack basis (atk + str, the one
+ *     attacker-side term of the engine's damage formula) are folded onto the rebuilt attacker, so the
+ *     owner's number IS the attacker's number without needing the peer's stat sheet; a status
+ *     condition is the one thing that cannot travel (it is attributed to the attacker's combatant --
+ *     see applyForwardedHit), and the same missing attacker means a forwarded hit grants the attacker
+ *     no SP.
+ *   - Engagement (Phase 5a), the input the reward phase consumes: a LATCH WITH A TTL recording
+ *     which players have engaged each enemy -- the attackers of the hits we applied, the local
+ *     player's own hits on BOTH sides of the split (the ones we applied and the ones we forwarded),
+ *     plus every player inside ENGAGE_RADIUS of an enemy that is in a fight (its own `aggressive`
+ *     field if we simulate it, the owner's carried `aggro` flag if we puppet it). Exposed as
+ *     isEngaged()/engagedPlayers(), per enemy, so Phase 5b never has to re-derive it. The latch is
+ *     not a live flag on purpose: the engine de-aggros an enemy before it grants its rewards.
+ * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, enemyStableId,
+ *   isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn, onEnemyRespawn,
+ *   onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
- *   g_game.map.active.path / g_scene.isRunning / EnemyCmp (and, through it, each enemy's
+ *   g_game.map.active.path / g_scene.isRunning / g_player (the local player's position, for the
+ *   proximity half of engagement) / EnemyCmp (and, through it, each enemy's
  *   sourceEntity.core, which is where identity comes from), plus — for the death half —
  *   EnemyCmp.prototype.onDeathHit (the owner seam, wrapped once) and g_vars (the engine's var
  *   store, which is where the per-spot dead-set lives); for the two Phase 4b halves, additionally
@@ -56,8 +79,12 @@
  *   identity, tested with the engine's own instanceof) plus its flag/enum tables
  *   (ENEMY_SPOT_FLAG / ENEMY_PASSIVE, which say what a spot's enemy should have been),
  *   CombatManager/EnemySpotEntity both reached through terra.export; ./enemy-puppet.js, which owns the
- *   prototype patches and the actual puppet drive; window.terraTogether.playerId / playerNames
- *   (published by ./session.js); performance.now() (the freshness clock). Inbound routing:
+ *   prototype patches and the actual puppet drive; window.terraTogether.playerId / playerNames /
+ *   playerActors (published by ./session.js); performance.now() (the freshness clock). For the
+ *   Phase 5a hit half, additionally ./enemy-puppet.js's setEnemyHitSink/readHitDescriptor (the
+ *   suppressed-hit seam and its wire shape) and the engine's own combat primitives, reached
+ *   through terra.export: DamagerCmp, HitForce, AttackInfo, CombatStats (getAttackStats /
+ *   the level-scaled attack-stat stand-in) and COMBATANT_PARTY. Inbound routing:
  *   ./client.js (see the note at the handler registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
  *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
@@ -75,6 +102,7 @@ import { getRogueInfo, hasPeers } from "./session.js";
 import { MSG } from "../net/protocol.js";
 import {
 	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet, adoptState,
+	readHitDescriptor, setEnemyHitSink,
 } from "./enemy-puppet.js";
 
 // The option key declared in ../config/settings.js (see the header note on why it is a
@@ -140,6 +168,32 @@ const DYING_REMOVE_MS = 3000;
 // an enemy the engine has genuinely left behind, and it is a leak guard on the STREAM, not a guess
 // at the animation: the despawn still normally rides the removal.
 const DYING_STREAM_MAX_MS = 5000;
+
+// How far from an enemy a player counts as engaged with it, in world units, measured on XY like
+// the engine's own proximity tests (enemy-cmp.js:584 player.checkDistanceXY(..., 20) for aggro
+// upkeep, and :1114 aggroNearbyEnemy(this, 8, true) when an enemy aggros). Sam's number, and
+// deliberately a named constant because it is a TUNING knob, not a fact: "Near you can make it as
+// [X], we can adjust it later". 15 is comfortably past melee reach and a couple of boss body
+// widths, while still being "the same fight" for two players standing in it. Phase 5b (rewards)
+// reads engagement through isEngaged()/engagedPlayers() rather than re-deriving a radius, so this
+// one number stays the single definition of near.
+export const ENGAGE_RADIUS = 15;
+
+// How long an engagement sighting stays valid, in milliseconds -- the TTL of the latch isEngaged()
+// reads. Deliberately LONGER than DYING_REMOVE_MS (3000ms) above, which is the longest gap there
+// can be between an enemy's death on its owner and the definitive event (the despawn, or the peer's
+// bounded removal) on a client that did not simulate it: a player whose last sighting was the frame
+// before the killing blow must still be engaged when the reward is decided on that client. 4000
+// leaves a second of slack over the longest gap, and is short enough that a fight which ended long
+// ago is not still "engaged".
+export const ENGAGEMENT_TTL_MS = 4000;
+
+// How long a hit that has already been applied is remembered by its signature, in milliseconds --
+// the exactly-once guard for a re-delivered MSG.ENEMY_HIT frame (onEnemyHit). A duplicate of a
+// frame arrives within the same round trip, while two DISTINCT hits that happen to share every
+// forwarded field are at least an attack animation apart, so a window far below a second
+// separates them without being able to swallow a real second hit.
+const HIT_DEDUPE_MS = 250;
 
 // True while the feature is on. Strict `=== true`, like the overlay's flag test: only a real
 // boolean switches it on, and an option that was never seeded counts as off.
@@ -365,6 +419,39 @@ function clearPeerState() {
 	peerState.clear();
 }
 
+// ─────────────────────────── hit forwarding (Phase 5a) state ───────────────────────────
+
+// Hits this client has seen land on a PUPPET since the last frame, in the wire shape
+// ./enemy-puppet.js readHitDescriptor produces them. One MSG.ENEMY_HIT per frame at most carries
+// them all (sendHitQueue); the hit itself is NOT applied here -- the engine's own application of it
+// was suppressed by the puppet patch, and the enemy's owner is the only party that may write its HP.
+let pendingHits = [];
+
+// The applied forwarded hits, by signature: signature -> the clock reading it was applied at. The
+// exactly-once guard (see onEnemyHit): a frame that arrives twice must not apply its hits twice,
+// and HIT_DEDUPE_MS bounds how long a signature is remembered.
+const recentHits = new Map();
+
+// enemyId -> Map<playerId, atMs>: which players have ENGAGED each enemy, and when each was last
+// seen in that fight (Phase 5a). This is the input the reward phase (5b) consumes, through
+// isEngaged()/engagedPlayers(): a LATCH with a TTL, not a predicate over the enemy's current state
+// -- the engine de-aggros an enemy seven lines before it grants its rewards (see isEngaged).
+// Seeded from the forwarded hits (the owner applied, and the sender queued -- both clients answer
+// for their own player) and from proximity to an enemy that is in a fight (any player, owned or
+// puppeted -- see updateEngagement). Entries live until they age out (ENGAGEMENT_TTL_MS) or the
+// world they belong to goes (clearHitState), and they deliberately OUTLIVE the enemy: a reward is
+// decided after the death, and often only once the despawn arrives.
+const engagement = new Map();
+
+// Drop everything the hit half holds: the hits waiting to be sent for a map we are leaving, the
+// applied-signature memory (whose ids embed the old map path), and the engagement records (which
+// belong to the ownerships that are ending). Part of every reset that also drops the peer state.
+function clearHitState() {
+	pendingHits = [];
+	recentHits.clear();
+	engagement.clear();
+}
+
 // Release one held entity and forget the hold. The single exit from the hold, so the puppet mark
 // and the hold entry can never disagree.
 function releaseHold(id) {
@@ -460,6 +547,9 @@ function syncEnemies() {
 		releaseAllPuppets();
 		clearTakeoverState();
 		dyingOwned.clear();
+		// The hit half holds no world either: a hit waiting to be sent belongs to a map we may have
+		// left, and engagement is ownership bookkeeping (Phase 5a).
+		clearHitState();
 		return null;
 	}
 	const map = activeMapPath();
@@ -945,6 +1035,10 @@ function resetForNewMap() {
 	clearPeerState();
 	releaseAllPuppets();
 	clearTakeoverState();
+	// The hit half goes with the map for the same reason: the ids its records are keyed by all embed
+	// the old map path, and a hit queued while the old map was live must not be sent from the new one
+	// (Phase 5a).
+	clearHitState();
 	// The old map's dying latches and deferred despawns go with the map: the entities they name are
 	// being torn down with it, and neither a stale latch nor a despawn for the old map may survive
 	// into the new one.
@@ -1445,6 +1539,560 @@ export function onEnemyRespawn(msg) {
 		debugLog(`enemy respawn applied for ${map} (announced by ${msg?.from == null ? "?" : msg.from})`);
 }
 
+// ──────────────────── phase 5a: forwarding a hit we cannot apply ────────────────────
+
+// The sink for the suppressed-hit seam (./enemy-puppet.js setEnemyHitSink). It is called for EVERY
+// EnemyCmp.onHit this client sees, with `suppressed` telling the two cases apart:
+//
+//   suppressed === true -- the receiver is a PUPPET, i.e. an enemy another client simulates. Its
+//   local application was skipped, so the hit would simply be lost; it is described here and queued
+//   for this frame's MSG.ENEMY_HIT instead (sendHitQueue), to be applied by its owner through the
+//   engine's own pipeline there. Nothing is applied here. The local player IS recorded as engaged
+//   at this point, though (see the note at the engage() call below): this client has to be able to
+//   answer for its OWN player, and its hit never comes back to it.
+//
+//   ...except for the one enemy that is suppressed yet OURS: an enemy we have been assigned but
+//   have not taken over yet is held as a puppet while the takeover waits for the previous owner's
+//   handoff (see takeOwnership). Forwarding its hit would address it to "its owner", which is US --
+//   and no other client applies an entry for an enemy it does not own, so the hit would be silently
+//   lost. `true` answers "apply this one here after all": the seam then runs the engine's own
+//   application on the live force/coll, which is exact (no rebuild, no lossy round trip), is recorded
+//   as engagement exactly like any other owned hit, and happens ONCE -- adoption applies state, never
+//   a hit, so the takeover cannot replay it.
+//   The residual, stated plainly: if the previous owner's handoff DOES arrive after that hit, the
+//   adoption writes that older state over ours (`applyState` writes hp), undoing the damage locally.
+//   That window is the hold itself (a frame or two in practice, HANDOFF_HOLD_FRAMES at worst), it is a
+//   property of the handoff design rather than of this path, and applying here is still never worse
+//   than losing the hit: whenever the hold expires without a handoff the damage stands, and nothing
+//   re-applies the hit either way.
+//
+//   suppressed === false -- the receiver is an enemy THIS client simulates, and the engine's own
+//   application of the hit is running right after this call. The only thing recorded is that the
+//   local player is now engaged with that enemy: this is the owner's own half of the engagement
+//   record, which a forwarded hit cannot supply (a hit on an enemy we own never leaves this client).
+//   Note the party test: this seam sees hits from EVERYTHING (a hazard, a trap, another enemy, a
+//   party ally), and only a PLAYER-party hit is the local player fighting -- the same distinction
+//   the engine itself makes one line later in the real EnemyCmp.onHit (enemy-cmp.js:1101-1103,
+//   `force.damager.getParty() == COMBATANT_PARTY.PLAYER`). Without it, an enemy walking into its own
+//   map's spikes would count as the local player engaging it.
+//
+// The sink's own behaviour is total: it never throws (a throw would abort the engine's hit delivery
+// on the attacker's side), and it holds nothing. Its return value is read on the suppressed path
+// only, and only for `true` (the "apply it here" answer above); the other paths return undefined.
+function onEnemyHitSeam(ent, force, coll, suppressed) {
+	if (!isEnemySyncEnabled() || !isConnected())
+		return;
+	if (!isPlayerAttack(force))
+		return;
+	if (suppressed) {
+		// Only a wire-addressable enemy can be addressed to an owner: a runtime spawn (`u:<uid>`)
+		// means a different enemy on every client. readHitDescriptor derives the id the same way
+		// readEnemyState does; this is the test the register and state paths use, so what travels is
+		// exactly what the receiving registry can be keyed by.
+		const id = wireEnemyId(ent?.core);
+		if (id === null)
+			return;
+		// Ours-but-not-yet-adopted (the takeover hold): the assignment is already ours and this copy
+		// is the one that will be authoritative, so the hit is applied HERE rather than forwarded to
+		// an owner that would drop it. See the note on this case in the seam contract above.
+		if (isOwner(id)) {
+			engage(id, localPlayerId());
+			return true;
+		}
+		const descriptor = readHitDescriptor(force, coll, ent);
+		if (!descriptor)
+			return;
+		descriptor.id = id;
+		pendingHits.push(descriptor);
+		// The SENDING side records its own player as engaged at send time (5b's constraint: a peer
+		// evaluates ITS OWN player's eligibility, and its hit never comes back to it -- the server
+		// excludes the sender -- so the owner's record of it is not one this client can read). No wire
+		// change is needed for it: the fact is already known here.
+		engage(id, localPlayerId());
+		return;
+	}
+	const id = wireEnemyId(ent?.core);
+	if (id === null || !isOwner(id))
+		return;
+	engage(id, localPlayerId());
+}
+
+// True when this force is a PLAYER's attack, i.e. not a hazard, a trap, an enemy or anything else
+// the world went and did on its own. `getParty()` is the engine's own answer (hit-force.js:277-279:
+// the attack's own party override, else the damager's), and a damager without stats cannot answer
+// at all -- those are not player attacks.
+function isPlayerAttack(force) {
+	if (!force?.damager?.stats)
+		return false;
+	if (typeof force.getParty !== "function")
+		return false;
+	return force.getParty() === (terra.export?.COMBATANT_PARTY?.PLAYER ?? 1);
+}
+
+// The peer half's flush: one MSG.ENEMY_HIT per frame at most, however many hits landed in it.
+// Silent when nothing was queued. Gated on the feature and the connection, not on hasPeers(): a hit
+// is one-shot, so it must not be dropped because the peer set has not been populated yet (the same
+// reasoning as the one-shot despawn, see sendDespawnId). `owner` is our own playerId, which the
+// server overwrites with the id of the socket the frame came from.
+function sendHitQueue() {
+	if (pendingHits.length === 0)
+		return;
+	const list = pendingHits;
+	pendingHits = [];                      // one-shot, whatever happens below
+	if (!isEnemySyncEnabled() || !isConnected())
+		return;
+	send({ type: MSG.ENEMY_HIT, owner: localPlayerId(), list });
+	if (debugEnabled())
+		debugLog(`forwarded ${list.length} hit(s) to their owners: ${list.map((e) => e.id).join(", ")}`);
+}
+
+// ─────────────────── phase 5a: applying a hit forwarded to us ───────────────────
+
+// Inbound MSG.ENEMY_HIT (a client whose hit was suppressed -> server -> everyone but the sender):
+// the description of hits that landed on enemies the SENDER does not simulate. Routed here from
+// ./client.js, and applied by exactly one party -- the enemy's owner.
+//
+// The gates, in order:
+//   * the feature must be on (a disabled module owns nothing and applies nothing);
+//   * the entry must be shaped like a hit (see isForwardedHit) -- a peer's payload must not be able
+//     to break this frame, not even the one it arrives in (the same rule as
+//     onEnemyState/onEnemyHandoff/onEnemyDespawn), and must not be able to invent a damage number
+//     out of a missing field;
+//   * WE must own the enemy (isOwner). This is the gate that makes the type safe: the server
+//     deliberately does not authorise the relay (anyone may hit anything), so the recipient's own
+//     ownership is what decides whether the hit is ours to apply. An entry for an enemy somebody
+//     else owns is dropped, not stored: a hit is an EVENT, not state, and applying it late -- after
+//     the enemy changed hands -- would damage an enemy the sender never hit.
+//   * the hit must not have been applied already. See the signature below.
+//
+// The attacker recorded as engaged is the SERVER-STAMPED sender (msg.owner), not the payload's own
+// `attacker`: both are the same player on an honest client, but the stamped one came off the socket
+// and cannot be forged, and it is also the right answer when the hit came from something else the
+// sender's player owns (a party ally's blow). The payload's field is the fallback for a frame with
+// no stamp at all.
+export function onEnemyHit(msg) {
+	if (!isEnemySyncEnabled())
+		return;
+	const list = msg?.list;
+	if (!Array.isArray(list))
+		return;
+	const now = nowMs();
+	const sender = msg?.owner == null ? null : String(msg.owner);
+	for (const entry of list) {
+		if (!entry || typeof entry !== "object")
+			continue;
+		if (!isForwardedHit(entry))
+			continue;                      // malformed/partial: skipped, never applied with invented values
+		const id = entry.id;
+		if (!isOwner(id))
+			continue;
+		const signature = hitSignature(id, entry);
+		const seen = recentHits.get(signature);
+		if (seen !== undefined && now - seen < HIT_DEDUPE_MS)
+			continue;                      // a re-delivered frame: this hit has already been applied
+		recentHits.set(signature, now);
+		const applied = applyForwardedHit(id, entry);
+		if (debugEnabled()) {
+			debugLog(applied
+				? `hit applied to ${id} (from ${sender ?? entry.attacker ?? "?"}, x${entry.dmgFactor})`
+				: `hit for ${id} dropped: no entity to apply it to`);
+		}
+		const attacker = sender ?? (typeof entry.attacker === "string" && entry.attacker !== "" ? entry.attacker : null);
+		if (attacker !== null)
+			engage(id, attacker);
+	}
+	pruneRecentHits(now);
+}
+
+// Is this entry a hit at all? The frozen payload carries 20 fields; an entry missing the ones the
+// rebuild cannot do without is SKIPPED, never replayed with invented values:
+//   id          which enemy it hit (already tested, but it is the entry's key)
+//   dmgFactor   the damage the peer computed for this hit. Defaulting a MISSING one to 1 would
+//               invent damage the peer never measured, which is exactly the failure mode a
+//               malformed entry must not have.
+//   atk         the attacker's RESOLVED attack basis (atk + str), i.e. the attacker-side term of the
+//               damage the peer computed. There is no safe default for a missing one: guessing a
+//               stand-in from a level is exactly the defect this field replaced, so its absence is a
+//               reason to skip the entry.
+//   hitPoint    where the hit landed: the position of its FX and hit number.
+// Everything else (impact/fly/fx/element/hints/...) only tunes the reaction and degrades to the
+// engine's own AttackInfo/damager defaults, which is what a partial entry can safely mean. A
+// version-skewed sender therefore loses its hits rather than landing wrong ones -- failing closed.
+function isForwardedHit(entry) {
+	if (typeof entry.id !== "string" || entry.id === "")
+		return false;
+	if (typeof entry.dmgFactor !== "number" || !Number.isFinite(entry.dmgFactor))
+		return false;
+	if (typeof entry.atk !== "number" || !Number.isFinite(entry.atk))
+		return false;
+	return Array.isArray(entry.hitPoint) && entry.hitPoint.length >= 3;
+}
+
+// The identity of one forwarded hit, for the exactly-once guard: everything the descriptor carries
+// that distinguishes one hit from the next, including its landing point. A re-delivered frame
+// repeats it exactly, while two distinct hits of the same attack differ in at least their point (or
+// in the attack's own factors), so the guard cannot swallow a real second hit.
+function hitSignature(id, entry) {
+	const point = Array.isArray(entry.hitPoint) ? entry.hitPoint.join(",") : "";
+	return `${id}|${entry.attacker ?? ""}|${entry.part ?? 0}|${entry.dmgFactor}|${point}`;
+}
+
+// Forget signatures older than the dedupe window. Cheap: it walks the map only when a hit arrives.
+function pruneRecentHits(now) {
+	if (recentHits.size === 0)
+		return;
+	for (const [signature, at] of recentHits) {
+		if (now - at >= HIT_DEDUPE_MS)
+			recentHits.delete(signature);
+	}
+}
+
+// The reusable synthetic force this client applies forwarded hits with -- built once, rewritten per
+// hit. The engine's own precedent for exactly this shape is `g_selfDamageForce`
+// (hit-force.js:329-353): one HitForce + AttackInfo pair for the whole process, its fields set per
+// application, because an application is synchronous and nothing outlives it.
+let forwardedRig = null;
+
+// Build the rig, or null on a game build whose combat primitives are not exported (in which case
+// there is nothing to apply a forwarded hit with, and the hit is dropped rather than half-done).
+function getForwardedRig() {
+	if (forwardedRig)
+		return forwardedRig;
+	const exp = terra.export ?? {};
+	const { DamagerCmp, HitForce, AttackInfo } = exp;
+	if (typeof DamagerCmp !== "function" || typeof HitForce !== "function" || typeof AttackInfo !== "function")
+		return null;
+
+	// The force's SOURCE is what supplies the hit direction/velocity to the damage path
+	// (hit-force.js:280-299: getHitVel/getHitDir/getHitRotDir are delegated to it). The real source
+	// is the attacker's act, which this client does not have; these stand-ins return the vectors the
+	// peer measured, so the victim is knocked the same way.
+	const source = {
+		hitVel: [0, 0],
+		hitDir: [0, 0],
+		hitRotDir: [0, 0],
+		getHitVel(dest) { dest.setC(this.hitVel[0], this.hitVel[1]); return dest; },
+		getHitDir(dest) { dest.setC(this.hitDir[0], this.hitDir[1]); return dest; },
+		getHitRotDir(dest) { dest.setC(this.hitRotDir[0], this.hitRotDir[1]); return dest; },
+	};
+	const damager = new DamagerCmp();       // an unregistered, reusable attacker stand-in
+	const force = new HitForce(source);
+	forwardedRig = { source, damager, force, attackInfo: new AttackInfo({}, false) };
+	return forwardedRig;
+}
+
+// The attack-stat stand-in for the forwarded attacker: the SHELL the engine's own factory builds
+// ("an attack-scaled stats set with no combatant" -- no entity, no modifiers, hp/def 1, the party the
+// rebuilt hit is attributed to; the same call TerraActorEntity uses to give an NPC an attacker,
+// terra-actor-entity.js:95), with the FORWARDED attack basis written over the basis the factory would
+// have invented from a level.
+//
+// WHAT THIS DOES AND DOES NOT REPRODUCE. The attacker-side term of the damage formula is the resolved
+// `atk` of CombatParams.calculateDamage (:201, `force.stats.getStat("atk") +
+// force.stats.getStat("str")`) and nothing else -- every other read of `force.stats` in that formula
+// is a modifier lookup, which this stand-in answers with 0 -- so writing the peer's own sum into
+// `base.atk` (with `base.str` left at 0) reproduces the peer's attacker-side term EXACTLY. The
+// owner's `baseDamage` (damage-formula.js) is then the same function of the same atk against ITS OWN
+// defender, which is the authoritative copy -- which is why the resulting number is the peer's:
+//   * exact: the damage factor chain (:95, hit-force.js:108-117) -- the peer's whole
+//     force.getDamageFactor(true) rides on `damager.dmgFactor` while the rebuilt attack info's own
+//     factor is 1, ceiling included.
+//   * exact: the defender-side terms (def, resistances, weakFactor, the part): read from the OWNER's
+//     params/defParams, which is the authoritative copy by construction.
+//   * NOT reproduced: the attacker's MODIFIERS (ARTS_DMG / SNIPER_DMG / CRIT_DMG / STAT_CRIT ...,
+//     :100-171), which live in the attacker's own stats and are deliberately not on the wire -- a
+//     stand-in has none, so those branches contribute nothing.
+//   * NOT reproduced: the engine's own per-application rolls (crit, the +/-5% variance, :187-207).
+//     They are re-rolled on the owner, which is inherent to forwarding a basis rather than a number:
+//     the deterministic part of the damage is the peer's to the bit, the dice are not.
+//   * `params.level` is now irrelevant to the number: the factory only used it to scale the basis we
+//     overwrite, and it is 1 for a player anyway (combat-params.js:44) -- which IS the defect this
+//     replaced, because the wire used to carry that level and every forwarded player hit therefore
+//     landed as a level-1 one.
+function attackStatsFor(atk) {
+	const CombatStats = terra.export?.CombatStats;
+	const party = terra.export?.COMBATANT_PARTY?.PLAYER ?? 1;
+	if (typeof CombatStats?.getAttackStats !== "function" || !Number.isFinite(atk))
+		return null;
+	try {
+		const stats = CombatStats.getAttackStats(1, party);
+		// The forwarded basis, exactly: CombatStats.getStat rounds per stat and the peer's sum is
+		// already an integer, so `atk + 0` is the number the peer's own calculation used.
+		stats.base.atk = atk;
+		stats.base.str = 0;
+		return stats;
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+// Write one forwarded descriptor onto the rig and apply it to `ent` through the ENGINE's own entry
+// point -- TerraActorEntity.onHit (terra-actor-entity.js:252-258 -> EnemyCmp.onHit -> the
+// combatant's damage pipeline: onHit -> onDamage -> getDamage -> dealDamage -> onPreDamage ->
+// reduceHP). That is what makes a forwarded hit behave like a local one: part damage, hp-break,
+// poise/break trackers, the hit reaction/stun, the damage FX, the hit number and a defeat that
+// reaches the engine's own death chain all happen exactly as they do for the owner's own hits. The
+// two things that do NOT are named where they are set below (a status condition, which needs the
+// attacker's combatant, and the attack info's two live-object fields, which cannot be serialised).
+//
+// `coll`: the real coll that hit lives on the attacker and is not serialisable, so it is rebuilt
+// from the one field the pipeline reads from it (`coll.part`, the body part the attack landed on:
+// EnemyCmp.getHitDefense, enemy-cmp.js:750-754, maps it through the enemy's own part list, and the
+// damage FX flash it). `getFlashPart()` is what the engine's own coll answers with for that.
+//
+// Returns false when the hit could not be applied at all (no entity behind the id any more, no
+// rebuild available): the engagement record above still counts it, because the hit did happen.
+function applyForwardedHit(id, entry) {
+	const rig = getForwardedRig();
+	if (!rig)
+		return false;
+	const core = findCoreById(id);
+	const ent = core?.ent;
+	if (!ent || typeof ent.onHit !== "function")
+		return false;
+
+	const { force, damager, attackInfo, source } = rig;
+	const stats = attackStatsFor(entry.atk);
+	if (!stats)
+		return false;
+
+	attackInfo.damageFactor = 1;           // the fold: the peer's factor rides on damager.dmgFactor
+	attackInfo.element = numField(entry.element, 0);
+	attackInfo.impact = numField(entry.impact, 0);
+	attackInfo.fly = numField(entry.fly, 0);
+	attackInfo.fx = numField(entry.fx, 0);
+	attackInfo.triggerFactor = numField(entry.triggerFactor, 1);
+	// statusFactor is CARRIED on the wire (the frozen payload) and deliberately NOT applied here: the
+	// engine's status branch (combatant-cmp.js:861-878) attributes the condition to the ATTACKER's
+	// combatant -- `combatant.params.stats.modifiers` and `statusState.start(this, strength,
+	// combatant, modifier)` on `combatant = force.getCombatant()` -- and a forwarded hit has no
+	// attacker combatant on this client (the peer's player is not an entity here). A non-zero factor
+	// therefore throws inside the engine's own hit delivery (:870), so the effect is dropped rather
+	// than crashed: the damage, the reaction, the FX and the hit number all still land.
+	attackInfo.statusFactor = 0;
+	// spGain travels and is written onto the attack info (the engine's own hit delivery draws it down
+	// as it lands), but it cannot REACH the attacker from here: applying it is
+	// `force.applySpOnHit` -> `applySpGain` -> `force.getCombatant()` (hit-force.js:91-101), and the
+	// stand-in above has no combatant -- the peer's player is not an entity on this client. So no SP is
+	// granted to the attacker for a forwarded hit, for the same missing-attacker reason as statusFactor.
+	attackInfo.spGain = numField(entry.spGain, 0);
+	attackInfo.hitPause = numField(entry.hitPause, 0);
+	attackInfo.hints = Array.isArray(entry.hints) ? entry.hints.slice() : [];
+	// Live engine objects, not data: they cannot travel (see readHitDescriptor's note), and null is
+	// the value the engine's own code guards every use of them with (`if (attackInfo.lock)` etc.).
+	attackInfo.lock = null;
+	attackInfo.details = null;
+	// IMPLICIT for a melee hit: HitForce.reset turns it into MELEE (hit-force.js:66-67), which is
+	// the engine's own defaulting for a non-proxy force. A ranged hit keeps the peer's own answer.
+	attackInfo.attackType = entry.ranged === true ? (terra.export?.ATTACK_TYPE?.RANGED ?? 2) : (terra.export?.ATTACK_TYPE?.IMPLICIT ?? 0);
+
+	// The attacker stand-in, carrying the FORWARDED basis, and the folded factor. A missing/invalid
+	// factor degrades to 1 (the engine's own default for both fields) rather than to 0, which would
+	// mean "this hit does no damage" and quietly delete the hit the peer just made.
+	const factor = numField(entry.dmgFactor, 1);
+	damager.stats = stats;
+	damager.dmgFactor = factor;
+	damager.dmgCeiling = null;             // the peer's ceiling effect is already inside `factor`
+
+	force.reset(damager, attackInfo);
+	// `reset` derives the force's element from the attack info just written (and, for a stats object
+	// whose entity is a player, from the damager's variant instead -- not our case, since the stand-in
+	// has no entity). Setting it explicitly keeps the peer's own reading the one the hit uses.
+	force.element = attackInfo.element;
+	force.forceRanged = entry.ranged === true;
+
+	const point = Array.isArray(entry.hitPoint) ? entry.hitPoint : [];
+	if (force.hitPoint && typeof force.hitPoint.setC === "function")
+		force.hitPoint.setC(numField(point[0], 0), numField(point[1], 0), numField(point[2], 0));
+
+	source.hitVel = wirePair(entry.hitVel);
+	source.hitDir = wirePair(entry.hitDir);
+	source.hitRotDir = wirePair(entry.hitRotDir);
+
+	// The coll, rebuilt from what the wire carries. It is passed to the engine's own hit code, so it
+	// has to answer the two things that code reads from it:
+	//   part           the body part index the attack landed on (this is the VICTIM's own part index:
+	//                  EnemyCmp.getHitDefense maps it through that enemy's part list,
+	//                  enemy-cmp.js:750-754, and the damage FX flash it).
+	//   getFlashPart   what the engine's own coll answers with for the flash part (combatant-cmp.js
+	//                  :829 uses it when no part flash was set by defence).
+	//   core.ent       the one other read on this path: a SHIELD's block-FX alignment
+	//                  (combat-shield.js:130 `blockFxAlign.get(force.hitPoint, coll.core.ent)`). Since
+	//                  the part index above is the victim's, a coll belonging to the victim's own core
+	//                  is the coherent stand-in, and it keeps that engine path from dereferencing
+	//                  nothing.
+	const coll = {
+		part: numField(entry.part, 0),
+		core,
+		getFlashPart() { return this.part; },
+	};
+	ent.onHit(force, coll);
+	return true;
+}
+
+// One numeric wire field, or `fallback` when it is missing/skewed.
+function numField(value, fallback) {
+	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+// An [x, y] wire pair, or a zero pair. The array is stored on the rig's source as-is: it is this
+// client's own parsed payload, and only ever read synchronously by the application right after.
+function wirePair(value) {
+	if (!Array.isArray(value) || value.length < 2)
+		return [0, 0];
+	return [numField(value[0], 0), numField(value[1], 0)];
+}
+
+// ───────────────────────────── phase 5a: engagement ─────────────────────────────
+
+// Record that `playerId` has engaged `enemyId` RIGHT NOW, as a latch: the entry stores when the
+// player was last seen in the fight, and it is refreshed on every later sighting (each proximity
+// pass, each hit). Nothing here ever reads the enemy's live state back -- see isEngaged.
+function engage(enemyId, playerId, at = nowMs()) {
+	if (typeof playerId !== "string" || playerId === "")
+		return;
+	let players = engagement.get(enemyId);
+	if (!players) {
+		players = new Map();
+		engagement.set(enemyId, players);
+	}
+	players.set(playerId, at);
+}
+
+// Has `playerId` engaged `enemyId`? THE reader Phase 5b consumes, and deliberately a LATCH with a
+// TTL rather than a predicate over the enemy's current state:
+//
+//   * It answers from what was RECORDED earlier in the fight (the last sighting inside
+//     ENGAGEMENT_TTL_MS), never from `enemy.aggressive` right now. That is required, not stylistic:
+//     the engine's own death path de-aggros the enemy seven lines before it grants the rewards
+//     (enemy-cmp.js:1122 setAggressive(false, true) -> :1129-1130 giveExp/dropItems), so at the
+//     moment an eligibility question is asked the live flag is already false on both clients.
+//   * The TTL must outlive the gap between a death and the definitive event a peer can act on: on
+//     a client that does not simulate the enemy, the death is only certain when the owner's despawn
+//     arrives, which is up to DYING_REMOVE_MS (3000ms) later. ENGAGEMENT_TTL_MS is 4000, so a
+//     player whose last sighting was the frame before the killing blow is still engaged when that
+//     despawn lands. A shorter window would deny the killer's own reward.
+//   * It is recorded for the enemies this client OWNS and for the ones it puppets, because BOTH
+//     clients evaluate their own player's eligibility (see updateEngagement).
+//
+// False while the feature is off (a disabled module records nothing, and reports nothing).
+export function isEngaged(enemyId, playerId) {
+	if (!isEnemySyncEnabled())
+		return false;
+	const at = engagement.get(enemyId)?.get(String(playerId));
+	return at !== undefined && nowMs() - at < ENGAGEMENT_TTL_MS;
+}
+
+// Every player id engaged with `enemyId` and still inside the TTL, in the order they were first
+// recorded. A fresh array (the caller may keep or sort it), empty for an enemy nobody engaged. This
+// is the reusable shape Phase 5b consumes: it never needs to re-derive a radius or re-read the
+// enemy, and it is the only definition of "engaged" there is.
+export function engagedPlayers(enemyId) {
+	if (!isEnemySyncEnabled())
+		return [];
+	const players = engagement.get(enemyId);
+	if (!players)
+		return [];
+	const now = nowMs();
+	const out = [];
+	for (const [playerId, at] of players) {
+		if (now - at < ENGAGEMENT_TTL_MS)
+			out.push(playerId);
+	}
+	return out;
+}
+
+// Where each player is, as far as this client can know: the local player from its own entity, and
+// each peer from its ghost actor (./actors.js moves it to the position the peer reported, and
+// window.terraTogether.playerActors is ./session.js's live map of them). A player whose actor is
+// not in the world (or has no core yet) simply has no position and is skipped.
+function playerPositions() {
+	const out = [];
+	const me = localPlayerId();
+	const myPos = terra.export.g_player?.entity?.core?.pos;
+	if (me !== null && myPos)
+		out.push([me, myPos]);
+	const actors = window.terraTogether?.playerActors;
+	if (actors) {
+		for (const [id, actor] of actors) {
+			const pos = actor?.core?.pos;
+			if (pos)
+				out.push([String(id), pos]);
+		}
+	}
+	return out;
+}
+
+// XY distance, the engine's own flavour of proximity (enemy-cmp.js:584
+// player.checkDistanceXY(this.ent.core.pos, 20) for aggro upkeep; :1114 aggroNearbyEnemy(this, 8,
+// true)). Height is deliberately not part of it: two players on a ledge above a fight are in it.
+function withinEngageRadius(a, b) {
+	if (!a || !b)
+		return false;
+	const dx = a.x - b.x, dy = a.y - b.y;
+	return dx * dx + dy * dy <= ENGAGE_RADIUS * ENGAGE_RADIUS;
+}
+
+// Is this enemy in a fight, for the proximity rule below? Two sources, one per side of the split:
+//   * an enemy WE simulate: the engine's own flag on the entity (`aggressive`);
+//   * an enemy we PUPPET: the owner's carried `aggro` flag (readEnemyState -> the enemy_state
+//     entry), read through the same gate the peer half applies to state -- it must be the enemy's
+//     CURRENT owner's frame, and a fresh one. This is the one use this module makes of the carried
+//     flag; nothing applies it with setAggressive (see the note on the field in ./enemy-puppet.js).
+function enemyInFight(id, core) {
+	if (isOwner(id))
+		return core?.ent?.enemy?.aggressive === true;
+	const entry = peerState.get(id);
+	if (!entry || entry.from !== currentOwner(id))
+		return false;
+	if (nowMs() - entry.at >= PEER_STATE_FRESH_MS)
+		return false;
+	return entry.state?.aggro === true;
+}
+
+// The per-frame engagement pass, over every live enemy this client holds -- owned OR puppeted,
+// because both clients evaluate their OWN player's eligibility and each can only answer for the
+// enemies it can see:
+//   * PROXIMITY. Sam's rule: "if player comes near enemies after other player already in battle,
+//     they should aggro as well" -- so every player inside ENGAGE_RADIUS of an enemy that is IN A
+//     FIGHT is (re-)recorded, whenever they arrive. Gating on "in a fight" is what stops standing
+//     next to a calm enemy nobody is fighting from counting, and refreshing on every frame is what
+//     keeps a participant's stamp younger than ENGAGEMENT_TTL_MS for as long as the fight lasts.
+//     Height is ignored (see withinEngageRadius).
+//   * THE HITS' OWN SEED is not here: a forwarded hit is recorded when it is applied
+//     (onEnemyHit, owner side) or when it is queued (onEnemyHitSeam, sending side).
+//   * PRUNING is by AGE ALONE -- deliberately not "the enemy is gone" or "we no longer own it".
+//     A record has to survive the enemy's death and the despawn that follows it (see isEngaged), so
+//     dropping it when the enemy leaves would delete exactly the answer Phase 5b asks for. Map
+//     changes, disconnects and the feature going off clear the whole thing (clearHitState).
+function updateEngagement(live) {
+	if (live && live.size > 0) {
+		let positions = null;
+		for (const [id, core] of live) {
+			if (!enemyInFight(id, core))
+				continue;
+			if (positions === null)
+				positions = playerPositions();
+			for (const [playerId, pos] of positions) {
+				if (withinEngageRadius(pos, core.pos))
+					engage(id, playerId);
+			}
+		}
+	}
+	if (engagement.size === 0)
+		return;
+	const now = nowMs();
+	for (const [id, players] of engagement) {
+		for (const [playerId, at] of players) {
+			if (now - at >= ENGAGEMENT_TTL_MS)
+				players.delete(playerId);
+		}
+		if (players.size === 0)
+			engagement.delete(id);
+	}
+}
+
 // ─────────────────────────────── public readers ───────────────────────────────
 
 // True when the local player is the server-assigned simulator of `enemyId`. False for an
@@ -1489,6 +2137,13 @@ addPeerMessageHandler(MSG.ENEMY_STATE, onEnemyState);
 addPeerMessageHandler(MSG.ENEMY_HANDOFF, onEnemyHandoff);
 addPeerMessageHandler(MSG.ENEMY_DESPAWN, onEnemyDespawn);
 addPeerMessageHandler(MSG.ENEMY_RESPAWN, onEnemyRespawn);
+addPeerMessageHandler(MSG.ENEMY_HIT, onEnemyHit);
+
+// The suppressed-hit seam's sink (./enemy-puppet.js setEnemyHitSink): registered here, at load,
+// because the module that owns the wire is the one that must decide what a hit means -- the puppet
+// module only reports the seam. Registering it is harmless while the feature is off (the sink
+// re-tests the option per call), and it must exist before the first hit of the session.
+setEnemyHitSink(onEnemyHitSeam);
 
 // ──────────────────────────────────── addon ────────────────────────────────────
 
@@ -1500,6 +2155,9 @@ addPeerMessageHandler(MSG.ENEMY_RESPAWN, onEnemyRespawn);
 // frame that did it) and then publishes this frame's state for the enemies we own. The diff is
 // silent when nothing changed, so registering still costs one message per identity change; only
 // the state publish is per-frame, and only while there is a peer and something we own to send.
+// Phase 5a adds two more end-of-frame duties to onPostUpdate, both owner-side bookkeeping: the
+// queue of hits this client could not apply (sendHitQueue) and the engagement pass
+// (updateEngagement).
 class EnemySync {
 	onGameMapStart() {
 		resetForNewMap();
@@ -1528,6 +2186,12 @@ class EnemySync {
 		const live = syncEnemies();
 		sendOwnerStates(live);
 		sendHandoffs(live);
+		// Phase 5a, owner side: apply nothing here -- the hits this client could NOT apply left in one
+		// batch (sendHitQueue), and the engagement record is updated for the enemies the frame's diff
+		// has just confirmed are ours (updateEngagement). Both are cheap and silent when there is
+		// nothing to do: an empty queue, and an engagement map walked only while it is non-empty.
+		sendHitQueue();
+		updateEngagement(live);
 	}
 }
 

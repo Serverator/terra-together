@@ -146,14 +146,46 @@
  *                                            when its active map is not the one named. Payload:
  *                                            { from, map, variant }. Client case:
  *                                            MSG.ENEMY_RESPAWN.
+ *   MSG.ENEMY_HIT         "enemy_hit"        client -> server -> all but sender, batched per frame,
+ *                                            from a client whose hit on an enemy was SUPPRESSED
+ *                                            because that enemy is a puppet here: a client cannot
+ *                                            damage an enemy it does not simulate (its local hit
+ *                                            application is suppressed, see the onHit seam in
+ *                                            src/client/enemy-puppet.js), so the hit travels to
+ *                                            whoever IS simulating it and is applied there through
+ *                                            the engine's own hit pipeline (src/client/enemies.js
+ *                                            onEnemyHit). Stamp-then-relay like
+ *                                            ENEMY_HANDOFF/ENEMY_DESPAWN (the server rewrites
+ *                                            `owner` to the sender's id) and like them NOT
+ *                                            entry-validated against the arbiter: ANY client may hit
+ *                                            any enemy, so there is nothing for the ownership check
+ *                                            to authorise here -- the sender is the injured party's
+ *                                            peer by construction, not its owner. The recipient's own
+ *                                            owner-gate is what makes that safe: it applies an entry
+ *                                            only to an enemy it holds itself, and only once. The one
+ *                                            case where a suppressed hit is NOT forwarded is a
+ *                                            suppressor that already owns the enemy it hit (an enemy
+ *                                            held mid-takeover): there the sending client IS the
+ *                                            owner, so it applies the hit itself.
+ *                                            Payload: { owner, list: [ { id, attacker, atk,
+ *                                            dmgFactor, element, weaponKey, impact, fly, fx,
+ *                                            triggerFactor, statusFactor, spGain, hints, hitPause,
+ *                                            hitPoint: [x,y,z], hitVel: [x,y], hitDir: [x,y],
+ *                                            hitRotDir: [x,y], part, ranged } ] }. `dmgFactor` is the
+ *                                            attacker's whole damage factor and `atk` its resolved
+ *                                            attack basis (atk + str), together everything the
+ *                                            engine's damage formula takes from the ATTACKER's side --
+ *                                            the owner resolves them against its own copy of the
+ *                                            defender. Client case:
+ *                                            MSG.ENEMY_HIT.
  *
- * The server's inbound switch has 13 cases: the 9 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
+ * The server's inbound switch has 14 cases: the 10 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
  * REVIVE, REVIVE_PROGRESS, AREA_HEAL forwarded verbatim; ENEMY_STATE forwarded entry-validated;
- * ENEMY_HANDOFF and ENEMY_DESPAWN forwarded with `owner` stamped to the sender; ENEMY_RESPAWN
- * forwarded with `from` stamped to the sender), PROFILE --
+ * ENEMY_HANDOFF, ENEMY_DESPAWN and ENEMY_HIT forwarded with `owner` stamped to the sender;
+ * ENEMY_RESPAWN forwarded with `from` stamped to the sender), PROFILE --
  * answered, not relayed -- and ENEMY_REGISTER / ENEMY_UNREGISTER, which are not relayed but
  * answered with ENEMY_OWNER. The
- * client's dispatch has 16: every type except PROFILE,
+ * client's dispatch has 17: every type except PROFILE,
  * ENEMY_REGISTER and ENEMY_UNREGISTER. The six server-only types (WELCOME, HOST_SETTING,
  * PLAYER_PROFILE, PLAYER_JOINED, PLAYER_LEFT, ENEMY_OWNER) are never accepted from a client -- a
  * client that sends one hits the server's default branch and is dropped, because they describe state
@@ -161,6 +193,6 @@
  * enemy ownership it arbitrates).
  */
 
-export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff", ENEMY_DESPAWN:"enemy_despawn", ENEMY_RESPAWN:"enemy_respawn" };
+export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff", ENEMY_DESPAWN:"enemy_despawn", ENEMY_RESPAWN:"enemy_respawn", ENEMY_HIT:"enemy_hit" };
 
 //# sourceURL=/mods/terra-together/net/protocol.js

@@ -12,7 +12,7 @@
  *     reads — declared here because the client module graph is a DAG rooted at this file.
  *   - Lifecycle: joinServer/leaveServer/disconnect/send + detachClient/clearPeers/
  *     onDisconnected, and the inbound dispatch (MSG.* -> peer state, snapshot ingest,
- *     revive/area-heal/enemy-owner/enemy-despawn/enemy-respawn routing).
+ *     revive/area-heal/enemy-owner/enemy-despawn/enemy-respawn/enemy-hit routing).
  * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send,
  *   hasClient, hasPeers, initSession, getLocalId, getDownedFraction, setLocalDowned,
  *   getPeerDowned, isLocalDowned, getRogueInfo, getPeerRogueSeed, playerActors, playerNames,
@@ -322,7 +322,7 @@ export function joinServer(address, options = {}) {
 				// Types owned by a feature module rather than by this dispatch: the downed/revive
 				// + estus area-heal protocol (../features/revive.js, ../features/area-heal.js)
 				// and the enemy ownership broadcast, state snapshots, ownership handoffs,
-				// death despawns and map-wide respawn resets (../client/enemies.js).
+				// death despawns, map-wide respawn resets and forwarded hits (../client/enemies.js).
 				// ./client.js is the composition root that routes them on.
 				case MSG.REVIVE:
 				case MSG.REVIVE_PROGRESS:
@@ -332,6 +332,7 @@ export function joinServer(address, options = {}) {
 				case MSG.ENEMY_HANDOFF:
 				case MSG.ENEMY_DESPAWN:
 				case MSG.ENEMY_RESPAWN:
+				case MSG.ENEMY_HIT:
 					deps.onPeerMessage(msg);
 					break;
 			}

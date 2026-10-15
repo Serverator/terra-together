@@ -15,7 +15,7 @@
  *     entity this client is about to simulate itself): the per-frame state snapshot and its
  *     application to an entity.
  * Public surface: installPuppetPatches, makePuppet, releasePuppet, isPuppet, readEnemyState,
- *   drivePuppet, adoptState
+ *   drivePuppet, adoptState, readHitDescriptor, setEnemyHitSink
  * Engine touchpoints: terra.export.{EnemySheet, EnemyCmp, ActorCmp, LoopCheckReaction,
  *   ACTOR_FACING, ACTOR_FX_TYPE, Vec2, Vec3, g_game}. Patched seams (all prototypes, all gated on
  *   the ENTITY mark): EnemySheet.updateAction (AI choice/action selection, the one funnel every
@@ -25,6 +25,14 @@
  *   (local damage -> local HP), EnemyCmp.onDeathHit (giveExp/dropItems/rogue.onEnemyKilled/screen
  *   shake/combat.setEnemyDefeated), EnemyCmp.onNotify (scripted reactions can start actions), and
  *   ActorCmp.onPostMove (the per-frame actor-FX sink: step dust/sounds and the run glow).
+ *   The EnemyCmp.onHit seam also REPORTS every hit it sees to a sink registered by
+ *   src/client/enemies.js (setEnemyHitSink, see the hit section below): on a puppet the local
+ *   application stays suppressed and the hit is described for its owner instead, on a locally
+ *   simulated enemy it only tells that module that a hit happened (which is how a player's own hit
+ *   on an enemy it owns counts as engagement), and for the one enemy that is suppressed yet already
+ *   OURS (held mid-takeover) the sink answers "apply it here", so the engine's own application runs.
+ *   The sink changes what the seam does in that last case only, and by running the very call the
+ *   seam was suppressing -- never by applying something of its own.
  * Notes: the AI is NOT switched off; only its decision points are. The puppet keeps ticking --
  *   TerraActor.update -> EnemyCmp.update -> CombatantCmp.update -> AttackerCmp.update ->
  *   ActorCmp.update -> ActionState.update -> postActionUpdate -> EnemyCmp.onPostAction -- because
@@ -35,11 +43,14 @@
  *   non-puppet, and the mark lives on the entity, never on a component:
  *   EnemyCmp/ActorCmp are pooled (EnemyCmp.pooling = true, entity-component reset on bury), so a
  *   component flag would leak into an unrelated later entity; entities are not pooled.
- *   Phase 2 deliberately does NOT forward damage or death: local hits, local HP loss, local
- *   rewards and local defeat bookkeeping are all suppressed rather than mirrored, so nothing on a
- *   peer can diverge from the owner. Applying the peer's `state`/`action` fields is likewise out
- *   of scope -- driving a figure animation is enough to look right, and playing the action would
- *   run local action steps (hitboxes, FX) which is exactly what a puppet must not do.
+ *   Phase 2 deliberately does NOT mirror damage or death: local hits, local HP loss, local
+ *   rewards and local defeat bookkeeping are all suppressed rather than replayed, so nothing on a
+ *   peer can diverge from the owner. Phase 5a keeps that suppression and forwards the hit as a
+ *   DESCRIPTOR instead (readHitDescriptor below): what the owner needs to rebuild the same hit
+ *   through the engine's own pipeline, so the owner remains the only party that writes an enemy's
+ *   HP. Applying the peer's `state`/`action` fields is likewise out of scope -- driving a figure
+ *   animation is enough to look right, and playing the action would run local action steps
+ *   (hitboxes, FX) which is exactly what a puppet must not do.
  * Decompiled refs: enemy-type.js:219 updateAction (choice -> startChoice -> actor.setAction, and
  *   enemy.updateTarget at :234) called from enemy-cmp.js:556 onSceneAggressionStart, :596 update
  *   and :736 onPostAction; enemy-cmp.js:601 checkAutoAggro / :626 -> :1113 triggerAggression /
@@ -263,7 +274,9 @@ function noop() { }
 //   resolveEnt(self, args): where the ENTITY is for this seam. Components carry `.ent`
 //   (entity.js:270 sets it on every component); the EnemySheet/reaction seams take the EnemyCmp as
 //   their first argument and must go through it.
-function patch(proto, name, resolveEnt, apply) {
+//   observe(`ent`, `args`) is called for a NON-puppet receiver, before the original runs. Only the
+//   hit seam passes it (see hitSink below); it observes the call and must change nothing about it.
+function patch(proto, name, resolveEnt, apply, observe = null) {
 	if (!proto || typeof proto[name] !== "function")
 		return false;
 	const original = proto[name];
@@ -272,8 +285,11 @@ function patch(proto, name, resolveEnt, apply) {
 
 	const wrapper = function (...args) {
 		const ent = resolveEnt(this, args);
-		if (!ent || ent[PUPPET_MARK] !== true)
+		if (!ent || ent[PUPPET_MARK] !== true) {
+			if (observe)
+				observe(ent, args);
 			return original.apply(this, args);
+		}
 		return apply.call(this, ent, original, args);
 	};
 	wrapper.__ttPuppetPatched = true;
@@ -315,7 +331,10 @@ export function installPuppetPatches() {
 		// combatant.onHit, which is where local damage, stun, knockback and local death are
 		// decided. Suppressed (not mirrored) in Phase 2, so local HP cannot diverge; the attacker
 		// still counts the hit and its hit-stop (attacker-cmp.js:100-104 ignores our return value).
-		["EnemyCmp.onHit", exp.EnemyCmp?.prototype, "onHit", entOfSelf, noop],
+		// Phase 5a reports the hit to the sink instead (reportSuppressedHit / observeLocalHit), which
+		// is what sends a suppressed (puppet) hit to the enemy's owner and records a local hit as
+		// engagement: this is the last place both `force` and `coll` exist for the hit.
+		["EnemyCmp.onHit", exp.EnemyCmp?.prototype, "onHit", entOfSelf, reportSuppressedHit, observeLocalHit],
 
 		// (d) The death/reward hooks. onDeathHit is the ONLY caller of giveExp (:1129), dropItems
 		// (:1130), rogue.onEnemyKilled (:1128) and of the screen shake + combat.setEnemyDefeated
@@ -337,8 +356,8 @@ export function installPuppetPatches() {
 		["ActorCmp.onPostMove", exp.ActorCmp?.prototype, "onPostMove", entOfSelf, puppetOnPostMove],
 	];
 
-	for (const [label, proto, name, resolveEnt, apply] of table) {
-		if (!patch(proto, name, resolveEnt, apply))
+	for (const [label, proto, name, resolveEnt, apply, observe] of table) {
+		if (!patch(proto, name, resolveEnt, apply, observe ?? null))
 			missing.push(label);
 	}
 
@@ -380,10 +399,194 @@ function puppetOnPostMove(ent, original, args) {
 	}
 }
 
+// ─────────────────────────── the suppressed-hit seam ───────────────────────────
+//
+// A hit that lands on an enemy this client does not simulate is applied by NOBODY locally: seam (c)
+// suppresses `combatant.onHit`, so there is no HP change, no part damage, no hit reaction, no
+// number. Phase 5a fills that hole by describing the hit here -- the last place `force` (the
+// HitForce carrying the damager, the attack info, the hit point/velocity) and `coll` (the coll that
+// hit, and so the body PART the attack landed on) are both alive -- and having
+// src/client/enemies.js send the description to the enemy's owner, which rebuilds an equivalent
+// force and applies it through the engine's own pipeline. Nothing is applied here -- with the single
+// exception of an enemy this client owns but has not taken over yet, where exercising the very call
+// being suppressed is the only way the hit survives (see the sink contract below).
+//
+// The seam takes ONE sink, mirroring the handler table in src/client/client.js, because the module
+// that owns the wire lives on the far side of a module cycle (src/client/enemies.js imports this
+// one). The sink is called for every hit this seam sees:
+//   suppressed === true   the receiver is a PUPPET: its local application was skipped, so the hit
+//                         has to travel to its owner. src/client/enemies.js queues the descriptor.
+//   suppressed === false  the receiver is a normal, locally simulated enemy: the original still
+//                         runs and applies the hit; the call is only an observation, and is what
+//                         lets a player's OWN hit count towards engagement with an enemy it owns.
+//   SUPPRESSED, BUT OURS  an enemy this client already OWNS yet has not taken over (the takeover
+//                         hold, src/client/enemies.js takeOwnership): its hit must not travel to
+//                         "its owner", because this client IS the owner -- every other client drops
+//                         an entry for an enemy it does not own -- and nothing else would apply it.
+//                         The sink answers `true` then, and the engine's own application runs here.
+// No sink is registered until src/client/enemies.js is loaded, and an unregistered sink is a no-op,
+// so the patch installed at map start is completely inert on its own.
+let hitSink = null;
+
+export function setEnemyHitSink(fn) {
+	hitSink = typeof fn === "function" ? fn : null;
+}
+
+// The puppet half of the hit seam. Deliberately returns undefined -- what the previous `noop`
+// patch returned, and what the attacker's own hit accounting expects (attacker-cmp.js:100-104
+// ignores the return value) -- because the hit is normally described for its owner instead of being
+// applied here. The `true` answer is the one exception (see the ownership case above): the hit is
+// applied through the engine's own call, unchanged, and nothing is forwarded for it.
+function reportSuppressedHit(ent, original, args) {
+	if (hitSink && hitSink(ent, args[0], args[1], true) === true)
+		return original.apply(this, args);
+}
+
+// The non-puppet half: the hit is applied by the engine exactly as before, and the sink is told
+// about it. Kept as a separate function from reportSuppressedHit so the two meanings of the sink
+// call stay readable at the seam.
+function observeLocalHit(ent, args) {
+	if (hitSink)
+		hitSink(ent, args[0], args[1], false);
+}
+
+// One number of a wire field, or 0 when the engine field is missing/skewed: every field below comes
+// off a live engine object, and a descriptor is not worth a throw on the attacker's hit path.
+function numOrZero(value) {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+// The attacker's resolved attack basis: the EXACT local `atk` the engine's damage formula computes
+// from its stats, `force.stats.getStat("atk") + force.stats.getStat("str")` (combat-params.js:201 --
+// the one place an attacker's stats enter the damage calculation). It is what the owner resolves its
+// own copy of that formula against, and it has to be read HERE, on the attacker's own client,
+// because that is the only party holding the real stats (equipment, buffs, character level).
+//
+// Why not the LEVEL, which is what the first cut of this phase forwarded: the engine only ever sets
+// CombatParams.level for an ENEMY (the SET_ENEMY_LEVEL step, combatant-steps.js:553). A PLAYER's
+// CombatParams keeps the constructor's default of 1 (combat-params.js:44), and DamagerCmp.getLevel()
+// is exactly `stats.params.level` (damager-cmp.js:223-226) -- so a player's attack reported 1 at every
+// level, and an owner rebuilding from it scaled every forwarded hit by a level-1 stand-in. The
+// resolved basis needs no such reconstruction: it is already the sum the formula wants, and it is
+// the number the peer's own hit used, so no stat block has to travel for it.
+//
+// Null when the stats cannot answer (no stats object, no getStat, a stat that is not a number): the
+// hit is then not described at all rather than applied with invented values.
+function attackBasis(force) {
+	try {
+		const stats = force?.stats;
+		if (!stats || typeof stats.getStat !== "function")
+			return null;
+		const basis = stats.getStat("atk") + stats.getStat("str");
+		return Number.isFinite(basis) ? basis : null;
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+// The wire descriptor of ONE suppressed hit, or null when the hit cannot be described (no entity,
+// no force, no attack info, no damager, no damage factor, or no attack basis). Every field is read
+// defensively: this runs inside the engine's own hit delivery.
+//
+// What travels, and what deliberately does not:
+//   dmgFactor   force.getDamageFactor(true) -- the whole multiplier the peer computed for this hit
+//               (attackInfo.damageFactor, the attacker's dmgCeiling and the damager's dmgFactor
+//               already folded together). The owner needs no attacker stats to reproduce it: it
+//               assigns it to the rebuilt damager's dmgFactor and sets the rebuilt attack info's
+//               damageFactor to 1.
+//   atk         the attacker's RESOLVED attack basis (atk + str), i.e. exactly the attacker-side term
+//               of the damage the peer's own calculation used (see attackBasis). The owner writes it
+//               onto its attacker stand-in, so the number it computes is the number the peer
+//               computed: no stat block travels, and nothing is guessed from a level the engine does
+//               not even expose for a player.
+//   weaponKey   descriptive only (force.stats.weaponKey): carried for logging/debug, the rebuild
+//               does not use it.
+//   element, impact, fly, fx, triggerFactor, spGain, hints, hitPause
+//               the attack info's own scalars/enums, so the rebuilt hit reacts like the original.
+//               `statusFactor` travels too but is deliberately NOT applied by the rebuild (the
+//               engine's status path needs the ATTACKER's combatant, which a forwarded hit does not
+//               have -- see the note in src/client/enemies.js applyForwardedHit).
+//   hitPoint, hitVel, hitDir, hitRotDir, part, ranged
+//               where the hit landed, which way it pushed, which body part it hit, and whether it
+//               was a ranged hit -- all read through the engine's own accessors (getHitVel /
+//               getHitDir / getHitRotDir), so the owner's damage movement and FX match.
+//   NOT carried: `attackInfo.lock` and `attackInfo.details`. Both are live engine objects with
+//               methods (CombatStunModChange / CombatStunDetails), not data: they cannot be
+//               serialised, and a re-built empty one would be worse than none (the engine guards
+//               both with `if (...)`). Their loss is accepted: a stun lock and the pull/z-velocity
+//               details of one hit do not travel. `attackInfo.hitType`, `attackType`, `limiter` and
+//               `guardable` are not carried either -- hitType/limiter would need enum fidelity the
+//               frozen payload does not claim, and `ranged` is what the rebuild turns into an
+//               attackType. See the owner-side rebuild in src/client/enemies.js for what each
+//               omission means there.
+export function readHitDescriptor(force, coll, ent) {
+	const core = ent?.core;
+	if (!core || !ent.enemy || !force || !force.damager || !force.attackInfo)
+		return null;
+
+	const attackInfo = force.attackInfo;
+	const dmgFactor = force.getDamageFactor(true);
+	if (!Number.isFinite(dmgFactor))
+		return null;
+	const basis = attackBasis(force);
+	if (basis === null)
+		return null;
+
+	const stats = force.stats;
+	const tmp = getTmpVec2();
+	const hitPoint = force.hitPoint;
+	// Ranged is the engine's own answer (hit-force.js:243-250: the force's own flag, else whether
+	// the attack's combatant is the damager's own entity). Guarded: it dereferences stats.params.
+	let ranged = false;
+	if (typeof force.isRanged === "function") {
+		try { ranged = force.isRanged() === true; } catch (e) { ranged = false; }
+	}
+
+	return {
+		id: stateId(core, ent.enemy),
+		// The sender's own player id, i.e. whose hit this is. The server stamps the same id over
+		// the frame's `owner` from the socket (src/server/server.js), and the recipient prefers
+		// that stamped id when seeding engagement -- this field is what a recipient can fall back
+		// to, and what makes the payload self-describing.
+		attacker: window.terraTogether?.playerId == null ? null : String(window.terraTogether.playerId),
+		dmgFactor,
+		element: numOrZero(force.element),
+		weaponKey: typeof stats?.weaponKey === "string" ? stats.weaponKey : null,
+		atk: basis,
+		impact: numOrZero(attackInfo.impact),
+		fly: numOrZero(attackInfo.fly),
+		fx: numOrZero(attackInfo.fx),
+		triggerFactor: numOrZero(attackInfo.triggerFactor),
+		statusFactor: numOrZero(attackInfo.statusFactor),
+		// The attack's authored SP gain (attackInfo.spGain), not force.spGain: the latter is the
+		// RUNNING remainder, already drawn down by every target this force has hit so far
+		// (hit-force.js:88-101), so it is not a property of this one hit.
+		spGain: numOrZero(attackInfo.spGain),
+		hints: Array.isArray(attackInfo.hints) ? attackInfo.hints.slice() : [],
+		hitPause: numOrZero(attackInfo.hitPause),
+		hitPoint: hitPoint ? [numOrZero(hitPoint.x), numOrZero(hitPoint.y), numOrZero(hitPoint.z)] : [0, 0, 0],
+		// Each of the three vectors is read into the same scratch Vec2 and copied out immediately:
+		// the engine's own accessors write into the destination they are handed.
+		hitVel: tmp && typeof force.getHitVel === "function" ? wireVec2(force.getHitVel(tmp, coll)) : [0, 0],
+		hitDir: tmp && typeof force.getHitDir === "function" ? wireVec2(force.getHitDir(tmp, coll)) : [0, 0],
+		hitRotDir: tmp && typeof force.getHitRotDir === "function" ? wireVec2(force.getHitRotDir(tmp, coll)) : [0, 0],
+		part: typeof coll?.part === "number" ? coll.part : 0,
+		ranged,
+	};
+}
+
+// [x, y] of a Vec2 the engine just wrote into, or [0, 0] when it wrote nothing.
+function wireVec2(vec) {
+	if (!vec)
+		return [0, 0];
+	return [numOrZero(vec.x), numOrZero(vec.y)];
+}
+
 // ───────────────────────────── OWNER side: snapshot ─────────────────────────────
 //
 // The wire shape, produced here exactly as the contract freezes it:
-//   { id, x, y, z, vx, vy, vz, fx, fy, anim, animTime, hp, state, action }
+//   { id, x, y, z, vx, vy, vz, fx, fy, anim, animTime, hp, state, action, aggro }
 // Numbers are quantised on the way out, because this is built per enemy per frame and every field
 // is a float that carries far more precision than the wire (or the eye) needs:
 //   x/y/z, vx/vy/vz, fx/fy, animTime -> 3 decimals (mm and ms);
@@ -454,6 +657,14 @@ export function readEnemyState(ent) {
 		hp: round4(Math.max(0, Math.min(1, params.getHPRatio ? params.getHPRatio() : 0))),
 		state: enemy.currentState?.name ?? null,
 		action: actor?.actionState?.sequence?.name ?? null,
+		// Whether the enemy is in a fight (enemy-cmp.js:151/:228 `aggressive`, set by :377
+		// setAggressive / :1113 triggerAggression and cleared on kill/death/giveUp/rest). Phase 5a CARRIES it and nothing
+		// more: a recipient deliberately does NOT apply it with setAggressive(), which has
+		// receiver-side side effects -- the attack-frequency registration, the navDanger handle, the
+		// HUD and actorFx.range -- and is the OWNER's decision to make. It is here so a peer (and the
+		// debug overlay) can tell an enemy that is being fought from one standing idle, which is the
+		// input the engagement/proximity rule in src/client/enemies.js reads on the owner side.
+		aggro: enemy.aggressive === true,
 	};
 }
 
