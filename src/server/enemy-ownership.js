@@ -33,8 +33,14 @@
  *     change is what converges on the balanced one. Register-time assignment stays least-loaded
  *     (register()), so a complete roster still balances immediately, and the rebalance is
  *     idempotent, so a roster change that moves nothing publishes nothing.
+ *   - An enemy is held by more than one client (every client that can see it announces it), so
+ *     a record carries the set of clients that have announced it. A withdrawal removes only the
+ *     withdrawing client; the record (and its epoch) survives while any other client still
+ *     holds the enemy. That is what keeps an assignment's epoch comparable across a
+ *     withdrawal, and it is why unregister() takes the sender.
  *   - Room keys are `<map>#<variant>` (variant null outside rogue). server.js builds the same
- *     key from a player's stored state; this module only compares keys, it never parses one.
+ *     key from the messages a client sends; this module only compares keys, it never parses
+ *     one.
  *     The ENEMY id, by contrast, is not variant-scoped, so the same map path in two rogue
  *     variants de-dupes onto one owner here -- a known gap deferred to Phase 2, recorded at
  *     the id's origin in src/client/enemies.js (the id format must not change in Phase 1).
@@ -63,8 +69,9 @@ function normalizeIds(ids) {
 class EnemyOwnership {
 	// Records are keyed by enemy id. `room` is the room the enemy was registered from,
 	// `registrant` the client that registered it first (the last-resort owner when the room
-	// has no member left to take it), `owner` the current simulator (null while unassigned)
-	// and `epoch` the assignment's version -- see register() for why it starts at 1.
+	// has no member left to take it), `registrants` every client that has announced the enemy
+	// and not withdrawn it yet, `owner` the current simulator (null while unassigned) and
+	// `epoch` the assignment's version -- see register() for why it starts at 1.
 	constructor() {
 		this.enemies = new Map();
 	}
@@ -80,13 +87,22 @@ class EnemyOwnership {
 		if (typeof enemyId !== "string" || enemyId.length === 0)
 			return null;
 
+		const registrant = typeof registrantId === "string" && registrantId.length > 0 ? registrantId : null;
+
 		const existing = this.enemies.get(enemyId);
-		if (existing)
+		if (existing) {
+			// A second client announcing an enemy the room already knows: it holds the enemy too.
+			// Recording it is what lets the record outlive either client's withdrawal, and what
+			// keeps the assignment epoch comparable across one (see unregister()).
+			if (registrant !== null)
+				existing.registrants.add(registrant);
 			return { id: enemyId, owner: existing.owner, epoch: existing.epoch };
+		}
 
 		const entry = {
 			room: room ?? null,
-			registrant: typeof registrantId === "string" && registrantId.length > 0 ? registrantId : null,
+			registrant,
+			registrants: new Set(registrant === null ? [] : [registrant]),
 			owner: null,
 			// The first assignment is itself a change, so the counter starts at 1 (an epoch of
 			// 0 is never a real one, which lets epochOf() report 0 for "no such enemy"). It is
@@ -99,17 +115,32 @@ class EnemyOwnership {
 		return { id: enemyId, owner: entry.owner, epoch: entry.epoch };
 	}
 
-	// Forget enemies that no longer exist (the owner resolved a death, or the map unloaded).
+	// Forget enemies that `registrantId` no longer holds (it resolved a death, or its map
+	// unloaded). The enemy is still held by every other client that announced it, so the record
+	// only goes when the LAST registrant withdraws: dropping it while another client still has
+	// the live enemy would both strand that client (nobody would be assigned to simulate it) and
+	// restart the record's epoch at 1, which a client still holding the superseded epoch would
+	// reject as stale -- exactly the transient disagreement where two clients each believe the
+	// other owns the enemy, or each believe they do. An omitted sender keeps the old
+	// unconditional removal for callers that are not speaking for a client.
 	// Removal never triggers a reassignment: a room with fewer enemies is never a reason to
 	// move one, and an owner that just died is exactly the case where the entry should go away
-	// rather than migrate. Returns how many ids were actually known.
-	unregister(enemyIds) {
+	// rather than migrate. Returns how many records were actually dropped.
+	unregister(enemyIds, registrantId = null) {
 		let removed = 0;
 		if (!Array.isArray(enemyIds))
 			return removed;
+		const registrant = typeof registrantId === "string" && registrantId.length > 0 ? registrantId : null;
 		for (const enemyId of enemyIds) {
-			if (this.enemies.delete(enemyId))
+			const entry = this.enemies.get(enemyId);
+			if (!entry)
+				continue;
+			if (registrant !== null)
+				entry.registrants.delete(registrant);
+			if (registrant === null || entry.registrants.size === 0) {
+				this.enemies.delete(enemyId);
 				removed++;
+			}
 		}
 		return removed;
 	}
@@ -162,9 +193,11 @@ class EnemyOwnership {
 			// nothing for it.
 			if (owner === entry.owner)
 				continue;
+			// `previous` rides along for the opt-in server diagnostic (server.js), which has to
+			// report old -> new; the publish loop itself only reads id/owner/epoch.
+			changed.push({ id: enemyId, owner, previous: entry.owner, epoch: entry.epoch + 1 });
 			entry.owner = owner;
 			entry.epoch++;
-			changed.push({ id: enemyId, owner, epoch: entry.epoch });
 		}
 		return changed;
 	}

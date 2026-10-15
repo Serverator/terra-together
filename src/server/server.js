@@ -23,9 +23,10 @@
  *     client registers the map-placed enemies it can see and the server answers with the
  *     owner for everyone -- broadcast to all rather than scoped to the room, like every
  *     other relay here, so a client just ignores an id it does not know. The room a
- *     registration is arbitrated against is read from the state that client has ALREADY
- *     sent (see roomOf), so an UPDATE for the new map has to land before its registrations
- *     to be split across that map's players; before that it lands on itself alone.
+ *     registration is arbitrated against comes from the messages that client sends -- its
+ *     ENEMY_REGISTER/JOIN_MAP name its map, and its UPDATE states where it is -- so the room is
+ *     known even for the registrations a client writes at map start, ahead of its first
+ *     snapshot (see noteRoom).
  *   - Routing is "everyone but the sender" (broadcast(data, skip)): the author already
  *     applied its own change locally, so relaying back to it would double-apply it. The
  *     one exception is setHostSetting(), where the *host's* client is a normal recipient
@@ -88,18 +89,90 @@ function roomKey(map, variant) {
 	return `${map}#${variant ?? null}`;
 }
 
-// The room a player is currently in, read from the state it has already sent (UPDATE caches
-// map/variant and SCENE_CHANGED keeps `scene` current, so nothing new is asked of the
-// client). Null when we cannot tell: no cached state yet, or a MENU scene -- the engine is
-// paused there, so that client is not simulating anything and must not be picked to own an
-// enemy. Callers treat null as "this client's room is unknown".
-function roomOf(playerId) {
-	const state = playerData.get(playerId);
+// Live, opt-in switch for the ownership log below, off by default and read straight from the
+// page global like the enemy debug overlay's window.ttEnemyDebug (src/debug/enemy-debug.js).
+// Enable it from the HOST's devtools console with `window.ttEnemyNetDebug = true` to get one
+// line per inbound register/withdraw, per roster change and per published assignment, each
+// carrying the room and roster the server computed -- which is what a report of mis-ownership
+// has to contain to be actionable. Every call site tests the flag before building its arguments,
+// so the off path is one property read.
+function netDebugEnabled() {
+	return window.ttEnemyNetDebug === true;
+}
+
+function netDebug(...parts) {
+	console.log("[TT enemy-net]", ...parts);
+}
+
+// Short id for the log: the wire ids are uuids, and only their prefixes are needed to tell two
+// clients apart in a line.
+function shortId(id) {
+	return id === null || id === undefined ? String(id) : String(id).slice(0, 8);
+}
+
+// The room a client's cached STATE puts it in. Null when we cannot tell: no cached state yet, a
+// state that names no map, or a MENU scene -- the engine is paused there, so that client is not
+// simulating anything and must not be picked to own an enemy. This is only the fallback for a
+// client the server has not heard a room report from yet (see roomOf).
+function roomFromState(state) {
 	if (!state || state.scene === "MENU")
 		return null;
 	if (typeof state.map !== "string" || state.map.length === 0)
 		return null;
 	return roomKey(state.map, state.variant);
+}
+
+// The room a message names, or null when it names no usable map. JOIN_MAP and ENEMY_REGISTER
+// both carry the map (and rogue variant) their client is on, read from the same live g_game.map
+// the state snapshots are built from.
+function roomFromMessage(msg) {
+	return typeof msg.map === "string" && msg.map.length > 0 ? roomKey(msg.map, msg.variant) : null;
+}
+
+// The room each client is in, as the server last heard it (see noteRoom). A client's room is
+// tracked from its own messages rather than derived on demand from its cached state, because
+// the cached state is a frame behind what the client is doing: the first enemy_register of a
+// map is written ahead of that map's first UPDATE, and an UPDATE that first names a client's
+// room used to change nothing at all -- which let a room's split stay one-sided for good.
+const playerRooms = new Map();
+
+// The room a player is in: what it last reported, else what its cached state says.
+function roomOf(playerId) {
+	if (playerRooms.has(playerId))
+		return playerRooms.get(playerId);
+	return roomFromState(playerData.get(playerId));
+}
+
+// Record `playerId` as being in `room` (null = no room), re-arbitrating the rooms it moved
+// between: the one it left, which now has to do without it (its enemies must not stay owned by a
+// client that has walked away, or nobody would simulate them), and the one it entered, whose
+// split is recomputed over the roster that now includes it. This is the server's single
+// convergence point -- every message that tells us where a client is funnels through here (its
+// first UPDATE naming a room, JOIN_MAP, ENEMY_REGISTER) -- which is what repairs a room whose
+// announcement was lost: the map-start JOIN_MAP is written while the socket is still connecting
+// (session.send() drops it), so the first split has to be able to converge from nothing but the
+// snapshots and the registrations that follow. Idempotent: a report of the room the client is
+// already in returns without touching the arbiter.
+function noteRoom(playerId, room) {
+	if (playerRooms.has(playerId) && playerRooms.get(playerId) === room)
+		return;
+	const previous = playerRooms.get(playerId) ?? null;
+	playerRooms.set(playerId, room);
+	if (netDebugEnabled())
+		netDebug(`room ${shortId(playerId)}: ${previous ?? "(none)"} -> ${room ?? "(none)"} | ${roomTable()}`);
+	if (previous !== null)
+		reassignRoom(previous, playerId);
+	if (room !== null)
+		reassignRoom(room, null, playerId);
+}
+
+// Room per connected client, for the opt-in log: "which room did the server think each client was
+// in" is the first question nearly every mis-ownership report comes down to.
+function roomTable() {
+	const parts = [];
+	for (const [, client] of clientsSockets)
+		parts.push(`${shortId(client.id)}=${roomOf(client.id) ?? "(none)"}`);
+	return parts.join(" ");
 }
 
 // The ownership candidate roster for a room: every connected player whose stored state puts
@@ -121,8 +194,11 @@ function rosterOf(room) {
 // to everyone (see the routing note in the header) and a client ignores an enemy_owner for an
 // id it does not know.
 function publishOwners(assignments) {
-	for (const assignment of assignments)
+	for (const assignment of assignments) {
+		if (netDebugEnabled())
+			netDebug(`publish enemy_owner ${assignment.id} ${assignment.previous == null ? "(new)" : shortId(assignment.previous)} -> ${assignment.owner == null ? "none" : shortId(assignment.owner)} epoch ${assignment.epoch}`);
 		broadcast({ type: MSG.ENEMY_OWNER, id: assignment.id, owner: assignment.owner, epoch: assignment.epoch });
+	}
 }
 
 // Re-arbitrate a room after its membership changed and publish whatever moved. `leavingId` is
@@ -137,7 +213,10 @@ function reassignRoom(room, leavingId = null, joiningId = null) {
 	const members = rosterOf(room).filter((id) => id !== leavingId);
 	if (joiningId !== null && !members.includes(joiningId))
 		members.push(joiningId);
-	publishOwners(enemyOwnership.onRosterChange(room, members));
+	const changed = enemyOwnership.onRosterChange(room, members);
+	if (netDebugEnabled())
+		netDebug(`rebalance ${room} roster=[${members.map(shortId).join(",")}]${leavingId !== null ? ` leaving=${shortId(leavingId)}` : ""}${joiningId !== null ? ` joining=${shortId(joiningId)}` : ""} -> ${changed.length} moved`);
+	publishOwners(changed);
 }
 
 // Hand on every enemy this client still owns, except in `exceptRoom` (the room it is entering).
@@ -212,6 +291,15 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						if (msg.state && typeof msg.state === "object")
 							playerData.set(playerId, msg.state);
 						broadcast({ type: MSG.UPDATE, id: playerId, state: msg.state }, socket);
+						// Where this client says it is. This is the room report that used to be missing:
+						// at map start the JOIN_MAP and scene_changed of that start are written while the
+						// socket is still connecting (session.send() drops them), so the first snapshot to
+						// name a room can be the only one the server ever gets -- and an UPDATE used to
+						// change no room at all, which is how a room's split stayed one-sided for good.
+						// A state that is not an object is relayed verbatim (as before) but cannot move
+						// anyone: reading it as "this client left its room" would hand its enemies away.
+						if (msg.state && typeof msg.state === "object")
+							noteRoom(playerId, roomFromState(msg.state));
 						break;
 
 					case MSG.SCENE_CHANGED:
@@ -227,12 +315,13 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// owned enemies in are re-arbitrated over the members that remain. The scenes that
 						// hide it while it stays in the world (LOADING/TITLE) deliberately do not.
 						if (msg.scene === "MENU")
-							reassignOwnedRooms(playerId);
+							noteRoom(playerId, null);
 						// Whichever room it is in now is re-arbitrated as well: it takes over enemies whose
 						// owner is gone AND re-splits the room over the roster that now includes this client
-						// (returning from MENU is the case that matters). Null after a MENU, so it is a
-						// no-op there.
-						reassignRoom(roomOf(playerId));
+						// (returning from MENU is the case that matters -- though there the room is re-reported
+						// by the first UPDATE of the resumed loop, so this is usually the no-op).
+						else
+							reassignRoom(roomOf(playerId));
 						break;
 
 					case MSG.PROFILE:
@@ -269,22 +358,20 @@ function startServer(host = '0.0.0.0', port = 17005) {
 							if (state.scene === "MENU" && playerId !== id && msg.map === state.map && (msg.variant ?? null) === (state.variant ?? null))
 								send(socket, { type: MSG.UPDATE, id, state });
 						}
-						// Leaving a room invalidates this client's ownership in it: its enemies there need
-						// an owner still in that room. Which rooms those are comes from the arbiter, not
-						// from this client's cached state -- an UPDATE for the new map may already have
-						// overwritten that, and the enemies left behind are still owned here either way.
-						// Re-entering the SAME room moves nothing (it is the excluded one), so this
-						// never churns ownership on a reload.
-						const enteredRoom = typeof msg.map === "string" && msg.map.length > 0 ? roomKey(msg.map, msg.variant) : null;
-						reassignOwnedRooms(playerId, enteredRoom ?? roomOf(playerId));
-						// The room being ENTERED is re-arbitrated too, and this is the convergence point for
-						// the map-start race: the joiner is added by hand (its cached state still names the
-						// room it is leaving), and the room's enemies are re-split over the roster that now
-						// includes it -- which is what turns a one-client assignment made before this client's
-						// room was known into a real split. Because it re-splits, it can move enemies even when
-						// every current owner is present; an unchanged split is what stays silent.
+						// The client tells us which room it is entering. noteRoom records it and re-arbitrates
+						// BOTH rooms: the one it left, whose enemies must not stay owned by a client that has
+						// walked away (nobody would simulate them), and the one it entered, re-split over the
+						// roster that now includes it. That re-split is the point -- it moves enemies even when
+						// every current owner is present, which is what turns a one-client assignment made
+						// before this client's room was known into a real split, and why re-entering the room
+						// it is already in moves nothing.
+						const enteredRoom = roomFromMessage(msg);
 						if (enteredRoom !== null)
-							reassignRoom(enteredRoom, null, playerId);
+							noteRoom(playerId, enteredRoom);
+						else
+							// No usable map in the message: hand on everything this client still owns except the
+							// room its cached state names, the old best guess at where it is.
+							reassignOwnedRooms(playerId, roomOf(playerId));
 						break;
 
 					case MSG.REVIVE:
@@ -299,16 +386,21 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						break;
 
 					case MSG.ENEMY_REGISTER:
-						// A client announces a map-placed enemy and asks who simulates it. The room
-						// comes from the state this client has already sent (roomOf) and the candidate
-						// roster is everyone whose state puts them in that room; with no room known the
-						// arbiter falls back to the registrant alone. msg.map/msg.variant only back the
-						// RECORDED room key, so an assignment made before the first UPDATE from the new
-						// map can still be repaired by a later roster change -- they are never trusted
-						// over the stored state for choosing the roster.
-						const room = roomOf(playerId);
-						const knownRoom = room ?? (typeof msg.map === "string" && msg.map.length > 0 ? roomKey(msg.map, msg.variant) : null);
-						const assignment = enemyOwnership.register(msg.id, knownRoom, playerId, rosterOf(room));
+						// A client announces a map-placed enemy and asks who simulates it. The room comes from
+						// the message, which names the map this enemy and this client are on: read from the same
+						// live g_game.map the snapshots use, but not a frame behind them and never the map the
+						// client just left. Trusting it here is what keeps a re-entering client's registrations
+						// in the room that will re-split them; deriving the room from cached state instead
+						// records the enemy against a player who is no longer there, whose one-member roster
+						// then hands it the whole map.
+						const messageRoom = roomFromMessage(msg);
+						if (messageRoom !== null)
+							noteRoom(playerId, messageRoom);
+						const room = messageRoom ?? roomOf(playerId);
+						const roster = rosterOf(room);
+						const assignment = enemyOwnership.register(msg.id, room, playerId, roster);
+						if (netDebugEnabled())
+							netDebug(`in enemy_register ${msg.id} (msg map=${msg.map} variant=${msg.variant}) room=${room ?? "(none)"} from=${shortId(playerId)} roster=[${roster.map(shortId).join(",")}] -> owner=${shortId(assignment?.owner) || "none"} epoch ${assignment?.epoch ?? "-"}`);
 						// Everyone, the registrant included: it has to learn who owns the enemy it just
 						// registered, and a duplicate register is how a late joiner learns it.
 						if (assignment)
@@ -316,10 +408,14 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						break;
 
 					case MSG.ENEMY_UNREGISTER:
-						// The enemy no longer exists for this client (its death resolved, or the map
-						// unloaded): forget it. Nothing is reassigned -- a removal never moves load
-						// around -- and the entry lives on for clients that still hold the enemy.
-						enemyOwnership.unregister(msg.ids);
+						// The enemy no longer exists for THIS client (its death resolved, or its map unloaded):
+						// withdraw it. Records other clients still hold survive the withdrawal (see
+						// enemy-ownership.js unregister()), so an enemy the other client can still see keeps
+						// both its owner and its epoch instead of being re-registered from scratch. Nothing is
+						// reassigned -- a removal never moves load around.
+						const dropped = enemyOwnership.unregister(msg.ids, playerId);
+						if (netDebugEnabled())
+							netDebug(`in enemy_unregister [${(msg.ids ?? []).join(", ")}] from=${shortId(playerId)} -> ${dropped} record(s) dropped, ${(msg.ids ?? []).length - dropped} still held elsewhere`);
 						break;
 
 					default:
@@ -344,6 +440,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 				return;
 			playerData.delete(playerId);
 			playerNames.delete(playerId);
+			playerRooms.delete(playerId);
 			console.log(`Player ${playerId} disconnected. Total: ${clientsSockets.size}`);
 			broadcast({ type: MSG.PLAYER_LEFT, id: playerId });
 			// Hand on everything this client still owned: the socket is already out of
@@ -358,6 +455,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 				return;
 			playerData.delete(playerId);
 			playerNames.delete(playerId);
+			playerRooms.delete(playerId);
 			console.log(`Player ${playerId} crashed. Reason: ${err}`);
 			broadcast({ type: MSG.PLAYER_LEFT, id: playerId });
 			reassignOwnedRooms(playerId);
@@ -405,6 +503,7 @@ function stopServer() {
 	// it to them would strand the finished session's state for a later startServer().
 	playerData.clear();
 	playerNames.clear();
+	playerRooms.clear();
 	server.close();
 	server = null;
 }
