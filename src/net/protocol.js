@@ -125,13 +125,35 @@
  *                                            only to an enemy it holds itself, and idempotently.
  *                                            Payload: { owner, list: [ { id } ] }. Client case:
  *                                            MSG.ENEMY_DESPAWN.
+ *   MSG.ENEMY_RESPAWN     "enemy_respawn"    client -> server -> all but sender, ONE-SHOT, from the
+ *                                            client that has just RESTED: "the enemy population of
+ *                                            this map has reset". Resting is the one world event
+ *                                            that puts a map's enemies back, and the engine does it
+ *                                            by clearing a PER-CLIENT session dead-set
+ *                                            (combat.js onRestReset -> g_vars.clearMapSessionVars),
+ *                                            so it only respawns the rester's own enemies -- the
+ *                                            other client's spots stay defeated and it is left
+ *                                            simulating a map whose enemies are gone. The recipient
+ *                                            therefore runs the engine's own reset locally (clear
+ *                                            the same session vars, respawn its defeated spots) and
+ *                                            the restored enemies are re-registered by the normal
+ *                                            per-frame diff, which re-splits their room. Stamp-then-
+ *                                            relay like ENEMY_HANDOFF/ENEMY_DESPAWN (the server
+ *                                            rewrites `from` to the sender's socket id), and like
+ *                                            them NOT entry-validated -- it describes a world event,
+ *                                            not an enemy's ownership. Unlike the other relays it is
+ *                                            not room-scoped either: every recipient ignores it
+ *                                            when its active map is not the one named. Payload:
+ *                                            { from, map, variant }. Client case:
+ *                                            MSG.ENEMY_RESPAWN.
  *
- * The server's inbound switch has 12 cases: the 9 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
+ * The server's inbound switch has 13 cases: the 9 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
  * REVIVE, REVIVE_PROGRESS, AREA_HEAL forwarded verbatim; ENEMY_STATE forwarded entry-validated;
- * ENEMY_HANDOFF and ENEMY_DESPAWN forwarded with `owner` stamped to the sender), PROFILE --
+ * ENEMY_HANDOFF and ENEMY_DESPAWN forwarded with `owner` stamped to the sender; ENEMY_RESPAWN
+ * forwarded with `from` stamped to the sender), PROFILE --
  * answered, not relayed -- and ENEMY_REGISTER / ENEMY_UNREGISTER, which are not relayed but
  * answered with ENEMY_OWNER. The
- * client's dispatch has 15: every type except PROFILE,
+ * client's dispatch has 16: every type except PROFILE,
  * ENEMY_REGISTER and ENEMY_UNREGISTER. The six server-only types (WELCOME, HOST_SETTING,
  * PLAYER_PROFILE, PLAYER_JOINED, PLAYER_LEFT, ENEMY_OWNER) are never accepted from a client -- a
  * client that sends one hits the server's default branch and is dropped, because they describe state
@@ -139,6 +161,6 @@
  * enemy ownership it arbitrates).
  */
 
-export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff", ENEMY_DESPAWN:"enemy_despawn" };
+export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff", ENEMY_DESPAWN:"enemy_despawn", ENEMY_RESPAWN:"enemy_respawn" };
 
 //# sourceURL=/mods/terra-together/net/protocol.js

@@ -7,7 +7,8 @@
  *   - Push host-authoritative settings (revive, estus-share) on change.
  *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients, and
  *     enemy_state to other clients once its entries are checked against the arbiter, and
- *     enemy_handoff and enemy_despawn to other clients with the sender's id stamped on them.
+ *     enemy_handoff, enemy_despawn and enemy_respawn to other clients with the sender's id stamped
+ *     on them.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
  *     publish it, re-arbitrating when a room's membership changes.
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
@@ -19,7 +20,7 @@
  *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
  *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
  *     every inbound type is matched through MSG.*, so an unknown type falls to the default
- *     branch and is dropped. The direction table for all 18 types is documented there.
+ *     branch and is dropped. The direction table for all 19 types is documented there.
  *   - Enemy-sync ownership is arbitrated here, never simulated: the server is a single
  *     process, so its assignment is the consensus (see src/server/enemy-ownership.js). A
  *     client registers the map-placed enemies it can see and the server answers with the
@@ -48,7 +49,9 @@
  *     and for the same shape of reason: the sender has just killed the enemies in it, so the
  *     arbiter's record for them can already be gone or moved by the time it arrives, and
  *     validate() would drop the very message that removes a ghost (see the MSG.ENEMY_DESPAWN
- *     case).
+ *     case). enemy_respawn is relayed on that same coop trust for the mirror-image reason: it is
+ *     not about an enemy at all, but about the map's whole population having been reset by a rest
+ *     (see the MSG.ENEMY_RESPAWN case).
  *   - Ordering: each send is one synchronous socket.write, so per-connection order is
  *     preserved, but there is no rate limiting, batching or backpressure -- inbound
  *     traffic is paced by the clients' own tick (see src/client/snapshot.js).
@@ -500,7 +503,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 
 					case MSG.ENEMY_DESPAWN: {
 						// The id of an enemy this client owned and has just beaten (the owner half lives in
-						// src/client/enemies.js, sendDespawn): tell everyone else, so each of them can mark it
+						// src/client/enemies.js, markDying/sendDespawnId): tell everyone else, so each of them can mark it
 						// dead in its OWN per-client dead-set and take it out of the world. Without it a peer
 						// keeps a live copy of an enemy the owner has already killed, and no local event can
 						// ever correct that: a peer's copy of an enemy it does not own has its local hit
@@ -526,6 +529,28 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// The sender's own claim is never relayed -- the socket identity is the id the
 						// recipients gate and log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF cases.
 						msg.owner = playerId;
+						broadcast(msg, socket);
+						break;
+					}
+
+					case MSG.ENEMY_RESPAWN: {
+						// One-shot "the enemy population of this map has reset" from a client that just rested.
+						// Its rest cleared its own per-client enemy dead-set and respawned its spots, and every
+						// other client has to run the same reset or it is left simulating a map whose enemies
+						// are gone (src/client/enemies.js applyLocalRespawn). Relayed on the same coop trust as
+						// revive/area_heal: it describes a world event, not an enemy's ownership, so there is
+						// nothing for the arbiter to validate. Nothing is re-arbitrated here either -- the
+						// respawned enemies are re-registered by each client's normal registration diff, which
+						// is what re-splits their room. Wire shape (frozen): { from, map, variant }.
+						const respawnMap = typeof msg.map === "string" ? msg.map : "";
+						if (netDebugEnabled())
+							netDebug(`in enemy_respawn from=${shortId(playerId)} map=${respawnMap || "(none)"} variant=${msg.variant ?? null}`);
+						// A reset that names no map cannot be applied by anyone: no frame.
+						if (respawnMap === "")
+							break;
+						// The sender's own claim is never relayed -- the socket identity is the id the
+						// recipients log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF / ENEMY_DESPAWN cases.
+						msg.from = playerId;
 						broadcast(msg, socket);
 						break;
 					}

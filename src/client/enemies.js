@@ -25,24 +25,42 @@
  *     (see PEER_STATE_FRESH_MS — the anti-freeze guarantee).
  *   - Death/despawn half (Phase 4): detect that an enemy THIS client owns has been definitively
  *     beaten (the one engine seam that cannot fire for a disengaging enemy, see the patch note on
- *     onEnemyDeathHit) and announce it in one MSG.ENEMY_DESPAWN (sendDespawn); and, on the
+ *     onEnemyDeathHit) and announce it in one MSG.ENEMY_DESPAWN (sendDespawnId, once the engine has
+ *     removed the entity, see the death-ANIMATION bullet below); and, on the
  *     receiving side, take such an enemy out of this client's world and record it in the engine's
  *     own per-spot dead-set so it cannot come back (onEnemyDespawn).
+ *   - Death ANIMATION half (Phase 4b): a beaten enemy is not despawned at the killing blow -- its
+ *     state keeps being published until the engine removes the entity (markDying + syncEnemies),
+ *     so the peer puppets the dying enemy and the death animation streams. On the peer, a state at
+ *     0 HP latches the enemy DYING (dyingPuppets): it OVERRIDES the freshness gate, so a dying
+ *     enemy can never be released into local simulation (the zombie), and is removed by the despawn
+ *     or a bounded cap.
+ *   - Rest/respawn half (Phase 4b): resting clears a PER-CLIENT dead-set, so the reset is synced --
+ *     wrapping the engine's own CombatManager.onRestReset announces one MSG.ENEMY_RESPAWN
+ *     (sendRespawn), and a recipient on that map runs the engine's own reset locally
+ *     (onEnemyRespawn -> applyLocalRespawn: clear both session-var prefixes, respawn defeated
+ *     spots), after which the normal registration diff re-announces and re-splits the enemies.
  * Public surface: ENEMY_SYNC_OPTION, enemyStableId, isEnemySyncEnabled, onEnemyOwner,
- *   onEnemyState, onEnemyHandoff, onEnemyDespawn, isOwner, getEnemyOwnerName, EnemySync
+ *   onEnemyState, onEnemyHandoff, onEnemyDespawn, onEnemyRespawn, isOwner, getEnemyOwnerName,
+ *   EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
  *   g_game.map.active.path / g_scene.isRunning / EnemyCmp (and, through it, each enemy's
  *   sourceEntity.core, which is where identity comes from), plus — for the death half —
  *   EnemyCmp.prototype.onDeathHit (the owner seam, wrapped once) and g_vars (the engine's var
- *   store, which is where the per-spot dead-set lives); ./enemy-puppet.js, which owns the
+ *   store, which is where the per-spot dead-set lives); for the two Phase 4b halves, additionally
+ *   CombatManager.prototype.onRestReset (the rest seam, wrapped once), EnemySpotEntity (the spot
+ *   identity, tested with the engine's own instanceof), CombatManager/EnemySpotEntity both reached
+ *   through terra.export; ./enemy-puppet.js, which owns the
  *   prototype patches and the actual puppet drive; window.terraTogether.playerId / playerNames
  *   (published by ./session.js); performance.now() (the freshness clock). Inbound routing:
  *   ./client.js (see the note at the handler registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
  *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
  *   are released too, so no enemy can stay suppressed (or frozen) because this module stopped
- *   running. The option KEY is declared here as a literal instead of being imported from
+ *   running -- except a dying one, which is REMOVED rather than released, because releasing a dead
+ *   enemy is exactly the locally-simulating zombie the dying latch exists to prevent. The option KEY
+ *   is declared here as a literal instead of being imported from
  *   ../config/settings.js: that module imports ../debug/enemy-debug.js, which imports this
  *   one, so importing back would close a cycle (same reason ENEMY_DEBUG_OPTION is a literal
  *   in ../debug/enemy-debug.js).
@@ -98,6 +116,26 @@ const HANDOFF_HOLD_FRAMES = 10;
 // self-correcting as soon as state flows again), never to an enemy frozen at the last state
 // that did arrive.
 const PEER_STATE_FRESH_MS = 500;
+
+// How long a peer holds an enemy it has seen die before removing it regardless -- the bounded
+// guarantee of the dying latch (Phase 4b). A landed despawn removes the enemy immediately; this is
+// the backstop for a despawn that never arrives (a dropped frame, an owner that went away while the
+// enemy was mid-death). It is deliberately far longer than any death animation -- an enemy still
+// playing its death on the owner must not vanish early on the peer -- and it is the ONLY bound on
+// how long a dying enemy can be held suppressed, so nothing here can leave a stuck entity behind.
+// 3000ms is ~6x the freshness window above and comfortably past the engine's own death-fade
+// sequence, whose length this code deliberately does not guess at (the despawn is the real signal).
+const DYING_REMOVE_MS = 3000;
+
+// How long the OWNER streams a dying enemy before announcing the despawn regardless. Normally the
+// despawn is driven by the engine removing the entity (markDying -> syncEnemies' gone sweep), but a
+// handful of engine states never remove it -- most notably a `manualKill` enemy that takes lethal
+// damage: its boom() returns before playing any death action, so nothing ever reaches
+// onPostAction's core.kill() and the entity stays. Without a bound that one enemy would publish
+// state every frame forever. 5000ms is well past any real death animation, so it only ever fires on
+// an enemy the engine has genuinely left behind, and it is a leak guard on the STREAM, not a guess
+// at the animation: the despawn still normally rides the removal.
+const DYING_STREAM_MAX_MS = 5000;
 
 // True while the feature is on. Strict `=== true`, like the overlay's flag test: only a real
 // boolean switches it on, and an option that was never seeded counts as off.
@@ -292,6 +330,14 @@ const holding = new Map();
 // whole set travels as a single message, however many assignments in it moved.
 const lostOwnership = new Set();
 
+// Enemy ids this client owns and has KILLED locally, mapped to the clock reading of the death,
+// whose entity the engine has not removed yet (Phase 4b): their state keeps being published (see
+// syncEnemies) so a peer can watch the death play out, and the despawn is sent from the frame their
+// entity actually leaves the world rather than at the killing blow (see markDying). The timestamp
+// bounds the stream (DYING_STREAM_MAX_MS), so an enemy the engine never removes cannot be published
+// forever. Owner-side bookkeeping only, dropped on every reset.
+const dyingOwned = new Map();
+
 // The enemies THIS client is currently driving as puppets: enemyId -> entity. Kept so every
 // release path (stale state, ownership change, enemy gone, map change, disconnect, flag off)
 // can undo exactly what was done without a second enumeration of the entity list, and so
@@ -299,6 +345,15 @@ const lostOwnership = new Set();
 // module does not need to consult the puppet module's isPuppet(): this map is its own record of
 // what it puppeted.
 const puppets = new Map();
+
+// Enemies this client is driving as puppets that have been SHOWN to be dying: enemyId ->
+// { at, state }, where `at` is the clock reading of the first death sighting and `state` is the
+// last death pose to hold. This latch OVERRIDES the freshness gate in applyPeerState: a dying enemy
+// is never released back to local simulation -- releasing one would leave a locally-simulating
+// zombie of a dead enemy, the single thing this latch exists to stop -- and is instead held
+// suppressed until the owner's despawn arrives or the bounded cap (DYING_REMOVE_MS) removes it.
+// Every exit path removes it: despawn, cap, enemy gone, ownership change, disconnect, flag off.
+const dyingPuppets = new Map();
 
 // Drop every stored peer state. Part of the reset path: state stored for the map we are leaving
 // can never be applied to the next one.
@@ -337,6 +392,19 @@ function releaseAllPuppets() {
 	for (const ent of puppets.values())
 		releasePuppet(ent);
 	puppets.clear();
+}
+
+// Remove every enemy latched as dying (Phase 4b) instead of releasing it. Used by the paths that
+// abandon the world this module was syncing (feature off, disconnect): a dying enemy is DEAD, so
+// falling back to local simulation would leave a zombie on a client that has stopped syncing. It
+// goes through the same removal a despawn uses, so the spot is marked defeated, the entity is taken
+// out of the world and no reward path runs.
+function removeDyingPuppets() {
+	if (dyingPuppets.size === 0)
+		return;
+	for (const id of [...dyingPuppets.keys()])
+		despawnEnemyLocally(id);
+	dyingPuppets.clear();
 }
 
 // The prototype patches that make the puppet flag mean anything. Installed exactly once, never
@@ -382,8 +450,12 @@ function syncEnemies() {
 	if (!isEnemySyncEnabled() || !isConnected()) {
 		clearRegistry();
 		clearPeerState();
+		// Dying enemies are REMOVED, never released: handing a dead enemy back to local simulation
+		// is the zombie this whole latch exists to prevent (Phase 4b).
+		removeDyingPuppets();
 		releaseAllPuppets();
 		clearTakeoverState();
+		dyingOwned.clear();
 		return null;
 	}
 	const map = activeMapPath();
@@ -398,11 +470,14 @@ function syncEnemies() {
 	const live = new Map();
 	const added = [];
 	for (const core of terra.export.g_gState?.entities ?? []) {
-		if (!getLiveEnemy(core))
-			continue;
 		const id = wireEnemyId(core);
 		if (id === null)
 			continue;                      // runtime spawn / unknown map: not wire-addressable
+		// Live enemies, plus the ones we have killed locally whose entity the engine has not
+		// removed yet: a dying enemy keeps being published until its removal (Phase 4b), which is
+		// what lets a peer watch the death animation instead of seeing the enemy vanish.
+		if (!getLiveEnemy(core) && !dyingOwned.has(id))
+			continue;
 		live.set(id, core);
 		const entry = registry.get(id);
 		if (entry) {
@@ -417,10 +492,26 @@ function syncEnemies() {
 		added.push(id);
 	}
 
+	// Owner-side bound on the death stream (see DYING_STREAM_MAX_MS): an enemy the engine never
+	// removes stops being published here, and is handed to the gone sweep below as if it had gone,
+	// so its despawn still goes out exactly once and its announcement is still withdrawn.
+	if (dyingOwned.size > 0) {
+		const now = nowMs();
+		for (const [id, at] of dyingOwned) {
+			if (now - at >= DYING_STREAM_MAX_MS)
+				live.delete(id);
+		}
+	}
+
 	const gone = [];
 	for (const [id, entry] of registry) {
 		if (live.has(id))
 			continue;
+		// A dying enemy we owned: its entity has now left the world, i.e. its death animation is
+		// over. THIS is when the despawn goes out (Phase 4b) -- the state publishes have streamed
+		// the death until this frame, so the peer animated it instead of losing it instantly.
+		if (dyingOwned.delete(id))
+			sendDespawnId(id);
 		// Only an enemy we announced is ours to withdraw; an entry we merely learned about
 		// from the server is dropped locally.
 		if (entry.registered)
@@ -457,11 +548,14 @@ function sendOwnerStates(live) {
 	for (const [id, core] of live) {
 		if (!isOwner(id))
 			continue;
-		// Ours, but not taken over yet: either a takeover that has not run this frame or one that is
-		// holding the enemy for the handoff. Our copy is not authoritative then -- it is the position
-		// the previous owner's state is about to replace -- so publishing it would be exactly the
-		// snap-to-spawn this path exists to prevent. See adopted and takeOwnership.
-		if (!adopted.has(id))
+		// Ours and simulating, or ours and dying. Not ours-in-transit: an enemy we own but have not
+		// taken over yet is either a takeover that has not run this frame or one holding for the
+		// handoff, and our copy is not authoritative then -- it is the position the previous owner's
+		// state is about to replace -- so publishing it would be exactly the snap-to-spawn this path
+		// exists to prevent (see adopted and takeOwnership). A DYING enemy is the exception: its
+		// entity is going away and it will never reach adoption, but its death pose is real state the
+		// peer needs (Phase 4b).
+		if (!adopted.has(id) && !dyingOwned.has(id))
 			continue;
 		const state = readEnemyState(core.ent);
 		// An enemy whose state cannot be read simply does not appear: the peer's copy of it goes
@@ -572,11 +666,12 @@ function ensureDespawnPatch() {
 	const original = proto.onDeathHit;
 	if (original.__ttDespawnPatched !== true) {
 		const wrapper = function (...args) {
-			// Announce BEFORE the engine's own death work runs: the message is the one thing here that
-			// cannot be repeated, and nothing the original does (rewards, screen shake, the deferred
-			// defeat submission of a dramatic zoom) may delay or swallow it.
+			// MARK, do not send (Phase 4b): the despawn rides the enemy's removal, so the peer gets
+			// to watch the death animation instead of the enemy vanishing. Marking happens BEFORE the
+			// engine's own death work runs, so a death that removes the entity within this same frame
+			// is still recorded (the gone sweep in syncEnemies then sends the despawn next frame).
 			if (isEnemySyncEnabled())
-				sendDespawn(this?.ent);
+				markDying(this?.ent);
 			return original.apply(this, args);
 		};
 		wrapper.__ttDespawnPatched = true;
@@ -585,20 +680,35 @@ function ensureDespawnPatch() {
 	despawnPatched = true;
 }
 
-// One MSG.ENEMY_DESPAWN for an enemy THIS client owns and has just beaten. Silent when the feature
-// is off, while offline, for an enemy whose identity is not wire-addressable (a runtime spawn, or a
-// spot whose map is already gone), and for an enemy the registry does not assign to us -- only the
-// owner's word about an enemy is authoritative here, exactly as in the state publish, and the peer
-// gates nothing else. Deliberately NOT gated on hasPeers(): unlike the per-frame state publish, a
-// death happens once and can never be re-sent, so it must not be dropped just because the peer set
-// has not been populated yet; the cost of sending it to a server with nobody to relay to is one
-// small frame.
-function sendDespawn(ent) {
+// An enemy THIS client owns has just been beaten (the onDeathHit wrapper above). Do NOT announce
+// it yet (Phase 4b): the enemy is not gone. The engine is about to play its death animation and
+// only removes the entity when that finishes (combatant boom -> the enemyDieFade action ->
+// onPostAction -> core.kill, combatant-cmp.js:381-401, :364-370; the removal itself is a deferred
+// deactivation, game-state.js:144-162). Announcing the despawn NOW, as the previous phase did, is
+// exactly why the peer's enemy vanished instantly: the despawn removed it in the same frame its
+// state stopped arriving. Instead the enemy is marked dying and its state keeps being published
+// (syncEnemies) until the engine removes it, at which point the despawn goes out (syncEnemies'
+// gone sweep, via sendDespawnId).
+//
+// Silent when the feature is off, while offline, for an enemy whose identity is not
+// wire-addressable (a runtime spawn, or a spot whose map is already gone), and for an enemy the
+// registry does not assign to us -- only the owner's word about an enemy is authoritative here,
+// exactly as in the state publish. (The despawn is still not gated on hasPeers: it is one-shot and
+// must survive a peer set that has not been populated yet.)
+function markDying(ent) {
 	if (!isEnemySyncEnabled() || !isConnected())
 		return;
 	const id = wireEnemyId(ent?.core);
 	if (id === null || !isOwner(id))
 		return;
+	dyingOwned.set(id, nowMs());
+	if (debugEnabled())
+		debugLog(`enemy ${id} is dying: despawn deferred until its entity is removed`);
+}
+
+// The actual one-shot despawn frame. Sent by the deferred window decided in markDying (see
+// syncEnemies): the same payload the old immediate path used, { owner, list: [{ id }] }.
+function sendDespawnId(id) {
 	send({ type: MSG.ENEMY_DESPAWN, owner: localPlayerId(), list: [{ id }] });
 	if (debugEnabled())
 		debugLog(`despawn sent for ${id}`);
@@ -611,16 +721,31 @@ function sendDespawn(ent) {
 // to local simulation the moment it is not. The release branch is not an error path — it is the
 // normal outcome of an owner going quiet, and it is what turns a failed sync into "both
 // clients simulate this enemy" instead of a frozen one.
+//
+// The ONE exception to that release is an enemy that has been SEEN to die (Phase 4b, dyingPuppets):
+// releasing a dead enemy would let this client simulate a corpse, so a dying enemy whose state has
+// gone QUIET is held suppressed on its last death pose until the bounded cap removes it. A dying
+// enemy whose state is still arriving is just driven like any other puppet -- and that distinction
+// is load-bearing in the other direction too: the owner keeps streaming a dying enemy every frame
+// until it removes it, so a latch that removed on age alone would delete an enemy that is still very
+// much there (a live enemy whose ratio merely rounds to 0 would be the false positive).
 function applyPeerState(live) {
 	if (!live)
 		return;
 	const now = nowMs();
 	for (const [id, core] of live) {
 		const ent = core.ent;
+
 		// Ours: never a puppet. Becoming the owner (a rebalance) releases the enemy and starts
 		// simulating and publishing it instead -- through takeOwnership(), which spends whatever
-		// the previous owner left for us before this frame's update runs.
+		// the previous owner left for us before this frame's update runs. The one exception is an
+		// enemy we have SEEN die: takeover must not resurrect it (a locally-simulating zombie of a
+		// dead enemy), so a latched dying enemy is removed rather than adopted.
 		if (isOwner(id)) {
+			if (dyingPuppets.delete(id)) {
+				despawnEnemyLocally(id);
+				continue;
+			}
 			if (puppets.delete(id))
 				releasePuppet(ent);
 			takeOwnership(id, ent);
@@ -641,10 +766,41 @@ function applyPeerState(live) {
 				puppets.set(id, ent);
 			}
 			drivePuppet(ent, entry.state);
+			// The owner's enemy is at 0 HP: it has been beaten (the engine's own defeat sets both
+			// `defeated` and currentHP 0, combat-params.js reduceHP, so the ratio is 0 for the whole
+			// dying window). Latch it dying and remember the death pose, so that when the owner STOPS
+			// streaming it -- its entity removed, or the owner gone -- the enemy is HELD (below) rather
+			// than released into local simulation. `at` is set ONCE, so the bounded window is measured
+			// from the first sighting of the death however long the owner keeps streaming.
+			if (entry.state?.hp === 0) {
+				const seen = dyingPuppets.get(id);
+				dyingPuppets.set(id, { at: seen ? seen.at : now, state: entry.state });
+			}
 			continue;
 		}
 		// No usable state: nobody owns this enemy right now, the owner has gone quiet (or never
-		// had it), or its state predates the current assignment. Simulate it locally again.
+		// had it), or its state predates the current assignment. Simulate it locally again --
+		// UNLESS it is a latched dying enemy, which must never be released this way. Such an enemy
+		// stays suppressed on its held death pose until the despawn lands or the bounded cap
+		// removes it. The cap is measured from the first sighting of the death and only ever fires
+		// here, on a frame the owner is no longer reporting the enemy at all.
+		const held = dyingPuppets.get(id);
+		if (held) {
+			if (now - held.at >= DYING_REMOVE_MS) {
+				dyingPuppets.delete(id);
+				if (debugEnabled())
+					debugLog(`dying enemy ${id}: no despawn and no state after ${DYING_REMOVE_MS}ms, removing`);
+				despawnEnemyLocally(id);
+				continue;
+			}
+			if (!puppets.has(id)) {
+				ensurePuppetPatches();
+				makePuppet(ent);
+				puppets.set(id, ent);
+			}
+			drivePuppet(ent, held.state);
+			continue;
+		}
 		if (puppets.delete(id))
 			releasePuppet(ent);
 	}
@@ -660,6 +816,12 @@ function applyPeerState(live) {
 	for (const id of peerState.keys()) {
 		if (!live.has(id))
 			peerState.delete(id);
+	}
+	// A dying latch whose enemy is gone has nothing left to remove: its entity is already out of
+	// the world, so the latch goes with it (there is no stuck entity to clean up).
+	for (const id of dyingPuppets.keys()) {
+		if (!live.has(id))
+			dyingPuppets.delete(id);
 	}
 	// The takeover bookkeeping is per-assignment, so it must not outlive one: a stored handoff, an
 	// "already simulating" mark or a hold belongs to the ownership that is ending, and spending any
@@ -779,6 +941,11 @@ function resetForNewMap() {
 	clearPeerState();
 	releaseAllPuppets();
 	clearTakeoverState();
+	// The old map's dying latches and deferred despawns go with the map: the entities they name are
+	// being torn down with it, and neither a stale latch nor a despawn for the old map may survive
+	// into the new one.
+	dyingPuppets.clear();
+	dyingOwned.clear();
 	if (registry.size === 0)
 		return;
 	const ids = [...registry.keys()];
@@ -986,6 +1153,7 @@ function despawnEnemyLocally(enemyId) {
 	peerState.delete(enemyId);
 	handoffState.delete(enemyId);
 	adopted.delete(enemyId);
+	dyingPuppets.delete(enemyId);               // a landed despawn ends the dying latch, if any
 	releaseHold(enemyId);                       // releases the held entity's puppet mark, if any
 	const puppeted = puppets.get(enemyId);
 	if (puppeted) {
@@ -1027,6 +1195,127 @@ export function onEnemyDespawn(msg) {
 		if (debugEnabled())
 			debugLog(`despawn applied for ${id} (sent by ${msg.owner == null ? "?" : msg.owner})`);
 	}
+}
+
+// ──────────────────────────── rest / respawn sync ────────────────────────────
+
+// THE REST SEAM. Resting is the one world event that puts a map's enemy population back, and the
+// engine does it by clearing a PER-CLIENT session dead-set:
+//   waypoint-manager.js:233 onRestReset()  (the funnel BOTH rest steps call -- waypoint-steps.js:227
+//   WAYPOINT_TELEPORT, which reloads the map, and :238 WAYPOINT_RESET, which does not)
+//     -> combat.js:272-274 CombatManager.onRestReset()
+//       -> vars.g_vars.clearMapSessionVars("_enemySpot") + ("_healPlant")   (vars.js:114-123)
+// The dead-set itself is `session.map._enemySpot.<spot mapId>` -- or the rogue
+// `session.map._rogue_enemySpot.<mapId>_<roomUid>` -- written by the spot on defeat
+// (enemy-spot-entity.js getVarName :93-97, onEnemyDefeat :304-310) and read back in its constructor
+// (:79-80). Because each client keeps its OWN dead-set, clearing it only respawns the rester's
+// enemies: the other client's spots stay DEFEATED, they never respawn, and -- with nothing of theirs
+// registered -- the arbiter hands every respawned enemy to the rester. That is Sam's report.
+//
+// The patch is on the engine's own reset METHOD rather than on g_vars.clearMapSessionVars, and that
+// is deliberate: onRestReset is the EVENT ("a rest happened") and it is a named method on the one
+// CombatManager singleton, while clearMapSessionVars is a general var-store primitive called for
+// several keys from several places (vars.js itself, rogue-manager.js:472-475), where we would have
+// to guess which clear means "rest". Wrapping onRestReset observes the rest and nothing else, and
+// still lets the engine's own reset run (chained, like the death seam).
+//
+// SHARED, by product decision: anyone's rest respawns the enemies for everyone in the map. That is
+// what the message says -- "this map's enemy population has reset" -- and it is why the sender
+// announces the EVENT and each recipient runs the engine's own reset locally, rather than the
+// sender trying to describe which enemies it respawned.
+let respawnPatched = false;
+
+function ensureRespawnPatch() {
+	if (respawnPatched)
+		return;
+	const proto = terra.export.CombatManager?.prototype;
+	if (!proto || typeof proto.onRestReset !== "function") {
+		if (debugEnabled())
+			debugLog("cannot install the rest patch: terra.export.CombatManager.onRestReset is missing");
+		return;
+	}
+	const original = proto.onRestReset;
+	if (original.__ttRespawnPatched !== true) {
+		const wrapper = function (...args) {
+			// Send AFTER the original: the local reset has then happened, so the message cannot announce
+			// a rest that did not take effect locally.
+			const result = original.apply(this, args);
+			if (isEnemySyncEnabled())
+				sendRespawn();
+			return result;
+		};
+		wrapper.__ttRespawnPatched = true;
+		proto.onRestReset = wrapper;
+	}
+	respawnPatched = true;
+}
+
+// Announce the reset to the other clients: one message per rest, never per frame, and only while the
+// feature is on and connected. `from` is our own playerId; the server overwrites it with the
+// socket's id, so it is only ever a convenience for the log.
+function sendRespawn() {
+	if (!isEnemySyncEnabled() || !isConnected())
+		return;
+	send({ type: MSG.ENEMY_RESPAWN, from: localPlayerId(), map: activeMapPath(), variant: roomVariant() });
+	if (debugEnabled())
+		debugLog(`enemy respawn announced for ${activeMapPath()}`);
+}
+
+// Run the engine's own rest reset on THIS client, without the map reload the real rest does: clear
+// the same session dead-set variables the engine clears and respawn the already-defeated spots.
+//
+// Both halves matter. Clearing the variables (BOTH prefixes) is what the engine's rest does
+// (combat.js:273) and it is what stops a re-init or a later map load from re-marking these spots
+// defeated; but it does NOT touch a spot that is already loaded -- the rester's spots come back
+// because the rest TELEPORTS (reloads) the map and the fresh spot then reads a cleared variable. A
+// peer must not reload the map, so it needs the engine's own respawn path as well:
+// EnemySpotEntity.respawn() (enemy-spot-entity.js:152-169) is the supported "bring back a defeated
+// enemy" call (the engine's RESPAWN_ENEMY / RESPAWN_ENEMIES event steps use it, enemy-steps.js:248
+// / :269). It flips the spot back to INIT, drops its stale enemyEnt/eggEnt and triggers the spawn,
+// whose own `if (this.enemyEnt) return` guard (:254-256) keeps a repeat reset from building a
+// second entity.
+//
+// Only DEFEATED spots are respawned: calling respawn() on a spot that is still INIT would trigger a
+// spawn the map did not ask for (hidden and passive enemies), and on a TRIGGERED one it is a no-op
+// anyway (:153-157).
+function applyLocalRespawn() {
+	const gVars = terra.export.g_vars;
+	if (gVars && typeof gVars.clearMapSessionVars === "function") {
+		gVars.clearMapSessionVars("_enemySpot");
+		gVars.clearMapSessionVars("_rogue_enemySpot");
+	}
+	const Spot = terra.export.EnemySpotEntity;
+	if (typeof Spot !== "function")
+		return;
+	for (const core of terra.export.g_gState?.entities ?? []) {
+		const ent = core?.ent;
+		if (!ent || !(ent instanceof Spot))
+			continue;
+		if (typeof ent.isDefeated !== "function" || typeof ent.respawn !== "function")
+			continue;
+		if (ent.isDefeated())
+			ent.respawn();
+	}
+}
+
+// Inbound MSG.ENEMY_RESPAWN (a rester -> server -> everyone but the sender). Routed here from
+// ./client.js. A reset for a map we are not on is ignored -- the local reset only makes sense for
+// the map in play, and every reset is map-shaped -- as is one that names no map at all. Gated on the
+// option AND the connection, like the send side: with the feature off, or offline, this module holds
+// no world to reset and applies nothing. Idempotent: a repeat reset clears already-cleared variables
+// and respawns no spot that is not defeated, and the re-split it leads to is the same one. The
+// respawned enemies are re-announced by the ordinary per-frame registration diff, and the server's
+// arbiter re-splits their room as those registrations arrive -- this handler does not touch
+// ownership itself.
+export function onEnemyRespawn(msg) {
+	if (!isEnemySyncEnabled() || !isConnected())
+		return;
+	const map = typeof msg?.map === "string" ? msg.map : "";
+	if (map === "" || map !== activeMapPath())
+		return;
+	applyLocalRespawn();
+	if (debugEnabled())
+		debugLog(`enemy respawn applied for ${map} (announced by ${msg?.from == null ? "?" : msg.from})`);
 }
 
 // ─────────────────────────────── public readers ───────────────────────────────
@@ -1072,6 +1361,7 @@ addPeerMessageHandler(MSG.ENEMY_OWNER, onEnemyOwner);
 addPeerMessageHandler(MSG.ENEMY_STATE, onEnemyState);
 addPeerMessageHandler(MSG.ENEMY_HANDOFF, onEnemyHandoff);
 addPeerMessageHandler(MSG.ENEMY_DESPAWN, onEnemyDespawn);
+addPeerMessageHandler(MSG.ENEMY_RESPAWN, onEnemyRespawn);
 
 // ──────────────────────────────────── addon ────────────────────────────────────
 
@@ -1094,13 +1384,14 @@ class EnemySync {
 	}
 
 	onPreUpdate() {
-		// The owner half's seam (see ensureDespawnPatch): installed once, and this hook is where it
-		// happens because it runs before this frame's entity updates -- an enemy can die in any frame,
-		// whether or not this module has driven anything yet, so the map-start install the puppet
-		// patches use would not cover a flag switched on mid-map. Installed while the option is off
-		// too: the wrapper is inert then (it re-tests the option per death), and there is no hook that
-		// fires on the moment the option changes.
+		// The owner half's seams (see ensureDespawnPatch / ensureRespawnPatch): installed once, and this
+		// hook is where it happens because it runs before this frame's entity updates -- an enemy can die
+		// in any frame, and a player can rest in any frame, whether or not this module has driven
+		// anything yet, so the map-start install the puppet patches use would not cover a flag switched
+		// on mid-map. Installed while the option is off too: the wrappers are inert then (they re-test the
+		// option per call), and there is no hook that fires on the moment the option changes.
 		ensureDespawnPatch();
+		ensureRespawnPatch();
 		applyPeerState(syncEnemies());
 	}
 
