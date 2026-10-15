@@ -38,8 +38,9 @@
  *   - Rest/respawn half (Phase 4b): resting clears a PER-CLIENT dead-set, so the reset is synced --
  *     wrapping the engine's own CombatManager.onRestReset announces one MSG.ENEMY_RESPAWN
  *     (sendRespawn), and a recipient on that map runs the engine's own reset locally
- *     (onEnemyRespawn -> applyLocalRespawn: clear both session-var prefixes, respawn defeated
- *     spots), after which the normal registration diff re-announces and re-splits the enemies.
+ *     (onEnemyRespawn -> applyLocalRespawn: clear the engine's own rest-reset keys, respawn
+ *     defeated spots), after which the normal registration diff re-announces and re-splits the
+ *     enemies.
  * Public surface: ENEMY_SYNC_OPTION, enemyStableId, isEnemySyncEnabled, onEnemyOwner,
  *   onEnemyState, onEnemyHandoff, onEnemyDespawn, onEnemyRespawn, isOwner, getEnemyOwnerName,
  *   EnemySync
@@ -1154,6 +1155,7 @@ function despawnEnemyLocally(enemyId) {
 	handoffState.delete(enemyId);
 	adopted.delete(enemyId);
 	dyingPuppets.delete(enemyId);               // a landed despawn ends the dying latch, if any
+	dyingOwned.delete(enemyId);                 // and the owner-side deferred despawn, so it cannot linger
 	releaseHold(enemyId);                       // releases the held entity's puppet mark, if any
 	const puppeted = puppets.get(enemyId);
 	if (puppeted) {
@@ -1264,11 +1266,19 @@ function sendRespawn() {
 // Run the engine's own rest reset on THIS client, without the map reload the real rest does: clear
 // the same session dead-set variables the engine clears and respawn the already-defeated spots.
 //
-// Both halves matter. Clearing the variables (BOTH prefixes) is what the engine's rest does
-// (combat.js:273) and it is what stops a re-init or a later map load from re-marking these spots
-// defeated; but it does NOT touch a spot that is already loaded -- the rester's spots come back
-// because the rest TELEPORTS (reloads) the map and the fresh spot then reads a cleared variable. A
-// peer must not reload the map, so it needs the engine's own respawn path as well:
+// The variable half is the engine's rest reset, key for key and nothing more (combat.js:272-274):
+// `_enemySpot` and `_healPlant`. It is NOT "every per-client dead-set we can find": the ROGUE
+// prefixes (`_rogue_enemySpot`, `_rogue_healPlant`, rogue-manager.js:472-475) belong to a
+// different event -- the end of a rogue RUN (clearRun) -- and the engine's rest does not clear
+// them. Clearing `_rogue_enemySpot` here would respawn rogue enemies on this client that the
+// resting client still has dead: the asymmetry this whole path exists to remove, re-created in the
+// peer direction. The set is therefore exactly the one the engine's own reset writes.
+//
+// The variable half is also not enough on its own. It stops a re-init or a later map load from
+// re-marking these spots defeated, but it does NOT touch a spot that is already loaded -- the
+// rester's spots come back because the rest TELEPORTS (reloads) the map and the fresh spot then
+// reads a cleared variable. A peer must not reload the map, so it needs the engine's own respawn
+// path as well:
 // EnemySpotEntity.respawn() (enemy-spot-entity.js:152-169) is the supported "bring back a defeated
 // enemy" call (the engine's RESPAWN_ENEMY / RESPAWN_ENEMIES event steps use it, enemy-steps.js:248
 // / :269). It flips the spot back to INIT, drops its stale enemyEnt/eggEnt and triggers the spawn,
@@ -1281,8 +1291,10 @@ function sendRespawn() {
 function applyLocalRespawn() {
 	const gVars = terra.export.g_vars;
 	if (gVars && typeof gVars.clearMapSessionVars === "function") {
+		// Exactly CombatManager.onRestReset (combat.js:272-274), and only that: these two keys, in
+		// this order. See the note above on why the rogue prefixes are not ours to clear here.
 		gVars.clearMapSessionVars("_enemySpot");
-		gVars.clearMapSessionVars("_rogue_enemySpot");
+		gVars.clearMapSessionVars("_healPlant");
 	}
 	const Spot = terra.export.EnemySpotEntity;
 	if (typeof Spot !== "function")
