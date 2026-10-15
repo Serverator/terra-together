@@ -65,9 +65,20 @@
  *     field if we simulate it, the owner's carried `aggro` flag if we puppet it). Exposed as
  *     isEngaged()/engagedPlayers(), per enemy, so Phase 5b never has to re-derive it. The latch is
  *     not a live flag on purpose: the engine de-aggros an enemy before it grants its rewards.
- * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, enemyStableId,
- *   isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn, onEnemyRespawn,
- *   onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
+ *   - Kill rewards (Phase 5b), the consumer of that latch: every client grants ONLY its own local
+ *     player's share of a killed enemy, and only when that player was IN COMBAT with it (the
+ *     engagement latch above) or NEAR it (the engine's own player-proximity call, KILL_REWARD_RADIUS
+ *     -- see eligibleForKillReward, the one predicate both halves of this use). The engine's own
+ *     unconditional grant is intercepted for the enemies this client OWNS (the giveExp/dropItems
+ *     patch: rewards follow the fight, not ownership, and an owner legitimately can be far away),
+ *     and on a client that did NOT simulate the death the grant happens at the moment the death is
+ *     CERTAIN -- the received MSG.ENEMY_DESPAWN, or the bounded removal of a latched dying puppet
+ *     (grantKillReward, once per enemy). Nothing beyond that travels: giveExp/dropItems take no
+ *     arguments and read only per-client state, so every client can answer for itself, and a
+ *     grant never replays the owner's own kill bookkeeping (see grantKillReward).
+ * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
+ *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
+ *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
  *   g_game.map.active.path / g_scene.isRunning / g_player (the local player's position, for the
@@ -84,8 +95,11 @@
  *   Phase 5a hit half, additionally ./enemy-puppet.js's setEnemyHitSink/readHitDescriptor (the
  *   suppressed-hit seam and its wire shape) and the engine's own combat primitives, reached
  *   through terra.export: DamagerCmp, HitForce, AttackInfo, CombatStats (getAttackStats /
- *   the level-scaled attack-stat stand-in) and COMBATANT_PARTY. Inbound routing:
- *   ./client.js (see the note at the handler registration below).
+ *   the level-scaled attack-stat stand-in) and COMBATANT_PARTY; for the Phase 5b reward half,
+ *   additionally EnemyCmp.prototype.giveExp and EnemyCmp.prototype.dropItems (the owner-side reward
+ *   gate, wrapped once per class and resolved per entity) and the engine's own player-proximity
+ *   call, g_player.checkDistanceXY. Inbound routing: ./client.js (see the note at the handler
+ *   registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
  *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
  *   are released too, so no enemy can stay suppressed (or frozen) because this module stopped
@@ -187,6 +201,20 @@ export const ENGAGE_RADIUS = 15;
 // leaves a second of slack over the longest gap, and is short enough that a fight which ended long
 // ago is not still "engaged".
 export const ENGAGEMENT_TTL_MS = 4000;
+
+// How far from a killed enemy a player counts as "in that fight" without having been engaged with it,
+// in world units -- the second half of Sam's reward rule (Phase 5b: every player in the map gets the
+// reward, but only those NEAR the enemy or IN COMBAT with it). Measured with the ENGINE's own
+// local-player proximity idiom, `g_player.checkDistanceXY(enemyPos, radius)` (player-model.js:188-194,
+// the same call the enemy AI uses for its aggro upkeep at enemy-cmp.js:584, r=20, and for the on-hit
+// aggro clause at :1102, r=12), so "near" means here exactly what it means to the engine -- note that
+// that call is a FULL 3D distance despite its name (:190 `pos.distance`, vec3.js:469).
+// Deliberately the same number as ENGAGE_RADIUS: the rule's two halves describe one notion of "in
+// this fight", and two numbers for it would be a tuning trap. They stay two constants because they
+// are two different questions asked of two different things -- engagement is a LATCH recorded while
+// the enemy was FIGHTING (and is measured on XY, see withinEngageRadius), while this is a plain
+// distance to where the enemy died, asked once, at the death -- and because Sam tunes them in game.
+export const KILL_REWARD_RADIUS = 15;
 
 // How long a hit that has already been applied is remembered by its signature, in milliseconds --
 // the exactly-once guard for a re-delivered MSG.ENEMY_HIT frame (onEnemyHit). A duplicate of a
@@ -550,6 +578,10 @@ function syncEnemies() {
 		// The hit half holds no world either: a hit waiting to be sent belongs to a map we may have
 		// left, and engagement is ownership bookkeeping (Phase 5a).
 		clearHitState();
+		// Phase 5b's exactly-once marks go with the world they were made in (see
+		// clearKillRewardState). Safe whenever it happens: the enemies they name are the ones this
+		// module has just released, and a grant needs the enemy's entity.
+		clearKillRewardState();
 		return null;
 	}
 	const map = activeMapPath();
@@ -1044,6 +1076,9 @@ function resetForNewMap() {
 	// into the new one.
 	dyingPuppets.clear();
 	dyingOwned.clear();
+	// The reward half's exactly-once marks belong to the world they were made in for the same reason
+	// (Phase 5b): its entities are the ones being torn down here.
+	clearKillRewardState();
 	if (registry.size === 0)
 		return;
 	const ids = [...registry.keys()];
@@ -1223,10 +1258,13 @@ function findCoreById(enemyId) {
 // GameState.deactivateEntity -> the deferred deactivation that unregisters the entity from the
 // update/physics lists and finally buries it (:144-161). That is the same last step of every one of
 // the engine's own death paths (combatant-cmp.js:369 `this.ent.core.kill()`, :417-429
-// doManualKill, enemy-cmp.js:344-357 disappear(skipFx)), so nothing is left half-torn-down. NO
-// reward path is involved: giveExp and dropItems hang off `EnemyCmp.onDeathHit`
-// (enemy-cmp.js:1127-1130) and are not called here -- and because the death hit is not replayed
-// either, a despawn cannot grant anything on this client at all.
+// doManualKill, enemy-cmp.js:344-357 disappear(skipFx)), so nothing is left half-torn-down. The
+// engine's death hit itself is NOT replayed: giveExp and dropItems hang off `EnemyCmp.onDeathHit`
+// (enemy-cmp.js:1127-1130) and are not called here, so none of the owner's own kill bookkeeping
+// (rogue state, the defeat callback, screen shake, combat.setEnemyDefeated) can fire on a client
+// that did not fight the enemy. The REWARD is the one thing this removal does pay, and deliberately:
+// its caller grants the local player's share first (grantKillReward, Phase 5b), because for a client
+// that did not simulate the death this removal IS the moment the death is certain.
 function removeDefeatedEnemy(core) {
 	const enemy = terra.export.EnemyCmp?.get?.(core?.ent);
 	// The dead-set FIRST: killing the entity destroys its components' links, so the spot has to be
@@ -1239,10 +1277,19 @@ function removeDefeatedEnemy(core) {
 // Apply one despawn, idempotently. Every case that is not "an enemy this client still holds" has to
 // end here as a no-op: an id we never held, an enemy already killed or buried (so `findCoreById`
 // finds nothing), and a repeat of a despawn we already applied.
+//
+// It is also where a client that did NOT simulate the death pays its own player (Phase 5b): the
+// received despawn and the bounded removal of a latched dying puppet are the two events that make the
+// death certain here, and both go through this one function -- as does the takeover of an enemy this
+// client saw die as a puppet, whose death is certain for the same reason (it was latched dying from
+// the owner's own 0 HP). The grant is asked BEFORE the removal, because granting needs the enemy: its
+// type and level for the XP, and its position for the drops.
 function despawnEnemyLocally(enemyId) {
 	const core = findCoreById(enemyId);
-	if (core)
+	if (core) {
+		grantKillReward(enemyId, core.ent);
 		removeDefeatedEnemy(core);
+	}
 
 	// The per-id bookkeeping goes either way. A killed entity is no longer live, so the per-frame
 	// sweeps (syncEnemies, applyPeerState) would drop all of this on the next frame anyway; doing it
@@ -2093,6 +2140,209 @@ function updateEngagement(live) {
 	}
 }
 
+// ────────────────────────────── phase 5b: kill rewards ──────────────────────────────
+
+// The enemies this client has ALREADY paid a kill reward for, keyed by the ENEMY ENTITY's own uid
+// (see killRewardKey). The exactly-once guard of the phase, written by BOTH grant paths: the gated
+// engine call below (the owner's own death) and grantKillReward (a death that became certain here
+// without the engine's death path ever running). Both halves need it, because the same enemy can
+// arrive twice: the dying entity is still in the world when a peer's despawn for it lands (the
+// engine removes it only when the death animation ends), and the bounded removal of a latched dying
+// puppet can be followed by the despawn that was in flight. Entries live until the resets that
+// abandon the world clear them (clearKillRewardState -- a REST deliberately does not: see there).
+const grantedKills = new Set();
+
+// The exactly-once key of a kill reward: the enemy ENTITY's own uid -- the engine's per-entity
+// counter (`++Entity.globalUid`, so it is unique inside one client) -- i.e. THIS incarnation of this
+// enemy on THIS client, which is what "grant once per kill" means. Deliberately not the wire id: a
+// wire id names a SPOT, and a spot's enemy can come back (a rest, a scripted RESPAWN_ENEMY) as a
+// brand-new entity that must be able to be paid on its own account, with a new uid. The wire id is
+// only the fallback for an entity that carries no uid (the engine always sets one; see the same
+// `?? "?"` fallback in enemyStableId) -- coarser, and in that degenerate case it can only ever
+// over-suppress, which is the safe direction for a double-grant guard.
+function killRewardKey(ent, enemyId) {
+	const uid = ent?.core?.uid;
+	if (typeof uid === "number")
+		return uid;
+	return typeof enemyId === "string" && enemyId !== "" ? enemyId : null;
+}
+
+// Is the LOCAL player entitled to a share of `enemyId`'s reward? Sam's rule in one place, asked by
+// BOTH halves of the split -- which is the point of having it here rather than inline twice: the
+// peer that grants and the owner that gates must agree on what "in this fight" means.
+//
+//   * IN COMBAT is isEngaged(enemyId, myId): Phase 5a's latch -- this player hit the enemy, or was
+//     inside ENGAGE_RADIUS of it while it was in a fight. It has to be the LATCH rather than the
+//     enemy's live state, because the engine de-aggros an enemy seven lines before it grants its
+//     rewards (enemy-cmp.js:1122 vs :1129), and because on a client that did not simulate the death
+//     the question is asked after the enemy is gone.
+//   * NEAR is the engine's own player-proximity call against the enemy's position (player-model.js:
+//     188-194, see KILL_REWARD_RADIUS): a player who walked up to the corpse of an enemy they never
+//     touched shares in it, which is what Sam asked for, and it is what pays the case the latch
+//     cannot -- a player who arrived after the last hit.
+// The question is asked when the death is CERTAIN on the asking client (its own death path, or the
+// definitive event), never off streamed state: a streamed `hp === 0` can be a live enemy whose HP
+// merely rounds to 0 (see the dying latch and suite 08).
+function eligibleForKillReward(enemyId, ent) {
+	const me = localPlayerId();
+	if (me === null)
+		return false;
+	if (isEngaged(enemyId, me))
+		return true;
+	const pos = ent?.core?.pos;
+	if (!pos)
+		return false;
+	return terra.export.g_player?.checkDistanceXY?.(pos, KILL_REWARD_RADIUS) === true;
+}
+
+// Pay the LOCAL player their share of an enemy that has just been established as DEAD on this
+// client -- the peer half of the phase, for an enemy this client did not simulate. Its callers are
+// the two deaths that become certain here without the engine's own death path ever running locally:
+// the owner's MSG.ENEMY_DESPAWN, and the bounded removal of a latched dying puppet (both through
+// despawnEnemyLocally).
+//
+// That a client can grant for an enemy it never simulated is the whole mechanism: giveExp and
+// dropItems take NO ARGUMENTS and read only per-client state (the local g_player, this client's own
+// drop rolls, the enemy's own type/level), so each client answers for itself from facts it already
+// has -- which is why this phase adds nothing to the wire.
+//
+// What deliberately does NOT happen here is the owner's own kill bookkeeping:
+// rogue.onEnemyKilled, the defeatCallback / BattleSequence flow (the wave counters), screen shake
+// and combat.setEnemyDefeated. Those describe the kill to the client that fought it -- aim handles,
+// trackers, scripted progression -- and replaying them on a client that did not would double-count
+// exactly what markSpotDefeated is careful to avoid. A peer's grant is the two reward calls and
+// nothing else.
+//
+// KNOWN GAP, documented rather than worked around: `this.hitExp`, which giveExp uses for the
+// weapon-experience share, is written in EnemyCmp.onPreDamage -- and a puppet's onHit is suppressed
+// before it (./enemy-puppet.js patch (c), which reports the hit instead of applying it), so on a
+// peer that map is empty and the weapon-XP part of the share is lost. The base XP and the drops are
+// unaffected; only the weapon-XP split of a kill you did not simulate is missing.
+function grantKillReward(enemyId, ent) {
+	if (!isEnemySyncEnabled() || !isConnected())
+		return false;
+	if (!ent)
+		return false;
+	const key = killRewardKey(ent, enemyId);
+	if (key !== null && grantedKills.has(key))
+		return false;
+	if (!eligibleForKillReward(enemyId, ent)) {
+		if (debugEnabled())
+			debugLog(`kill reward for ${enemyId}: our player was neither in combat with nor near it, nothing paid`);
+		return false;
+	}
+	const enemy = terra.export.EnemyCmp?.get?.(ent);
+	if (!enemy || typeof enemy.giveExp !== "function" || typeof enemy.dropItems !== "function")
+		return false;
+	// Marked BEFORE the calls: a grant that throws half-way must not be repeatable, and the mark is
+	// "this kill has been paid", not "the calls returned".
+	if (key !== null)
+		grantedKills.add(key);
+	// Through the ORIGINAL methods, never the wrappers below: those are the owner's GATE, and this
+	// path has just made the same decision for itself (asking it twice could only disagree with
+	// itself, and would log a second, misleading "skipped").
+	callRewardGrant(enemy, "giveExp");
+	callRewardGrant(enemy, "dropItems");
+	if (debugEnabled())
+		debugLog(`kill reward for ${enemyId}: paid to our player (${isEngaged(enemyId, localPlayerId()) ? "in combat" : "near"})`);
+	return true;
+}
+
+// One of the two engine reward calls, through the stored original when the gate below is installed
+// (see ensureRewardPatch) and directly otherwise.
+function callRewardGrant(enemy, name) {
+	const original = rewardGrants?.[name];
+	(original ?? enemy[name]).call(enemy);
+}
+
+// Drop the exactly-once marks. Part of the resets that abandon the world they belong to (a map
+// change, the feature going off, a disconnect -- the same paths that drop the peer state and the
+// engagement records). A REST is deliberately not one of them: it puts the map's enemies back, and a
+// respawned enemy is a new ENTITY with a new uid, so its own death must be payable on its own
+// account. Nothing that could still be paid is forgotten here: a grant needs the enemy's entity, and
+// the entities these keys name have left the world.
+function clearKillRewardState() {
+	grantedKills.clear();
+}
+
+// ── the owner's own grant, gated ──
+//
+// The engine grants a beaten enemy's reward unconditionally, in its own death path
+// (enemy-cmp.js:1129-1130, reached only from onDeathHit :1119). With rewards following the FIGHT
+// rather than ownership, that is the wrong answer for an owner whose own player is nowhere near the
+// enemy -- and an owner legitimately CAN be far from it, because ownership is a load-balancing
+// decision, not a proximity one. So the two calls are wrapped, per entity: when the feature is on,
+// this client is connected and the enemy is one WE own, a grant whose own player is neither engaged
+// with nor near it is skipped. Everything else -- solo play, the feature off, offline, an enemy we
+// do not own, a runtime spawn with no wire id -- runs the engine's own code untouched.
+//
+// This is the OWNER half of the phase, i.e. the one place a reward is granted where the engine has
+// always granted one; the peer half is grantKillReward above. Nothing else in the death path is
+// touched: the spot's defeat, the HUD, the screen shake, the defeat callback and the wave
+// bookkeeping all still run for the owner, whose kill it is.
+function ownerRewardBlocked(enemy) {
+	if (!isEnemySyncEnabled() || !isConnected())
+		return false;
+	const ent = enemy?.ent;
+	const id = wireEnemyId(ent?.core);
+	if (id === null || !isOwner(id))
+		return false;
+	return !eligibleForKillReward(id, ent);
+}
+
+// The unpatched reward calls, kept so the peer half (grantKillReward) can grant without re-entering
+// the gate above. Filled by ensureRewardPatch; null until it has run (an unknown game build leaves
+// it null and the peer half falls back to calling the method itself).
+let rewardGrants = null;
+let rewardPatched = false;
+
+// Install the two reward seams. Install-once, called every frame from the addon (see onPreUpdate)
+// for the same reason the death seam is: an enemy can die in any frame, and this must be in place
+// BEFORE the first enemy dies, whether or not this module has driven anything yet, and whether or
+// not the option was on at the last map start. The wrappers are inert while the feature is off (they
+// re-test it per call), so installing them unconditionally costs nothing and covers a flag switched
+// on mid-map. A missing export leaves the flag alone so a later frame can retry, and is reported
+// when the trace is on: silently believing rewards are gated would be worse than not gating them.
+function ensureRewardPatch() {
+	if (rewardPatched)
+		return;
+	const proto = terra.export.EnemyCmp?.prototype;
+	if (!proto || typeof proto.giveExp !== "function" || typeof proto.dropItems !== "function") {
+		if (debugEnabled())
+			debugLog("cannot install the reward patch: terra.export.EnemyCmp.giveExp/dropItems is missing");
+		return;
+	}
+	const grants = {};
+	for (const name of ["giveExp", "dropItems"]) {
+		const original = proto[name];
+		if (original.__ttRewardPatched === true) {
+			grants[name] = original;
+			continue;
+		}
+		const wrapper = function (...args) {
+			// OURS, and our own player is ineligible: the engine's grant is skipped, so an owner who
+			// is nowhere near the enemy is not paid for it. The death itself is untouched -- the rest
+			// of onDeathHit still runs (see the note on ownerRewardBlocked).
+			if (ownerRewardBlocked(this)) {
+				if (debugEnabled())
+					debugLog(`kill reward for ${wireEnemyId(this?.ent?.core)}: our player is neither in combat with nor near it, granting nothing`);
+				return undefined;
+			}
+			// A grant the engine is making for us right now: recorded, so no later event for the same
+			// enemy (a peer's despawn while its dying entity is still in the world) can pay it twice.
+			const key = killRewardKey(this?.ent, wireEnemyId(this?.ent?.core));
+			if (key !== null)
+				grantedKills.add(key);
+			return original.apply(this, args);
+		};
+		wrapper.__ttRewardPatched = true;
+		proto[name] = wrapper;
+		grants[name] = original;
+	}
+	rewardGrants = grants;
+	rewardPatched = true;
+}
+
 // ─────────────────────────────── public readers ───────────────────────────────
 
 // True when the local player is the server-assigned simulator of `enemyId`. False for an
@@ -2157,7 +2407,8 @@ setEnemyHitSink(onEnemyHitSeam);
 // the state publish is per-frame, and only while there is a peer and something we own to send.
 // Phase 5a adds two more end-of-frame duties to onPostUpdate, both owner-side bookkeeping: the
 // queue of hits this client could not apply (sendHitQueue) and the engagement pass
-// (updateEngagement).
+// (updateEngagement). Phase 5b adds nothing to the loop: its peer half hangs off the death events
+// (despawnEnemyLocally), and its owner half is a prototype gate installed by onPreUpdate.
 class EnemySync {
 	onGameMapStart() {
 		resetForNewMap();
@@ -2169,14 +2420,17 @@ class EnemySync {
 	}
 
 	onPreUpdate() {
-		// The owner half's seams (see ensureDespawnPatch / ensureRespawnPatch): installed once, and this
-		// hook is where it happens because it runs before this frame's entity updates -- an enemy can die
-		// in any frame, and a player can rest in any frame, whether or not this module has driven
-		// anything yet, so the map-start install the puppet patches use would not cover a flag switched
-		// on mid-map. Installed while the option is off too: the wrappers are inert then (they re-test the
-		// option per call), and there is no hook that fires on the moment the option changes.
+		// The engine seams that hang off a per-entity decision -- the death seam (ensureDespawnPatch),
+		// the rest seam (ensureRespawnPatch) and Phase 5b's reward gate (ensureRewardPatch) -- are
+		// installed once, and this hook is where it happens because it runs before this frame's entity
+		// updates: an enemy can die in any frame, and a player can rest in any frame, whether or not this
+		// module has driven anything yet, so the map-start install the puppet patches use would not cover
+		// a flag switched on mid-map. Installed while the option is off too: the wrappers are inert then
+		// (they re-test the option per call), and there is no hook that fires on the moment the option
+		// changes.
 		ensureDespawnPatch();
 		ensureRespawnPatch();
+		ensureRewardPatch();
 		applyPeerState(syncEnemies());
 	}
 
