@@ -6,14 +6,13 @@
  *  - name text, scaled by the tt-nameplate-scale option
  *  - HP bar ColorGuis: fill ramp, pending-heal preview, lost-HP flash, downed/revive slices
  *  - what peers/self show, from the tt-nameplates / tt-hpbar options
- * Public surface: NameplateGui (also self-registers the addon that creates it)
+ * Public surface: none (registers its own Nameplates addon at import time)
  * Engine touchpoints: terra.addAddon (onLoopStart 50000), terra.export g_gui / g_options /
  *  g_scene / g_player / g_system / g_tick, GuiElement, TextGui, ColorGui, Color;
  *  window.terraTogether.playerActors / playerNames / reviveState (see src/client/client.js)
  * Notes: building and anchoring the label text lives in ../debug/labels.js, shared with
- *  src/debug/enemy-debug.js. Bar geometry is in nameplate text pixels, so it scales with
- *  the text at any Nameplate Scale. Font/outline/align enum refs:
- *  features/font/font-system-types.js:5-14.
+ *  src/debug/enemy-debug.js (the font/align enum refs are documented there). Bar geometry
+ *  is in nameplate text pixels, so it scales with the text at any Nameplate Scale.
  */
 
 import { createLabel, headLabelPos, anchorLabel, placeLabelAbove, hideLabel, LABEL_HIDDEN_X } from "../debug/labels.js";
@@ -41,7 +40,9 @@ const HP_BAR_BG_COLOR = HP_BAR_ENABLED ? new Color(55 / 255, 55 / 255, 55 / 255,
 const HP_BAR_FILL_HIGH = HP_BAR_ENABLED ? new Color(44 / 255, 176 / 255, 68 / 255, 1) : null;
 const HP_BAR_FILL_MID = HP_BAR_ENABLED ? new Color(222 / 255, 176 / 255, 32 / 255, 1) : null;
 const HP_BAR_FILL_LOW = HP_BAR_ENABLED ? new Color(214 / 255, 48 / 255, 40 / 255, 1) : null;
-// Pending-heal (HoT) preview, matching the HUD's HEAL color (hp-hud.js HUD_COLORS_HP.HEAL).
+// Pending-heal (HoT) preview. Deliberately brighter than the HUD's HEAL color -- this is
+// rgb(55,110,110), while hp-hud.js HUD_COLORS_HP.HEAL is #274747 = rgb(39,71,71). Same teal
+// family, but NOT the same value; the gap is intentional so the thin nameplate bar reads.
 const HP_BAR_REG_COLOR = HP_BAR_ENABLED ? new Color(55 / 255, 110 / 255, 110 / 255, 1) : null;
 // Lost-HP flash: on damage the lost slice shows in pink, lingers at full for
 // HP_BAR_DAMAGE_HOLD seconds, then drains toward the current HP
@@ -351,6 +352,9 @@ class NameplateGui extends terra.export.GuiElement {
 		}
 	}
 }
+// GuiHook reads `element.constructor.states` when the element attaches
+// (features/gui/gui-hook.js:95); both states are instant (duration 0) so a plate never
+// fades. Overrides GuiElement's base table (DEFAULT only, spline EASE, 0.2s).
 NameplateGui.states = {
 	DEFAULT: { transform: { alpha: 1 }, duration: 0 },
 	HIDDEN: { transform: { alpha: 0 }, duration: 0 }
@@ -363,7 +367,5 @@ class Nameplates {
 }
 
 terra.addAddon(new Nameplates(), { onLoopStart: 50000 });
-
-export { NameplateGui };
 
 //# sourceURL=/mods/terra-together/features/nameplates.js

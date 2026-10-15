@@ -12,11 +12,21 @@
  *   g_menuSFX, ColorDecorator, g_gui, g_label, Observable; window.terraTogether.{reviveEnabled,
  *   estusShareEnabled}; addon hooks — main.js calls createModSettings() from its
  *   Multiplayer.onLoopStart and registers SettingsTab as an addon at onLoopStart: 40000.
- * Notes: the stored option value is the source of truth; the terraTogether mirrors are read
- *   by revive.js (reviveEnabled) and area-heal.js (estusShareEnabled), and are re-pushed to
- *   clients by server.js setHostSetting -> host_setting -> client.js. Option keys (tt-*) are
- *   read by main.js, nameplates.js and enemy-debug.js — do not rename them. See option-types.js
- *   for the TEXT/BUTTON types and for createOption().
+ * Notes: the stored option value (g_options.values[key], read through g_options.get()) is
+ *   the source of truth; the terraTogether mirrors are read by revive.js (reviveEnabled) and
+ *   area-heal.js (estusShareEnabled, preferring the mirror and falling back to the option),
+ *   and are re-pushed to clients by server.js setHostSetting -> host_setting -> client.js. Lifecycle: createModSettings() runs once per
+ *   game-loop start (main.js Multiplayer.onLoopStart, addon order -10000) and must be done
+ *   before the Options menu builds its rows, because option-types.js is what registers each
+ *   option in g_options.settings and seeds g_options.values — an option has to be created
+ *   before anything reads it, and the host toggles are read again by syncRevive() /
+ *   syncEstusShare() right after they are declared. `local: true` marks a per-machine
+ *   preference: the engine persists those to localStorage and keeps them out of the save
+ *   file (OptionsManager.writeLocalStorage / onLoadSystemData), which is what the mod wants
+ *   for connection details and for the host-authoritative toggles the host pushes down.
+ *   Option keys (tt-*) are read all over the mod (main.js, features/*, client/session.js,
+ *   debug/enemy-debug.js) — do not rename them. See option-types.js for the TEXT/BUTTON types
+ *   and for createOption().
  */
 
 import { createTextOption, createButtonOption, createOption } from "./option-types.js";
@@ -63,8 +73,12 @@ export function syncEstusShare() {
 		server.setHostSetting(ESTUS_OPTION, isEstusShareEnabled());
 }
 
-// The game's CHECKBOX option type has no enable predicate, so patch its GUI once: grey out
-// and refuse changes when the option's getEnabled() returns false (host-only setting).
+// The game's CHECKBOX renderer never asks its option whether it may be edited (there is no
+// getEnabled() anywhere in the engine), so a host-only setting would be freely togglable on a
+// client that has to obey the host. Patch the renderer once instead: grey the buttons out and
+// refuse the change when option.getEnabled() says no. The engine's own checkboxes don't define
+// getEnabled at all, so the typeof test leaves every other checkbox alone. Idempotent — the
+// flag stops createModSettings() from wrapping the methods twice if the loop restarts.
 function installHostOnlyCheckbox() {
 	const Gui = terra.export.OptionGuiTypeBuilder?.builders?.get("CHECKBOX");
 	if (!Gui?.prototype?.submitChange || Gui.prototype._ttHostOnly)
@@ -96,6 +110,13 @@ function installHostOnlyCheckbox() {
 }
 
 // Adds the mod's settings. Call once at startup, before Options builds its lists.
+//
+// The engine seeds g_options.values only for the options listed in its own options.json, and
+// g_options.get() has no default fallback, so every option the mod injects has to be put into
+// g_options.settings and have its value seeded here. createOption() / createTextOption() /
+// createButtonOption() do that for us; the settings further down that are built by hand just
+// write the same two lines out explicitly, either because they use a type this module has no
+// factory for (RADIO_GROUP) or because they build their data block inline.
 export function createModSettings() {
 	let g_options = terra.export.g_options;
 
@@ -112,6 +133,12 @@ export function createModSettings() {
 
 	createSkinSetting()
 
+	// RADIO_GROUP is a type the game already registers, so the mod adds the option by hand:
+	// into g_options.settings, plus a default for g_options.values. The seed matters here —
+	// the radio renderer reads g_options.get() raw, so an unseeded row would draw with
+	// nothing selected. Note the test is `=== undefined` (option-types.addSetting() also
+	// treats null as absent): a value restored from localStorage is kept as-is, and every
+	// read site of these keys coalesces a null one with its own `?? <default>`.
 	let nameplateData = {
 		category: CATEGORY,
 		local: true,
@@ -303,6 +330,9 @@ export function createModSettings() {
 		g_options.values["tt-auto-host"] = autoHostData.type.default;
 
 	// === Miscellaneous ===
+	// No explicit seed for this one or for tt-hide-party below: both default to false, and
+	// every read site coalesces the missing entry with `?? false`, so an absent value behaves
+	// exactly like false. (The truthy defaults above do need the seed, as noted there.)
 	let alwaysFocusedData = {
 		category: CATEGORY,
 		header: "Miscellaneous",
@@ -359,6 +389,10 @@ export function createModSettings() {
 }
 
 // Adds the mod's tab to the Options menu (as an addon, after the menu is built).
+//
+// Runs once per game-loop start at addon order 40000. The engine's MenuManager builds the
+// MainMenu at onLoopStart order 0, so g_gui.hooks already holds it by the time this runs —
+// that ordering is the only reason the two lookups below can skip a null check.
 export class SettingsTab extends terra.export.Observable {
 	onLoopStart() {
 		let mainMenu = terra.export.g_gui.hooks.find(x => x.gui?.constructor.name == "MainMenu").gui;

@@ -9,7 +9,7 @@
  *     their host callbacks, then inject the collaborators session.js cannot import back.
  *   - Re-export the public API (../main.js and ../config/settings.js consume it).
  * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send
- * Engine touchpoints: terra.export.{Observable,System,g_scene,g_options,g_game,g_player},
+ * Engine touchpoints: terra.export.{Observable,System,g_scene,g_options,g_game},
  *   terra.addAddon (onGameMapStart 35000, onLoopStart 35000), System.prototype.setWindowFocus
  * Notes: keep this file thin — it orchestrates only. The peer maps/connection live in
  *   ./session.js, the snapshot ends in ./snapshot.js, the peer actors in ./actors.js and
@@ -36,14 +36,15 @@ import { isHosting, getHostPort } from "../server/server.js";
 import { Reviver } from "../features/revive.js";
 import { AreaHealer } from "../features/area-heal.js";
 
-// Public API — unchanged surface, now owned by ./session.js.
+// Public API — re-exported from ./session.js for ../main.js and ../config/settings.js.
 export { joinServer, leaveServer, disconnect, isConnected, isConnecting, send };
 
-// Scene the last onSceneStateEvent saw: the addon's own scene gating state.
+// Last scene seen by onSceneStateEvent (see the note on its gate); "INIT" only until the
+// first scene event arrives.
 let lastScene = "INIT";
 
 // --- Composition root ---------------------------------------------------------
-// Downed/revive handling lives in its own module.
+// Downed/revive handling is delegated to ../features/revive.js.
 const reviver = new Reviver({
 	send,
 	isConnected,
@@ -54,7 +55,7 @@ const reviver = new Reviver({
 	setLocalDowned,
 });
 
-// Area estus heal handling lives in its own module.
+// Area estus heal handling is delegated to ../features/area-heal.js.
 const areaHealer = new AreaHealer({
 	send,
 	isConnected,
@@ -114,9 +115,11 @@ class MultiplayerClient extends terra.export.Observable {
 	}
 
 	onOptionEvent(event, key) {
-		// NOTE: `key = 'tt-skin'` (assignment, not comparison) is pre-existing; kept as-is so
-		// behaviour is unchanged. The body therefore always sends a snapshot.
-		if (key = 'tt-skin') {
+		// A skin change must reach peers at once: while the Options menu is open the scene is
+		// MENU and the loop is paused, so sendPlayerData's per-frame call is throttled (./snapshot.js);
+		// this forced send bypasses that. Peers re-apply the figure when its name changes
+		// (see movePlayerActor in ./actors.js).
+		if (key === 'tt-skin') {
 			sendPlayerData(true);
 		}
 	}
@@ -131,6 +134,8 @@ class MultiplayerClient extends terra.export.Observable {
 		playerActors.clear();
 		playerUpdates.clear();
 
+		// Tell the server which room we are in; it replays the stored state of peers already
+		// there, matched on map + rogue variant (server.js MSG.JOIN_MAP case).
 		let map = terra.export.g_game.map.active?.path;
 		let variant = getRogueInfo().variant;
 		send({ type: MSG.JOIN_MAP, map, variant });
@@ -146,6 +151,8 @@ class MultiplayerClient extends terra.export.Observable {
 		const scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 		if (scene != "RUNNING")
 			return;
+		// "PAUSED" is the mod's own pseudo-scene (the receiver freezes the peer on it, see the
+		// MSG.SCENE_CHANGED case in ./session.js); it is not a SCENE_STATE value.
 		send({ type: MSG.SCENE_CHANGED, scene: "PAUSED" });
 		sendPlayerData(true, "PAUSED");
 	}
@@ -162,6 +169,8 @@ class MultiplayerClient extends terra.export.Observable {
 		let originalsetWindowFocus = terra.export.System.prototype.setWindowFocus;
 		terra.export.System.prototype.setWindowFocus = function (...args) {
 			const result = originalsetWindowFocus.apply(this, args);
+			// The engine argument is windowFocusLost, not "focused" (blur passes true, focus
+			// passes false — engine/input/input.js blur/focus), hence the inversion.
 			focusChange(!args[0]);
 			return result;
 		};
@@ -171,6 +180,10 @@ class MultiplayerClient extends terra.export.Observable {
 	}
 
 	onSceneStateEvent(event) {
+		// Gate is effectively inert: the engine only writes g_scene.currentState in
+		// SceneManager.setState(), which always fires SCENE_CHANGED, so on any other event the
+		// scene still equals lastScene and the send below goes through anyway. A "send only on a
+		// real change" reading would test `scene == lastScene` here instead.
 		let scene = SCENE_STATE[terra.export.g_scene.currentState];
 		if (event != SCENE_EVENT.SCENE_CHANGED && scene != lastScene) return;
 		lastScene = scene;

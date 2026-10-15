@@ -16,7 +16,7 @@
  * Notes: callers own their scale — the player nameplates follow the "Nameplate Scale"
  *  option, the enemy overlay is fixed at 0.5 — and anything they stack under a label
  *  (the nameplate HP bar). headLabelPos() returns a shared scratch vector: consume it
- *  before calling headLabelPos() again.
+ *  before calling headLabelPos() again (see the note on `labelWorld` below).
  */
 
 const Vec3 = terra.export.Vec3;
@@ -35,8 +35,14 @@ export const LABEL_HEAD_OFFSET = 0.4;
 // layout survives), so re-showing it costs nothing; it is simply drawn off-screen.
 export const LABEL_HIDDEN_X = -100000;
 
-// Scratch world-space output for EntityTools.getAlignedPos(). Only ever read within the
-// frame that filled it, so one shared vector is safe.
+// Scratch world-space output for EntityTools.getAlignedPos(). One vector is safe because it
+// is only ever handed back to the caller that just filled it, and every caller reads it in
+// the same call: each update pass calls headLabelPos() at most once per label and passes the
+// result straight into anchorLabel(), which copies it into the GUI hook's screen position
+// before anything else can run. Neither caller stores the vector, and nothing reached from
+// here (anchorLabel/transformToMapPos) calls back into headLabelPos(), so there is no way for
+// a second call to overwrite it in between. The returned value is that same shared vector —
+// do not retain it across calls or store it in an entry.
 const labelWorld = new Vec3();
 
 // A TextGui for a world label, drawn at `scale` and positioned from its own top-left
@@ -83,8 +89,10 @@ export function headLabelPos(entity, extraZ = 0) {
 }
 
 // Project `text` to map (screen) space at the world position `pos`, applying `scale`.
-// ignoreScale=true: transformToMapPos must not overwrite hook.scale, we own it
-// (features/gui/gui-hook.js:221-229).
+// ignoreScale=true is essential: with it false, transformToMapPos() overwrites hook.scale
+// with the pixel size implied by the current camera distance (features/gui/gui-hook.js:225-228),
+// so the label would be scaled by perspective instead of holding the caller's size.
+// `pos` is read here and not kept, so the caller's scratch vector is free again on return.
 export function anchorLabel(text, scale, pos) {
 	text.hook.scale = scale;
 	text.hook.transformToMapPos(pos, true);
@@ -94,11 +102,18 @@ export function anchorLabel(text, scale, pos) {
 // `baselineY`, both read from text.hook.pos after anchorLabel(). A label with nothing
 // stacked beneath it passes its own anchor for `baselineY`; a nameplate lowered by its
 // HP bar passes the raised baseline instead.
+//
+// hook.size is the measured text block, which TextGui only refreshes when it re-measures
+// (features/gui/text/text.js:204-210) — so an unmeasured label can report a non-finite axis
+// here. Clamp per axis rather than zeroing both: the axes are measured independently, so a
+// known height should still lift the text off the baseline exactly as far as it is tall
+// (that is the whole contract above), and zeroing it would instead draw the label from
+// `baselineY` downwards. A non-finite width lands on `anchorX` either way, so the per-axis
+// clamp is never worse than the both-or-neither one; it only discards less information. And
+// neither axis can reach the hook as NaN, whatever the text reports.
 export function placeLabelAbove(text, anchorX, baselineY, scale) {
 	let w = text.hook.size.x * scale;
 	let h = text.hook.size.y * scale;
-	// An unmeasured text can report a non-finite size. Clamp per axis: each axis then
-	// contributes 0 instead of pushing the label position to NaN.
 	if (!Number.isFinite(w)) w = 0;
 	if (!Number.isFinite(h)) h = 0;
 	text.hook.pos.x = anchorX - w * 0.5;

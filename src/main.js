@@ -12,8 +12,8 @@
  * Engine touchpoints: terra.addAddon, terra.export.Observable, g_options, g_party,
  *   g_system, GAME_CONF, OPTION_EVENT; window.terraTogether.steps (+ the globals the
  *   features publish themselves).
- * Notes: The addon priority numbers below are load-order significant — do not
- *   renumber (see the comment on each terra.addAddon call).
+ * Notes: The addon priority numbers below are load-order significant — see the note
+ *   above the terra.addAddon calls before changing them.
  */
 
 import { registerOptionTypes } from "./config/option-types.js";
@@ -40,6 +40,11 @@ class Multiplayer extends terra.export.Observable {
 	}
 
 	onOptionEvent(event, key) {
+		// The engine calls this as onOptionEvent(event, key) (engine/options/options-manager.js:174).
+		// `key` is the changed option for CHANGED, but undefined for SETTINGS_UPDATED/LOADED, so
+		// the branches below switch on `key` and only the always-focused one also accepts those
+		// two events.
+
 		// Keep the server informed when the player renames themselves.
 		if (key === "tt-username") {
 			const name = String(terra.export.g_options.get("tt-username") ?? "").trim();
@@ -138,9 +143,16 @@ class Multiplayer extends terra.export.Observable {
 	}
 }
 
+// Addon order numbers are load-order keys, not priorities: the engine sorts each hook
+// list ascending and runs the hooks in that order (engine/addons.js AddonList). The game's
+// own onLoopStart hooks sit at -1000..990 (storage -1000, menu manager 0, hud 1, rogue 2,
+// blur 990), so -10000 runs before the menus/title screen exist and 40000+ after. Do not
+// renumber.
 terra.addAddon(new Multiplayer(), { onAddonInit: -10000, onLoopStart: -10000, onGameMapStart: 35000 });
+// 40000: after the game's own loop-start hooks, so MainMenu already exists.
 terra.addAddon(new SettingsTab(), { onLoopStart: 40000 });
-// Enemy debug overlay: added just after the nameplates so its labels draw on top.
+// Enemy debug overlay: 50001, just after the nameplates (50000, features/nameplates.js)
+// so its labels draw on top.
 terra.addAddon(new EnemyDebug(), { onLoopStart: 50001 });
 
 //# sourceURL=/mods/terra-together/main.js

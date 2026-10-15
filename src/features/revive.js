@@ -16,7 +16,13 @@
  * Notes: Gated by window.terraTogether.reviveEnabled (mirrored by
  *   config/settings.js); host-authoritative, default OFF. client.js owns the
  *   addon/loop wiring and forwards net messages to onMessage/onPreUpdate.
+ * Wire: MSG.REVIVE / MSG.REVIVE_PROGRESS from ../net/protocol.js. Neither payload
+ *   carries a sender field, so a receiver can only check the addressed `target`
+ *   (see onMessage) — the tracked-actor/range checks the area-heal path performs
+ *   are impossible here; adding a `from` field is a protocol change (see onMessage).
  */
+
+import { MSG } from "../net/protocol.js";
 
 // Vanilla death (PlayerCmp.onDeathHit, player-cmp.js:1207) adds a 0.1x "playerDeath"
 // slow-motion and reloads the checkpoint. In multiplayer that wrecks enemy sync: the
@@ -29,8 +35,18 @@
 // (terra-actor-entity.js:105, enemy-cmp.js:1153). A defeated combatant also auto-blocks
 // input: isInputBlocked() returns true for combatant.isDefeated() (player-cmp.js:2948).
 // A downed player bleeds out; a teammate who stays within `radius` revives them with the
-// engine's own CombatParams.revive() (combat-params.js:269, the primitive rogue's
-// "once more" perk uses).
+// engine's own CombatParams.revive() (combat-params.js:269, the primitive the rogue
+// "once more" power is built on).
+//
+// Two independent fields make up "downed", and both must be set on entry and undone on
+// exit, or the player ends up defeated-but-flagged-alive:
+//   - combatant.manualKill: keeps the entity from being killed while
+//     state >= DYING (CombatantCmp.onPostAction, combatant-cmp.js:367; onRespawn,
+//     combatant-cmp.js:1077).
+//   - combatant.state: drives isDefeated() (combatant-cmp.js:1056) and therefore input
+//     blocking, enemy AI and the HUD. CombatParams.revive() does NOT touch it, which is
+//     why the engine's own revive sets both (rogue-manager.js:1050-1051: params.revive()
+//     then combatant.state = ALIVE); reviveLocal() does the same.
 //
 // Solo, in rogue, or with no living ally in the room: we fall straight through to the
 // vanilla death, untouched.
@@ -42,7 +58,9 @@ const Vec3 = terra.export.Vec3;
 // Frame delta is clamped so a hitch (or an unpause) can't fast-forward the timers.
 const MAX_DT = 0.1;
 
-// Tunables, also exposed at runtime as window.terraTogether.reviveConfig.
+// Tunables, also exposed at runtime as window.terraTogether.reviveConfig. These are our
+// own values (there are no engine constants to match, unlike the cited line numbers
+// below); they are read every frame, so live edits take effect immediately.
 const CONFIG = {
 	bleedOut: 20,     // seconds a downed player has before being force-respawned
 	reviveTime: 5,    // seconds a teammate must stay within `radius`
@@ -153,9 +171,11 @@ class Reviver {
 		};
 
 		// Enemies only ever target the local player (enemy-cmp.js:654). While we are down
-		// they must not (re)acquire us. `setAggressive(true)` is the single choke point
-		// used by both auto-aggro (enemy-cmp.js:601) and taking a hit (enemy-cmp.js:1100),
-		// and `triggerAggression` adds aim/target side effects, so gate both.
+		// they must not (re)acquire us. `setAggressive(true)` is the single choke point every
+		// aggro path funnels through — checkAutoAggro (enemy-cmp.js:626) and taking a hit
+		// (enemy-cmp.js:1103) both call triggerAggression -> setAggressive(true)
+		// (enemy-cmp.js:1114) — and `triggerAggression` additionally wakes neighbours
+		// (aggroNearbyEnemy) and re-targets, so gate both.
 		const EnemyCmp = terra.export.EnemyCmp;
 		if (EnemyCmp?.prototype?.setAggressive) {
 			const originalSetAggressive = EnemyCmp.prototype.setAggressive;
@@ -224,12 +244,24 @@ class Reviver {
 		this.resetReviver();
 	}
 
+	// Inbound revive traffic. TRUST GAP (protocol, not fixable here): neither message
+	// carries a sender and the server relays both verbatim (server.js:129-133), so we
+	// cannot tell who is reviving us. All we can verify is that the packet is addressed to
+	// us and that we are downed - any peer can revive us from anywhere in the map, or hold
+	// our bar above zero to freeze the bleed-out, without being tracked, visible or in
+	// range. area-heal's payload does carry `from` and validates it against a tracked,
+	// visible actor within `radius`; adding the same field here (ideally stamped by the
+	// server, since a self-reported `from` is spoofable) is a wire change and needs
+	// coordinator sign-off.
 	onMessage(msg) {
-		if (msg?.target !== this.host.getLocalId?.() || !this.downed)
+		const localId = this.host.getLocalId?.();
+		// `!localId` matters: before WELCOME assigns an id, an untargeted message used to
+		// match, because undefined === undefined.
+		if (!this.downed || !localId || msg?.target !== localId)
 			return;
-		if (msg.type === "revive")
+		if (msg.type === MSG.REVIVE)
 			this.reviveLocal();
-		else if (msg.type === "revive_progress")
+		else if (msg.type === MSG.REVIVE_PROGRESS)
 			this.incoming = { frac: clamp01(msg.frac), t: CONFIG.reviveHold };
 	}
 
@@ -250,6 +282,10 @@ class Reviver {
 		if (!combatant)
 			return false;
 
+		// From here on both flags are set together (see the header): manualKill keeps the
+		// entity from being killed, while its state stays KILL_HIT — the engine set that in
+		// combatant.onDeathHit (combatant-cmp.js:982) — which is what keeps input blocked
+		// and what reviveLocal() has to undo.
 		combatant.manualKill = true;
 		this.downed = true;
 		this.bleed = CONFIG.bleedOut;
@@ -265,9 +301,15 @@ class Reviver {
 	reviveLocal() {
 		const playerCmp = terra.export.g_player?.entity?.player;
 		const combatant = playerCmp?.ent?.combatant;
-		this.stopDowned(true);
+		// Guard BEFORE touching any state. The combatant can be gone (map/entity teardown,
+		// a message that straggles in during it); clearing `downed` first would leave us
+		// flagged up - to ourselves and, via setLocalDowned, to our peers - while the
+		// engine still has the player defeated, so nothing would ever retry the respawn.
+		// Bailing here keeps `downed` set, so the bleed-out runs out and hardDeath()
+		// falls through to the vanilla respawn instead.
 		if (!combatant)
 			return;
+		this.stopDowned(true);
 		try {
 			combatant.params.revive(CONFIG.hpFactor);
 			combatant.manualKill = false;
@@ -294,10 +336,16 @@ class Reviver {
 	// discarded when the map reloads, so the flag doesn't leak.
 	hardDeath(reason) {
 		const playerCmp = terra.export.g_player?.entity?.player;
+		// Deliberately cleared even when there is no playerCmp left to respawn: an entity
+		// that no longer exists cannot stay downed, and onMapLoad/onConnectionReset would
+		// clear these anyway. (Keeping them would make onPreUpdate retry this every frame
+		// with bleed <= 0.)
 		this.stopDowned(false);
 		if (!playerCmp)
 			return;
 		try {
+			// null force: the real damage force is long gone by now. The vanilla path only
+			// hands it to analytics, which tolerates null (analytics-combat.js:115).
 			if (this.originalOnDeathHit)
 				this.originalOnDeathHit.call(playerCmp, null);
 		}
@@ -311,6 +359,8 @@ class Reviver {
 	// auto-clears `blinking`, so undo it here or the bar can blink forever. The
 	// player's floating HP bar is hidden by default (combat-hud.js:182-183), so
 	// restore HIDDEN rather than DEFAULT (which would pop it up over the head).
+	// The break bar and damage-sum hiding setDefeated() also did are left alone:
+	// the HUD re-drives both from its own combat events (combat-hud.js:232-259).
 	clearDefeatHud(combatant) {
 		const bar = combatant?.hud?.hpBar;
 		if (!bar)
@@ -325,6 +375,9 @@ class Reviver {
 		const list = terra.export.g_attackFreq?.activeEnemies;
 		if (!list)
 			return;
+		// Copy first: setAggressive(false) removes the enemy from activeEnemies
+		// (enemy-cmp.js:397 -> attack-frequency.js:98), so iterating the live array skips
+		// entries.
 		for (const enemy of [...list])
 			enemy?.setAggressive?.(false);
 	}
@@ -337,6 +390,8 @@ class Reviver {
 		this.incoming = null;
 		this.host.setLocalDowned?.(false);
 		if (resetCombatant) {
+			// resetCombatant is false on the hard-death path, where manualKill must stay
+			// true (see hardDeath).
 			const combatant = terra.export.g_player?.entity?.player?.ent?.combatant;
 			if (combatant)
 				combatant.manualKill = false;
@@ -350,6 +405,8 @@ class Reviver {
 		const counts = { visible: 0, living: 0 };
 		if (!actors)
 			return counts;
+		// playerActors only ever holds peers (client.js -> actors.js createPlayerActor);
+		// we are never in it, so living === 0 really means "no ally can revive us".
 		for (const [id, actor] of actors) {
 			if (!actor?.core?.isVisible?.())
 				continue;
@@ -413,7 +470,7 @@ class Reviver {
 			if (this.progress <= 0) {
 				// Clear the abandoned peer's bar promptly, then adopt the new target.
 				if (this.target && this.target !== target)
-					this.host.send?.({ type: "revive_progress", target: this.target, frac: 0 });
+					this.host.send?.({ type: MSG.REVIVE_PROGRESS, target: this.target, frac: 0 });
 				this.target = target; // possibly null
 				this.sentFrac = -1;
 			}
@@ -424,10 +481,11 @@ class Reviver {
 		const frac = Math.min(1, this.progress / CONFIG.reviveTime);
 		if (Math.abs(frac - this.sentFrac) >= CONFIG.resend) {
 			this.sentFrac = frac;
-			this.host.send?.({ type: "revive_progress", target: this.target, frac });
+			this.host.send?.({ type: MSG.REVIVE_PROGRESS, target: this.target, frac });
 		}
 		if (frac >= 1) {
-			this.host.send?.({ type: "revive", target: this.target });
+			// No `from`: the receiver cannot verify who we are (see onMessage).
+			this.host.send?.({ type: MSG.REVIVE, target: this.target });
 			this.resetReviver();
 			this.cooldown = CONFIG.cooldown;
 		}
@@ -476,7 +534,8 @@ class Reviver {
 				return null;
 			const align = terra.export.ENT_ALIGN;
 			// Anchor to the peer's feet, nudged down toward the ground (the effect hovers),
-			// and scaled up a touch so it reads as a ground marker.
+			// and scaled up a touch so it reads as a ground marker. Z_BASE/CENTER are the
+			// entity alignments the engine's own ground markers use for those two roles.
 			const offset = CONFIG.ringZOffset
 				? new Vec3(0, 0, CONFIG.ringZOffset)
 				: undefined;
@@ -487,7 +546,7 @@ class Reviver {
 				fx.scale = CONFIG.ringScale;
 			fx.setTarget2Entity?.(actor, align?.CENTER ?? 0);
 			fx.setGroup(RING_GROUP);
-			fx.start(-1);
+			fx.start(-1); // -1 = loop forever, like the defeat blink we cleared
 			return fx;
 		}
 		catch (err) {

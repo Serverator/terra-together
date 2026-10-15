@@ -15,7 +15,11 @@
  * Notes: Gated by window.terraTogether.estusShareEnabled, falling back to the
  *   "tt-estus-share" option. Recipients never spend their own charges. client.js owns
  *   the addon/loop wiring and forwards net messages to onMessage/onPreUpdate.
+ * Wire: MSG.AREA_HEAL from ../net/protocol.js. Unlike the revive payloads, this one
+ *   carries `from`, which the receiver validates against a tracked actor (see onMessage).
  */
+
+import { MSG } from "../net/protocol.js";
 
 // When a player drinks their estus flask, every other player within `radius` is healed
 // too. The heal is exactly what the *user's* flask produces (same amount + HoT duration),
@@ -29,7 +33,10 @@
 // so we can't heal them locally: each client heals its OWN g_player. We detect the flask
 // use locally, wait for the user's own heal to finish (the flask's HoT ticking out), then
 // broadcast; recipients re-check the distance against the sender's tracked actor, so only
-// players still near the healer are affected.
+// players still near the healer are affected. That actor sits at the ghost's
+// snapshot-interpolated position, which lags the healer's true one by about a network
+// update, so a peer right on the radius boundary can be included by the healer and
+// rejected by the receiver (both use CONFIG.radius, just measured from two sources).
 //
 // Works in rogue (the heal carries no rogue guard; only the downed/revive path is
 // rogue-gated elsewhere — see revive.js goDowned).
@@ -42,7 +49,8 @@ const MAX_DT = 0.1;
 
 // Tunables, also exposed at runtime as window.terraTogether.areaHealConfig.
 const CONFIG = {
-	radius: 4.0,      // world units (XY): heal range. Slightly more than revive's 3.0.
+	radius: 4.0,      // world units (XY): heal range. Slightly more than revive's 3.0, so a
+	                  // flask can still pick up a downed peer who is just outside revive range.
 	// Safety cap on how long we wait for the local heal to complete before sending.
 	// The flask's HoT is at most a few seconds; this only catches abnormal states.
 	maxWait: 8,
@@ -107,6 +115,8 @@ class AreaHealer {
 			// Let the flask be drunk at full HP when it would only help a nearby ally.
 			// Vanilla gates the estus branch on isHotFullyHealed(); shadow that one call
 			// so the rest of the vanilla path (charge, fx, event, trackers) runs untouched.
+			// The shadow is an own property of the params instance, so the finally below
+			// restores the prototype method even if the vanilla path throws.
 			let forced = false;
 			if (enabled()
 				&& dir === PLAYER_ITEM_DIR?.DOWN
@@ -136,9 +146,10 @@ class AreaHealer {
 		};
 
 		// The input handler refuses a full-HP flask use *before* useItem is ever called
-		// (player-cmp.js:1437, "healFull" fx). It checks g_player.combat.isFullyHealed(),
-		// which just delegates to params.isHotFullyHealed() (player-combat.js:930), so we
-		// shadow the same predicate across the call when a nearby ally needs the heal.
+		// (player-cmp.js:1437 is the isFullyHealed check, :1438 spawns the "healFull" fx).
+		// It checks g_player.combat.isFullyHealed(), which just delegates to
+		// params.isHotFullyHealed() (player-combat.js:930), so we shadow the same predicate
+		// across the call when a nearby ally needs the heal.
 		const PlayerCmp = terra.export.PlayerCmp;
 		if (PlayerCmp?.prototype?.handleItemUse) {
 			const originalHandleItemUse = PlayerCmp.prototype.handleItemUse;
@@ -172,7 +183,8 @@ class AreaHealer {
 			return;
 		const { params, hot } = this.pending;
 		this.wait += step;
-		// The HoT is removed from params.hots when it ticks out (combat-params.js:385).
+		// The HoT is erased from params.hots when it ticks out (updateHOTs, started at
+		// combat-params.js:385; the erase is at :392).
 		const finished = (hot && params?.hots && params.hots.indexOf(hot) === -1)
 			|| this.wait >= CONFIG.maxWait;
 		if (finished)
@@ -207,6 +219,8 @@ class AreaHealer {
 			if (!actor?.core?.isVisible?.())
 				continue;
 			const needy = down?.get?.(id) || (actor.terraTogether?.hpTarget ?? 1) < 1;
+			// ?? 1: a peer we have no snapshot data for counts as full, so an unknown peer
+			// can never be the reason we spend a charge at full HP.
 			if (needy && dist2(me.core.pos, actor.core.pos) <= r2)
 				return true;
 		}
@@ -246,13 +260,20 @@ class AreaHealer {
 		if (!enabled() || !this.host.isConnected?.() || !this.host.hasPeers?.())
 			return;
 		const { amount, duration } = pending.data;
-		this.host.send?.({ type: "area_heal", from: this.host.getLocalId?.(), amount, duration });
+		this.host.send?.({ type: MSG.AREA_HEAL, from: this.host.getLocalId?.(), amount, duration });
 	}
 
 	// ---- incoming -----------------------------------------------------------
 
+	// Inbound heal. The healer is identified by the payload's own `from`, which the server
+	// relays verbatim (server.js:129-133) and so is unauthenticated: it is only used to pick
+	// which of our tracked peers this heal claims to come from, and the heal is then gated
+	// on that actor being visible and within `radius` - the check the revive payloads have
+	// no way to make. A spoofed or oversized payload can at worst grant a free top-up:
+	// params.heal() clamps to max HP (combat-params.js:244) and never touches charges,
+	// buffs or stats.
 	onMessage(msg) {
-		if (msg?.type !== "area_heal" || !enabled())
+		if (msg?.type !== MSG.AREA_HEAL || !enabled())
 			return;
 		const me = terra.export.g_player?.entity;
 		const params = terra.export.g_player?.combat?.params;
@@ -275,6 +296,8 @@ class AreaHealer {
 		// Downed ally: revive at 25% first (same path revive.js uses), then deliver only the
 		// *remainder* of the estus heal. The instant revive counts as healing, so it is
 		// subtracted from the flask amount and the total received still equals the flask's.
+		// Measuring HP (rather than assuming CONFIG.hpFactor) also self-corrects when the
+		// revive gained nothing, e.g. reviveLocal() had no combatant to work on.
 		let healAmount = amount;
 		if (this.host.isSelfDowned?.()) {
 			const before = params.currentHP;
@@ -285,7 +308,8 @@ class AreaHealer {
 		}
 
 		try {
-			// Same heal call the flask makes on its own user; recipients keep their charges.
+			// Same heal call the flask makes on its own user (player-flask.js:92); recipients
+			// keep their charges.
 			if (healAmount > 0)
 				params.heal(healAmount, duration, true);
 			terra.export.g_playerHeal?.playHealFx?.(me);

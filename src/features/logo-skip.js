@@ -15,8 +15,9 @@
 
 // The game shows a LogoScreen (developer + promo logos) once the title scene appears,
 // and only reveals the title menu when that sequence ends (TitleScreen.onLogoDown ->
-// startBackground). We intercept the TitleScreen as it is added so we can short-circuit
-// the sequence when the option is on.
+// startBackground; bundle entry _runtime-and-entry.js:1472 starts the screen and :1491
+// handles its ENDED callback). We intercept the TitleScreen as it is added so we can
+// short-circuit the sequence when the option is on.
 function patchLogoScreen(logoScreen) {
 	if (!logoScreen || logoScreen.__ttPatched)
 		return;
@@ -32,6 +33,9 @@ function patchLogoScreen(logoScreen) {
 	logoScreen.__ttPatched = true;
 }
 
+// Idempotent: the guard flag lives on g_gui itself, so a second call is a no-op
+// (double-wrapping addElement would run the title-screen hook twice). If g_gui is not
+// up yet the flag stays unset, so a later call can still install the patch.
 function installLogoSkip() {
 	const g_gui = terra.export.g_gui;
 	if (!g_gui || g_gui.__ttLogosPatched)

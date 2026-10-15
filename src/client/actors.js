@@ -13,18 +13,19 @@
  * Public surface: createPlayerActor, movePlayerActor, setActorTimeFactor, updateOtherPlayers,
  *   playSyncedSound, applySyncedVolume, updateWeaponState
  * Engine touchpoints: terra.export.{TerraActor,g_gState,Character,COLL_TYPE,
- *   COLL_GROUND_FLAGS,g_fxConnect,ACTOR_FX_TYPE,Target,g_windboxManager,ACTOR_FACING,Vec2,
- *   Vec3,g_player,g_combat,FrameRepeatEntity,ENT_ALIGN,FIGURE_PART,PLAYER_CONFIG},
- *   terra.file.playback.PlaybackDetails, terra.file.audioEvent.AudioEvent,
- *   terra.file.sound.Sound, actor.actor.onPostMove hook, addon hooks via MultiplayerClient.
+ *   COLL_GROUND_FLAGS,g_fxConnect,ACTOR_FX_TYPE,Target,FxEntity,g_windboxManager,ACTOR_FACING,
+ *   g_player,g_combat,g_game,g_scene,g_audio,FrameRepeatEntity,ENT_ALIGN,FIGURE_PART,
+ *   PLAYER_CONFIG}, terra.file.playback.PlaybackDetails, terra.file.audioEvent.AudioEvent,
+ *   terra.file.sound.Sound, actor.actor.onPostMove hook, addon hooks via MultiplayerClient
+ *   (Vec2/Vec3 are re-exported by ./session.js).
  * Notes: updateOtherPlayers lives here rather than in ./snapshot.js because every call it
  *   makes (movePlayerActor, clearPeerFx, setActorTimeFactor) is an actor operation, and
  *   snapshot.js's import list is frozen to ../net/protocol.js + ./session.js.
  *   Import graph: session <- fx-sync <- actors.
- *   Decompiled refs: actor-fx.js:77-89 (POST_MOVE run glow, group "__runFX__"),
- *   actor-cmp.js:535-536 (MOVE_DIR overwrites the synced face from accelDir),
- *   actor-cmp.js:630 (maxRotate ∝ g_tick.entity), player-cmp.js:2480/2544 (FIXED facing
- *   set by dodge/perfect-dodge).
+ *   Decompiled refs: actor-fx.js:77-89 (POST_MOVE run glow, group "__runFX__" defined in
+ *   actor-dust.js:37), actor-cmp.js:535-536 (MOVE_DIR overwrites the synced face from
+ *   accelDir), actor-cmp.js:630 (maxRotate ∝ g_tick.entity), player-cmp.js:2480 (aiming holds
+ *   FIXED) then :2544 (back to MOVE_DIR); scripted MOVE steps do the same (move-steps.js:166-172).
  */
 
 import {
@@ -64,7 +65,7 @@ export function createPlayerActor(id) {
 	// that local state and then never stops, so it sticks after the owner stops running.
 	// STEP dust is likewise unreliable. Both are replayed from the owner instead — the run
 	// glow is an infinite fx synced through globalFx/persistentFx — so don't let the ghost
-	// produce its own. TODO: visual fx can still get lost.
+	// produce its own.
 	const ACTOR_FX_TYPE = terra.export.ACTOR_FX_TYPE;
 	let originalOnPostMove = actor.actor.onPostMove;
 	actor.actor.onPostMove = function (...args) {
@@ -131,7 +132,6 @@ export function movePlayerActor(id, state) {
 	}
 
 	if (state.char && actor.npc?.char?.path != state.char) {
-		// Get character from the character sheet
 		var char = terra.export.Character.get(state.char);
 		actor.setNpc(char, justCreated);
 	}
@@ -139,7 +139,10 @@ export function movePlayerActor(id, state) {
 	if (state.char == "CHA:main#Juno") {
 		let currentFigure = actor?.view?.getFigure().name;
 		if (state.figure && currentFigure != state.figure) {
-			let figure = skins[state.figure].figure;
+			// A peer may report a skin id our skins/ table doesn't have (skin folders do not
+			// sync), so tolerate a miss and keep the figure we already show. state.figure is the
+			// figure name after "#", which is the skins-table key (see ../features/skins.js).
+			let figure = skins[state.figure]?.figure;
 			if (figure) {
 				actor.view?.setFigure(figure);
 			}
@@ -240,8 +243,8 @@ export function movePlayerActor(id, state) {
 	actor.view?.figState?.setAnim(state.animation || "idle", null);
 	actor.view?.figState?.setAnimTime(state.anim_time);
 
-	// The player flips its own facing mode between MOVE_DIR and FIXED (e.g. a dodge/
-	// perfect-dodge sets FIXED to hold the facing, player-cmp.js:2480/2544), but the mod
+	// The player flips its own facing mode between MOVE_DIR and FIXED (e.g. aiming holds FIXED
+	// at player-cmp.js:2480 until it restores MOVE_DIR at :2544), but the mod
 	// only syncs the face *vector*. If the ghost stays MOVE_DIR, its update() overwrites
 	// the synced face with move.accelDir (actor-cmp.js:535-536) — the *movement* direction
 	// — so it renders backwards (e.g. faces up while the caster faces down) and never
@@ -361,6 +364,8 @@ export function updateWeaponState(actor, newWeapon) {
 		weaponState.timer = 0;
 	}
 
+	// The owner crossed the flash-hide threshold this frame: mirror the hide fx the game plays
+	// locally for the same edge (player-cmp.js:637-638).
 	if (weaponState.timer > terra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE && newWeapon.timer <= terra.export.PLAYER_CONFIG.WEAPON_FLASH_HIDE) {
 		playerFx.weaponHide.spawnEntity(actor, terra.export.ENT_ALIGN.NODE_WEAPON_R).setPart(terra.export.FIGURE_PART.PART_7).setGroup("weaponFade").start();
 	}

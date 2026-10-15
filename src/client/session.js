@@ -5,8 +5,8 @@
  * Responsibilities:
  *   - Connection singleton + peer maps: playerActors/playerNames/playerUpdates/playerActions/
  *     peers/peerDowned/peerRogue, plus the window.terraTogether mirrors of them.
- *   - Config/engine read helpers every client module needs: getSetting, getUsername,
- *     getServerUrl, hasPeers, getRogueInfo, getPeerRogueSeed.
+ *   - Private config helpers (getSetting/getUsername/getServerUrl) and the exported config
+ *     readers hasPeers/getRogueInfo/getPeerRogueSeed.
  *   - Shared sync state (queues, soundRegistry, activeSyncedSounds, activePersistentFx,
  *     soundSyncSuppress, RUN_FX_*) that fx-sync.js fills, snapshot.js drains and actors.js
  *     reads — declared here because the client module graph is a DAG rooted at this file.
@@ -19,17 +19,13 @@
  *   playerUpdates, playerActions, peers, peerDowned, peerRogue, queues, soundRegistry,
  *   activeSyncedSounds, activePersistentFx, soundSyncSuppress, RUN_FX_GROUPS,
  *   RUN_FX_SPEED_EPS, SCENE_STATE, SCENE_EVENT, Vec2, Vec3
- * Engine touchpoints: terra.file.sceneTypes, terra.export.{Vec2,Vec3,g_options,g_scene,
- *   g_rogue}, window.terraTogether (read/write mirrors), WebSocket.
+ * Engine touchpoints: terra.file.sceneTypes, terra.export.{Vec2,Vec3,g_options,g_rogue},
+ *   window.terraTogether (read/write mirrors, incl. reviveEnabled/estusShareEnabled), WebSocket.
  * Notes: import leaf — it imports ../net/protocol.js and nothing else, so the client
  *   modules form a DAG (session <- fx-sync <- actors <- snapshot <- client). Calls it must
  *   make *out* to a sibling (snapshot ingest, peer-actor teardown, revive/area-heal message
  *   routing, hosting state) are injected by ./client.js through initSession(); that is the
  *   same host-callback seam ../features/revive.js and ../features/area-heal.js already take.
- *   The shared queues keep their original names as fields of `queues`: queues.actorFx was
- *   actorFxQueue, queues.globalFx = globalFxQueue, queues.fxStops = fxStopQueue,
- *   queues.sounds = soundQueue, queues.soundStops = soundStopQueue,
- *   queues.windboxes = windboxQueue, queues.projectiles = projectileQueue.
  */
 
 import { MSG } from "../net/protocol.js";
@@ -112,19 +108,19 @@ export const peerRogue = new Map();
 // Filled by the capture hooks in fx-sync.js and drained every frame by snapshot.js. One
 // holder object (rather than free `let`s) so the drain can still rebind each slot.
 export const queues = {
-	// was actorFxQueue: player actorFx emitted this frame (see installActorFxInjection)
+	// player actorFx emitted this frame (see installActorFxInjection in fx-sync.js)
 	actorFx: [],
-	// was globalFxQueue: player-owned fx spawned this frame
+	// player-owned fx spawned this frame
 	globalFx: [],
-	// was fxStopQueue: those fx stopping
+	// those fx stopping
 	fxStops: [],
-	// was soundQueue: world/gameplay sounds started this frame
+	// world/gameplay sounds started this frame
 	sounds: [],
-	// was soundStopQueue: those sounds stopping
+	// those sounds stopping
 	soundStops: [],
-	// was windboxQueue: knockback windboxes applied to the local player
+	// knockback windboxes applied to the local player
 	windboxes: [],
-	// was projectileQueue: mirrored ranged projectiles
+	// mirrored ranged projectiles
 	projectiles: [],
 };
 
@@ -177,8 +173,8 @@ export function hasPeers() {
 	return peers.size > 0;
 }
 
-// True while a connection object exists (even while still connecting). This is the exact
-// gate the sync hooks use — it mirrors the plain `if (client)` checks of the monolith.
+// True while a connection object exists (even while still connecting). The capture hooks gate
+// on this (see fx-sync.js), so they keep queueing while connecting; send() drops those until OPEN.
 export function hasClient() {
 	return !!client;
 }
@@ -293,6 +289,8 @@ export function joinServer(address, options = {}) {
 				case MSG.PLAYER_JOINED:
 					console.log(`[TT Client] Player ${msg.id} joined`);
 					peers.add(msg.id);
+					// Carries no state (the server broadcasts it that way); the peer's own update
+					// follows, and updatePlayerState tolerates the missing state.
 					deps.updatePlayerState(msg.id, msg.state);
 					break;
 

@@ -6,19 +6,17 @@
  *   - Scan the skins/<name>/skin.json manifests and build the skin table.
  *   - Apply the selected skin to g_player (Juno only) on map start / option change.
  *   - Provide the RADIO_GROUP option values + labels and register the addon.
- * Public surface: SkinManager, skins, createSkinSetting
+ * Public surface: skins, createSkinSetting
  * Engine touchpoints: terra.export.Figure, SpriteSheet, OptionTypeBuilder,
  *   g_options (listProviders/observers/settings), g_player.entity.view.setFigure;
- *   terra.addAddon(SkinManager, { onAddonInit: 35000, onLoopStart: -10000,
+ *   terra.addAddon(new SkinManager(), { onAddonInit: 35000, onLoopStart: -10000,
  *   onGameMapStart: 35000 }) runs at import time — main.js imports this module for
  *   that side effect. Node fs/path via require() (the mod host provides them).
  * Notes: Skins do not sync between players (each client needs the same skins/ folder).
  *   `changeSkin` no-ops unless the local player is CHA:main#Juno.
- *   Pre-existing: onOptionEvent's `if (key = 'tt-skin')` is an assignment, not a
- *   comparison, so it re-applies on any option event; left as-is (behaviour frozen).
  */
 
-export { SkinManager, skins }
+export { skins }
 
 const fs = require("fs");
 const path = require("path");
@@ -33,14 +31,16 @@ function changeSkin(id) {
 	terra.export.g_player.entity?.view?.setFigure(skin.figure);
 }
 
+// Lives inside the packaged mod (mods/terra-together/skins), not the game data dir.
 const SKIN_DIR = "./mods/terra-together/skins";
 
 function loadSkins() {
 	let defaultFigure = terra.export.Figure.get("FIG:char.player.juno#default");
+	// Inserted first on purpose: getOptionList() returns the "default" key as the option's
+	// default value, and it must exist in the pushed values array (here index 0 of both
+	// values and labels).
 	skins.default = { name: "Default", figure: defaultFigure };
 
-	let i = 0;
-	
 	for (const folder of fs.readdirSync(SKIN_DIR)) {
 		const folderPath = path.join(SKIN_DIR, folder);
 		if (!fs.statSync(folderPath).isDirectory()) continue;
@@ -60,10 +60,10 @@ function loadSkins() {
 			figure.info = skins.default.figure.info;
 
 
+			// "juno" is the figure's body sheet slot (data/figures/char/player/juno.json);
+			// only that slot is swapped, the rest of the default figure is reused.
 			figure.spriteSheets.juno = sheet;
 			figure.skin_name = id;
-
-			i += 1;
 
 			skins[id] = { name: manifest.name ?? manifest.id, figure };
 		} catch (err) {
@@ -79,7 +79,7 @@ class SkinManager extends terra.export.Observable {
 	}
 
 	onOptionEvent(event, key) {
-		if (key = 'tt-skin') {
+		if (key === 'tt-skin') {
 			let skinId = terra.export.g_options.get("tt-skin") ?? "default";
 			changeSkin(skinId);
 		}
@@ -90,6 +90,9 @@ class SkinManager extends terra.export.Observable {
 		terra.export.g_options.observers.push(this);
 	}
 
+	// Returns the option's default *value* (a skin key), not an index: the engine stores
+	// it in config.default (engine/options/option-sub-types.js:74). "default" is always
+	// present because loadSkins() inserts it first.
 	getOptionList(values) {
         for (let key in skins) {
             values.push(key);
@@ -97,6 +100,8 @@ class SkinManager extends terra.export.Observable {
 		return "default";
 	}
 
+	// Labels are matched to getOptionList()'s values by index, so both must iterate
+	// `skins` in the same (insertion) order.
 	getOptionLabels(labels) {
 		for (let key in skins) {
 			let skin = skins[key];

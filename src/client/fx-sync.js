@@ -15,11 +15,11 @@
  * Public surface: installFxSyncHooks, installActorFxInjection, installRogueSeedHook,
  *   spawnRemoteFx, reconcilePersistentFx, clearUntrackedRunFx, clearPeerFx,
  *   spawnRemoteProjectile, stopActorSounds
- * Engine touchpoints: terra.export.{FxEntity,Sound? via terra.file.sound,AudioEvent,
- *   Playback,Projectile,ProxyDef,GenericProxy,HitForce,ACTION_STEP,Effect,Target,Vec3,
- *   g_windboxManager,g_rogue,g_player,g_actorGlobals,g_fxConnect,g_gState},
+ * Engine touchpoints: terra.export.{FxEntity,Effect,Projectile,ProxyDef,GenericProxy,HitForce,
+ *   ACTION_STEP,FX_STEPS,ACTOR_FX_TYPE,TARGET_RES_TYPE,COMBATANT_PARTY,DamagerCmp,CombatStats,
+ *   getEntAlign,getEntAlignFigure,addFigureToEntAlign,g_rogue,g_player,g_actorGlobals,g_gState},
  *   terraTogether.steps.SPAWN_WINDBOX, terra.file.{sound,audioEvent,playback,actorSound,
- *   hitSounds,playerCombat,fxBase}
+ *   hitSounds,playerCombat,fxBase,stepBase}; Vec3 is re-exported by ./session.js.
  * Notes: the sync queues/registries are NOT declared here: they are shared with
  *   ./snapshot.js and ./actors.js and live in ./session.js (see its header). This module
  *   owns only capture-local state (fxSyncId, soundSyncId, projSyncId, spawningVisualCopy,
@@ -170,7 +170,7 @@ function installScreenStepSuppression(effect) {
 // already excluded.)
 //
 // The defeat "preDeath" blink (a red multiply fade + looping red particles) is spawned
-// on death with an infinite duration (`combatant-cmp.js` onDeathHit -> start(-1)). On
+// on death with an infinite duration (combatant-cmp.js:977 onDeathHit -> :985-986 start(-1)). On
 // respawn the game tears it down without calling FxEntity.stop(), so the peer's synced
 // copy is never told to stop and flashes red forever. It is local death feedback, so
 // don't sync it at all. Key format is the effect's cacheKey: "FX:<sheet>#<name>".
@@ -323,6 +323,8 @@ export function installActorFxInjection() {
 			player.actorExt.actorFx.onActorFx = function (...args) {
 				const result = originalOnPlayerFx.apply(player.actorExt.actorFx, args);
 				const FX_TYPE = terra.export.ACTOR_FX_TYPE;
+				// POST_MOVE is not a one-shot spawn: it drives the local run/move state machine
+				// (actor-fx.js:62-95), which the peer rebuilds from the owner's synced run glow.
 				if (args[1] != FX_TYPE.POST_MOVE)
 					queues.actorFx.push({ type: args[1], vary: args[2] });
 				return result;
@@ -332,8 +334,8 @@ export function installActorFxInjection() {
 	}
 }
 
-// Install the outbound capture hooks. The windbox hook is re-wrapped on every call (as in
-// the monolith); the heavier Fx/Sound/Projectile patches install once per session.
+// Install the outbound capture hooks. The windbox hook is (re)wrapped on every call; the heavier
+// Fx/Sound/Projectile patches install once per session (module-level flags).
 export function installFxSyncHooks() {
 	// Sync windbox knockback the player receives.
 	let originalStart = terraTogether.steps.SPAWN_WINDBOX.prototype.start;
@@ -458,6 +460,8 @@ export function installFxSyncHooks() {
 		terra.export.FxEntity.prototype.stop = function (...args) {
 			if (this._ttFxId)
 				activePersistentFx.delete(this._ttFxId);
+			// Report each spawn's stop at most once: clearEntity() calls stop() again on every
+			// entry it removes (effect-entity.js clearList), which is not a second stop.
 			if (this._ttFxId && !this._ttFxStopSent) {
 				this._ttFxStopSent = true;
 				if (hasClient())
@@ -667,7 +671,7 @@ export function installFxSyncHooks() {
 // --- Remote replay -----------------------------------------------------------
 // Spawn one synced fx on a peer actor from a descriptor sent by its owner. Shared by the
 // one-shot globalFx path and the persistent-fx reconcile below.
-export function spawnRemoteFx(actor, fxState, source = "oneshot") {
+export function spawnRemoteFx(actor, fxState) {
 	if (!fxState?.effect)
 		return null;
 
@@ -746,7 +750,7 @@ export function reconcilePersistentFx(actor, list, running) {
 		const existing = map[fxState.id];
 		if (existing && !existing.hasEnded?.())
 			continue;
-		const fx = spawnRemoteFx(actor, fxState, "persist");
+		const fx = spawnRemoteFx(actor, fxState);
 		if (fx)
 			map[fxState.id] = fx;
 	}

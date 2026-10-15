@@ -8,8 +8,9 @@
  *     animation, HP/nameplate bars, rogue identity, and the drained fx/sound/projectile
  *     queues plus the persistent infinite-fx snapshot.
  * Public surface: updatePlayerState, sendPlayerData
- * Engine touchpoints: terra.export.{g_player,g_system,g_scene,g_game}, window.terraTogether
- *   (downed fraction comes from ../features/revive.js), terra.file.sceneTypes via SCENE_STATE
+ * Engine touchpoints: terra.export.{g_player,g_system,g_scene,g_game}; terra.file.sceneTypes
+ *   via SCENE_STATE. The downed fraction comes from ../features/revive.js through
+ *   ./session.js's collaborator seam.
  * Notes: the peer maps and the sync queues this module reads and drains are owned by
  *   ./session.js (see its header). The apply side of the snapshot (movePlayerActor /
  *   updateOtherPlayers) lives in ./actors.js, which keeps this module's imports to
@@ -36,7 +37,9 @@ export function updatePlayerState(id, state) {
 	let lastUpdate = playerUpdates.get(id);
 
 	// If the previous update hasn't been consumed yet, carry its one-shot events over.
-	if (lastUpdate && scene == "RUNNING") {
+	// `state` can be missing here (the server's PLAYER_JOINED carries none, and any client may
+	// send an update without one), so guard before touching its fields.
+	if (lastUpdate && state && scene == "RUNNING") {
 		state.globalFx ??= [];
 		state.actorFx ??= [];
 		state.sounds ??= [];
@@ -50,8 +53,8 @@ export function updatePlayerState(id, state) {
 			state.actorFx.push(fx);
 		}
 
-		// Sounds/volumes were previously dropped here: with the server on the same
-		// machine updates can outpace frames, losing a peer's one-shot sounds.
+		// Carry sounds/volumes over too: with the server on the same machine updates can
+		// outpace frames, so a dropped one-shot sound is never re-delivered.
 		for (const s of lastUpdate.sounds ?? []) {
 			state.sounds.push(s);
 		}

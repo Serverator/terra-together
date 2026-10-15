@@ -6,7 +6,8 @@
  *   - Data models (OptionText / OptionButton, both extending terra.export.Option).
  *   - Menu renderers (OptionTextGui / OptionButtonGui) and their keyboard/mouse handling.
  *   - registerOptionTypes(): register both halves, idempotently, before any menu is built.
- *   - Factories: createTextOption, createButtonOption, createOption, setButtonHandler.
+ *   - Factories/registration helpers: createTextOption, createButtonOption, createOption,
+ *     setButtonHandler.
  * Public surface: registerOptionTypes, createTextOption, createButtonOption, createOption,
  *   setButtonHandler, OptionText, OptionButton, OptionTextGui, OptionButtonGui
  * Engine touchpoints: terra.export (aliased `g` below) — Option, OptionTypeBuilder,
@@ -14,11 +15,14 @@
  *   TextButton, LangEntry, g_tick, g_input, g_menuSFX, GUI_ALIGN_X/Y, FONT_SIZE,
  *   BUTTON_TYPES, NP_CUT_DIR; window keydown/mousedown capture listeners while a TEXT field
  *   is being edited. g.ColorDecorator.WHITE is installed at module load.
- * Notes: createOption was merged in from the deleted src/helper.js — it is the generic
- *   factory the settings modules use for option types the game already registers (e.g.
- *   CHECKBOX). registerOptionTypes() is a no-op after the first call, so every factory may
- *   call it unconditionally. All helpers must run once the Options menu is being built
- *   (main.js onLoopStart), after terra.export exists.
+ * Notes: createOption() builds an option of a type the *game* already registered (the mod
+ *   uses it for CHECKBOX) and throws on an unknown type; createTextOption() and
+ *   createButtonOption() register the mod's own TEXT/BUTTON types first. Both write
+ *   g_options.settings[key] and seed g_options.values[key] the same way, but they are kept
+ *   apart on purpose — see the comment on createOption(). registerOptionTypes() is a no-op
+ *   after the first call, so every factory may call it unconditionally. All helpers must
+ *   run once the Options menu is being built (main.js onLoopStart), after terra.export
+ *   exists.
  */
 
 export {
@@ -43,6 +47,8 @@ const buttonHandlers = new Map();
 
 let registered = false;
 
+// The engine ships GREY/GREEN/YELLOW/ORANGE/RED/BLUE/MENU/PURPLE but no WHITE, while the
+// TEXT renderer below uses WHITE as its "normal" decorator — install it once, at load.
 g.ColorDecorator.WHITE = new g.ColorDecorator(g.FONT_COLOR.WHITE);
 
 // ───────────────────────────── data model ─────────────────────────────
@@ -427,15 +433,22 @@ function registerOptionTypes() {
 			g.g_options.addType(type);
 }
 
-// Registers a button handler by option key (for callbacks defined later).
+// Registers a button handler by option key, for callbacks attached after the option was
+// built (createButtonOption()'s `onPress` argument covers the usual case). Part of the
+// module's public surface but currently unused, so press()'s fallback below finds nothing.
 function setButtonHandler(key, handler) {
 	buttonHandlers.set(key, handler);
 }
 
+// Registers the option and seeds its stored value. g_options.get() hands back values[key]
+// as-is (there is no fallback to option.default) and the engine only seeds the options that
+// came out of its own options.json (OptionsManager.setData), so a mod-injected setting has
+// to be seeded here or get() would keep returning undefined. The undefined/null test keeps a
+// value already restored from localStorage (OptionsManager.readLocalStorage) instead of
+// overwriting it with the default.
 function addSetting(key, option) {
 	const options = g.g_options;
 	options.settings[key] = option;
-	// Preserve a value restored from localStorage / a save, otherwise use default.
 	if (options.values[key] === undefined || options.values[key] === null)
 		options.values[key] = option.default;
 	return option;
@@ -458,9 +471,14 @@ function createButtonOption(key, data, onPress) {
 	return addSetting(key, option);
 }
 
-// Creates a new option in the game menu, for any option type the game already knows
-// (used for the CHECKBOX settings). Should run in `onLoopStart`. Merged verbatim from
-// the deleted src/helper.js, minus its option-types.js import.
+// Creates an option of any type the game already knows (the mod uses it for CHECKBOX).
+// Must run while the Options menu is being built (main.js onLoopStart).
+//
+// Why this is not folded into addSetting(): the type lookup and the construction are the
+// only differences, and both matter. addSetting() takes an option that a factory built with
+// OptionTypeBuilder.build(), which returns null for an unknown type — the mistake would then
+// surface much later, as a null option in the menu. This resolves the builder directly so an
+// unknown `type` throws right here. The value seeding below is identical to addSetting()'s.
 function createOption(id, data, type) {
 	registerOptionTypes();
 
