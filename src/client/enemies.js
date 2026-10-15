@@ -15,7 +15,8 @@
  *   isOwner, getEnemyOwnerName, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
- *   g_game.map.active.path / g_scene.isRunning / EnemyCmp; window.terraTogether.playerId /
+ *   g_game.map.active.path / g_scene.isRunning / EnemyCmp (and, through it, each enemy's
+ *   sourceEntity.core, which is where identity comes from); window.terraTogether.playerId /
  *   playerNames (published by ./session.js). Inbound routing: ./client.js (see the note at
  *   the handler registration below).
  * Notes: Phase 1 is deliberately inert gameplay-wise — the module only observes and reports,
@@ -71,57 +72,72 @@ function localPlayerId() {
 
 // ────────────────────────────── enemy identity ──────────────────────────────
 
-// The enemy's stable identity — the same string on every client for the same enemy.
-// (Moved here verbatim from ../debug/enemy-debug.js so identity lives in one place; the
-// overlay imports it from this module.)
+// The map-scoped identity of the enemy's SOURCE SPOT — `m:<mapPath>#<mapId>` — or null when
+// this entity is not a map-placed spot, or its map is not known yet.
 //
-// Map-placed enemies are identified by their source spot, `m:<mapPath>#<core.mapId>`. mapId
-// is the index the map file gave the entity (game-map.js: `entry.mapId = parseInt(id)`), so 0
-// is a real id and the test has to be `>= 0`; mapPath is the active map's data path, the same
-// string for everyone. While no map is loaded that path is "" (and the map object can be
-// missing outright, hence `?? "?"`), so ids degenerate to `m:#7` for that frame — harmless,
-// nothing is drawn then, but not something to persist.
+// Identity MUST come from the spot, never from the enemy entity itself. Every fightable enemy
+// is a runtime-created TerraActor: EnemySpotEntity.spawnEnemy()
+// (features/enemies/entity/enemy-spot-entity.js) builds one with `new TerraActor()`, i.e. with NO
+// map settings, and never reconstructs it with any, so the actor's own core keeps the
+// CoreCmp.reset() default mapId 0 and a null gMap (engine/entity/core-cmp.js). Keying on that
+// core collapses EVERY enemy on a map onto the single id `m:<mapPath>#0`. The spot that spawned
+// it is a real map-placed entity, and spawnEnemy() sets `enemy.sourceEntity` to it before the
+// actor joins the entity list, so it is always populated for spot-spawned enemies. Its mapId is
+// the index the map file gave that entity (game-map.js: `entry.mapId = parseInt(id)`), so 0 is a
+// real id and the test has to be `>= 0`; its gMap gives the map's data path. That (mapPath,
+// mapId) pair is exactly what the engine itself keys on: respawn-tracker.js trackEntity() /
+// hasEntity() use (core.gMap.path, core.mapId), and the per-spot dead flag is
+// `session.map._enemySpot.<sourceEntity.core.mapId>` (enemy-spot-entity.js getVarName(), written
+// on defeat). An enemy spawned by the spawner rather than a spot (an act add) has no
+// sourceEntity and only the client-local id `u:<core.uid>`.
 //
-// Anything else was created at runtime. Entity.reConstruct() takes the mapId from the spawn
-// settings and falls back to -1 there, so such enemies only have the local id, `u:<core.uid>`.
-// uid is a per-process counter (`++Entity.globalUid`), which is unique inside one client but
-// NOT correlated across clients — these enemies may show different owners per client until the
-// real ownership scheme lands. (One caveat this test cannot resolve: an entity reconstructed
-// with no settings at all keeps the CoreCmp constructor default mapId 0, which is
-// indistinguishable from a real map id 0 — harmless for enemies, which always come from map
-// data or the spawner.) `?? "?"` is only there so a settings-less entity cannot put the string
-// "undefined" in an id.
+// gMap is null while the spot is detached and while no map is loaded (the map object can be
+// missing outright), so the path falls back to the active map's data path and can be "". An id
+// whose map half is empty is not an identity, so it degenerates to `u:<uid>`. uid is a
+// per-process counter (`++Entity.globalUid`), unique inside one client but NOT correlated across
+// clients — such enemies may show different owners per client until the real ownership scheme
+// lands, and they are not wire-addressable (see wireEnemyId). The `?? "?"` on the uid is only
+// there so a uid-less entity cannot put the string "undefined" in an id.
 //
 // KNOWN GAP — deliberately deferred to Phase 2; do NOT "fix" it by changing this format here.
 // The id is not scoped to the rogue variant, so the same map path in two different variants
-// gives the same mapId the same id. The ROOM key the server arbitrates against IS
-// variant-scoped (`<map>#<variant>`), so the two clients register the one id into their two
+// gives the same mapId the same id. The engine's own disambiguator for that is the room UID in
+// getVarName() (`session.map._rogue_enemySpot.<mapId>_<roomUid>`), which is engine-local and not
+// part of the wire format. The ROOM key the server arbitrates against IS variant-scoped
+// (`<map>#<variant>`), so the two clients register the one id into their two
 // rooms and the server de-dupes them onto whichever registered first: one client ends up owning
 // an enemy that exists (independently) on both variants. It is rogue-only, and it stays because
 // both halves of every surface are built on this format; Phase 2 syncs state and will treat the
 // variant as part of enemy identity, which is the change that closes the gap.
-export function enemyStableId(core) {
-	const mapId = core?.mapId;
-	if (typeof mapId === "number" && mapId >= 0) {
-		const mapPath = terra.export.g_game?.map?.active?.path ?? "?";
-		return "m:" + mapPath + "#" + mapId;
-	}
-	return "u:" + (core?.uid ?? "?");
-}
-
-// The subset of those identities that may travel on the wire: exactly the
-// `m:<mapPath>#<mapId>` form the frozen contract defines, i.e. a map-placed enemy in a map
-// whose data path is known. A runtime spawn (`u:<uid>`, unique per process but not correlated
-// across clients) and an unloading map (path "", which degenerates to `m:#7`) would each hand
-// the server an id that means a different enemy on every client, so neither is announced in
-// Phase 1 — the design gives runtime spawns an owner-minted id in a later phase. Those
-// enemies simply have no known owner here, and the overlay keeps labelling them with its
-// local rendezvous hash.
-function wireEnemyId(core, mapPath) {
-	const mapId = core?.mapId;
+function enemySpotId(core) {
+	const src = terra.export.EnemyCmp?.get?.(core?.ent)?.sourceEntity;
+	const mapPath = src?.core?.gMap?.path ?? terra.export.g_game?.map?.active?.path ?? "";
+	const mapId = src?.core?.mapId;
 	if (mapPath === "" || typeof mapId !== "number" || mapId < 0)
 		return null;
 	return "m:" + mapPath + "#" + mapId;
+}
+
+// The enemy's stable identity — the same string on every client for the same enemy.
+// (Lives here, not in ../debug/enemy-debug.js, which imports it from this module.) It is the
+// spot's map-scoped id when there is one, so it can never disagree with the wire id below, and
+// the client-local `u:<uid>` otherwise.
+export function enemyStableId(core) {
+	return enemySpotId(core) ?? "u:" + (core?.uid ?? "?");
+}
+
+// The subset of those identities that may travel on the wire: exactly the
+// `m:<mapPath>#<mapId>` form the frozen contract defines, i.e. an enemy whose map-placed spot is
+// known and still carries its map path and mapId. A runtime spawn (no sourceEntity, so only
+// `u:<uid>`, unique per process but not correlated across clients) and a spot whose map path or
+// mapId is missing (map unloading, or a detached spot) would each hand the server an id that
+// means a different enemy on every client, so neither is announced in Phase 1 — the design gives
+// runtime spawns an owner-minted id in a later phase. Those enemies simply have no known owner
+// here, and the overlay keeps labelling them with its local rendezvous hash. Reading the same
+// resolution as enemyStableId() is what keeps the two from ever disagreeing about which enemies
+// are addressable.
+function wireEnemyId(core) {
+	return enemySpotId(core);
 }
 
 // ──────────────────────────────── entity plumbing ────────────────────────────────
@@ -193,7 +209,7 @@ function syncEnemies() {
 	for (const core of terra.export.g_gState?.entities ?? []) {
 		if (!getLiveEnemy(core))
 			continue;
-		const id = wireEnemyId(core, map);
+		const id = wireEnemyId(core);
 		if (id === null)
 			continue;                      // runtime spawn / unknown map: not wire-addressable
 		live.add(id);
