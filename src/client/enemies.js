@@ -39,8 +39,12 @@
  *     wrapping the engine's own CombatManager.onRestReset announces one MSG.ENEMY_RESPAWN
  *     (sendRespawn), and a recipient on that map runs the engine's own reset locally
  *     (onEnemyRespawn -> applyLocalRespawn: clear the engine's own rest-reset keys, respawn
- *     defeated spots), after which the normal registration diff re-announces and re-splits the
- *     enemies.
+ *     defeated spots the way a fresh map load would -- CALMLY, see respawnSpotCalm), after which the
+ *     normal registration diff re-announces and re-splits the enemies.
+ *   - Local slow-motion half: the enemies this client PUBLISHES must not be simulated on a clock its
+ *     own player's slow-motion has warped, or one player's bullet-time would change how fast the
+ *     shared enemies move on the other client's screen. syncEnemyTimeScale puts them back on the
+ *     real-time clock for as long as that is the case (see the note there).
  * Public surface: ENEMY_SYNC_OPTION, enemyStableId, isEnemySyncEnabled, onEnemyOwner,
  *   onEnemyState, onEnemyHandoff, onEnemyDespawn, onEnemyRespawn, isOwner, getEnemyOwnerName,
  *   EnemySync
@@ -51,8 +55,11 @@
  *   EnemyCmp.prototype.onDeathHit (the owner seam, wrapped once) and g_vars (the engine's var
  *   store, which is where the per-spot dead-set lives); for the two Phase 4b halves, additionally
  *   CombatManager.prototype.onRestReset (the rest seam, wrapped once), EnemySpotEntity (the spot
- *   identity, tested with the engine's own instanceof), CombatManager/EnemySpotEntity both reached
- *   through terra.export; ./enemy-puppet.js, which owns the
+ *   identity, tested with the engine's own instanceof) plus its flag/enum tables
+ *   (ENEMY_SPOT_FLAG / ENEMY_PASSIVE, which say what a respawned spot's enemy should have been),
+ *   CombatManager/EnemySpotEntity both reached through terra.export; for the slow-motion half,
+ *   terra.export g_system.timeFactor.world and g_player.entity.core.time (this client's world scale
+ *   and its player's, the same two numbers ./snapshot.js puts on the wire); ./enemy-puppet.js, which owns the
  *   prototype patches and the actual puppet drive; window.terraTogether.playerId / playerNames
  *   (published by ./session.js); performance.now() (the freshness clock). Inbound routing:
  *   ./client.js (see the note at the handler registration below).
@@ -1306,8 +1313,65 @@ function applyLocalRespawn() {
 		if (typeof ent.isDefeated !== "function" || typeof ent.respawn !== "function")
 			continue;
 		if (ent.isDefeated())
-			ent.respawn();
+			respawnSpotCalm(ent);
 	}
+}
+
+// Respawn one DEFEATED spot the way the rester's own path respawns it -- CALMLY.
+//
+// EnemySpotEntity.respawn() (enemy-spot-entity.js:152-169) is the engine's own "bring a defeated
+// enemy back" call, but it triggers the spot AGGRESSIVE: its body ends in
+// `this.onEnemyTrigger(true, maxDelay)` (:164), and that flag makes triggerEnemy call
+// `setAggressive(true)` + `onSceneAggressionStart()` on the enemy it has just spawned (:228-231).
+// That is deliberately right for respawn()'s own callers -- the scripted RESPAWN_ENEMY /
+// RESPAWN_ENEMIES steps (enemy-steps.js:248 / :269), where "respawn" means a wave that arrives
+// fighting -- and wrong for a rest: the rester does not respawn anything, it TELEPORTS
+// (WAYPOINT_TELEPORT, waypoint-steps.js:227, the short/long rest branches of the waypoint sequence
+// in data/database/call-sequence.json) and its map reload builds FRESH spots, whose enemies spawn
+// through onShow -> spawnEnemy (:254) with `aggressive` left false (:151/:228) and their sheet's
+// default state applied (:276). A peer cannot reload the map, so this is the difference the rest
+// used to hide: without it the peer's respawned enemy comes back aggroed -- `aggressive` set,
+// registered in g_attackFreq.activeEnemies, holding a navDanger handle, its actor target already
+// pointed at this client's player, and its PASSIVE flag cleared -- i.e. a rest that puts the enemies
+// back but leaves them attacking.
+//
+// Every step is the engine's own:
+//   * setAggressive(false) is the engine's own de-aggro (onKill enemy-cmp.js:338, onDeathHit :1122,
+//     giveUp :1144, disappear :351, AttackFrequencyManager.stopAggression :150): it drops the flag,
+//     the attack-frequency registration (:397) and the navDanger handle (:399). No skipHudUpdate, so
+//     the HUD is put back too -- the trigger's own setAggressive(true) did update it (:388-389).
+//   * setTarget(null) restores the actor target a fresh entity has (actor-cmp.js:337, the ActorCmp
+//     reset): the trigger reached triggerAggression -> updateTarget, which targets the LOCAL player
+//     (:654-655), and nothing else would ever clear it.
+//   * setPassive re-applies the spot's own flag, which the trigger's setAggressive(true) cleared
+//     (:384-385 setPassive(ENEMY_PASSIVE.NONE)); the test is the one spawnEnemy uses (:264-268).
+//   * clearing `triggerAggressive` covers the spot that has NOT spawned its enemy yet when respawn()
+//     returns: a triggerDelay defers the spawn through attack_frequency's willAddDanger queue
+//     (:201-205, :211) and an EGG_FLY spot spawns an egg that only reaches triggerEnemy when it
+//     hatches (nyx-egg-entity.js:141) -- and the flag the later trigger reads is this one (:228).
+//     Without it that enemy would come back aggressive a few frames after this helper had run.
+function respawnSpotCalm(spot) {
+	spot.respawn();
+	// First, because the enemy below may not exist yet (see the triggerDelay / egg note above): this is
+	// the intent every later trigger of this spot reads.
+	spot.triggerAggressive = false;
+
+	const enemy = spot.enemyEnt?.enemy;
+	if (!enemy || enemy.aggressive !== true)
+		return;								// nothing was aggressivised (deferred, egg, or no enemy)
+
+	enemy.setAggressive(false);
+	if (enemy.actor && typeof enemy.actor.setTarget === "function")
+		enemy.actor.setTarget(null);
+
+	const flags = terra.export.ENEMY_SPOT_FLAG;
+	const passive = terra.export.ENEMY_PASSIVE;
+	if (!flags || !passive || typeof enemy.setPassive !== "function")
+		return;
+	if (spot.init & flags.PASSIVE)
+		enemy.setPassive(passive.PASSIVE);
+	else if (spot.init & flags.PASSIVE_STILL)
+		enemy.setPassive(passive.PASSIVE_STILL);
 }
 
 // Inbound MSG.ENEMY_RESPAWN (a rester -> server -> everyone but the sender). Routed here from
@@ -1328,6 +1392,116 @@ export function onEnemyRespawn(msg) {
 	applyLocalRespawn();
 	if (debugEnabled())
 		debugLog(`enemy respawn applied for ${map} (announced by ${msg?.from == null ? "?" : msg.from})`);
+}
+
+// ─────────────────── the shared enemy clock vs the local slow-motion ───────────────────
+//
+// A slow-motion is a CLIENT-LOCAL time warp: the engine applies one by scaling that client's own
+// world tick (`system.setTimeFactor` -> g_tick.world = g_tick.gui * timeFactor.world, system.js:517-526,
+// driven every frame from the active slow-motion handles, slow-motion.js:154), and the abilities that
+// cast one keep their CASTER out of it with a per-ENTITY inverse factor instead of with the tick:
+// ADD_SLOW_MOTION with invert ALL/LOGIC -- the players' bullet-time actions and the enemies' hit-stops
+// -- lands in `move.influencer.globalInvTime` (SlowMoHandle.setInverseEntity, slow-motion.js:33-45,
+// :113-121), which MoveInfluencer.update copies onto core.time.factor every frame
+// (move-influencer.js:34-40); core.getTick() is then g_tick.world * factor (core-cmp.js:353-365).
+//
+// That is fine while every enemy has ONE screen. Under the split it is not: the enemies this client
+// owns are simulated on its warped tick and PUBLISHED (readEnemyState -> MSG.ENEMY_STATE carries the
+// position and the animation playhead), so a peer replays them at the warped rate -- while the
+// enemies THAT client simulates keep running at its own rate. One ability on one client therefore
+// changes how fast the shared enemies move on the other client's screen, for the duration of the
+// ability, with nothing on that screen to explain it. (Both clients agree on where the enemies are:
+// the peer reproduces the owner's slowed positions, so this is not a desync -- it is the owner's
+// local time scale leaking into a shared simulation.)
+//
+// The rule enforced here: the enemy simulation a client PUBLISHES for a shared world runs on the
+// real-time clock, so it is the same simulation on every client, no matter which client runs it and
+// no matter what its local player is doing. Three things decide when it applies, and each is the
+// narrowest form of the rule:
+//   * only while the enemy population IS shared (a peer is present): with no other screen there is
+//     nothing to be inconsistent with, and the engine's own cinematic slow-motions should apply to
+//     enemies exactly as designed;
+//   * only while the local player is truly on a different clock from its world -- the invert-flagged
+//     abilities above, i.e. the player's own time scale > 1 while the world's is < 1. A slow-motion
+//     with no invert (the dramatic-zoom kill slow-motion, the scripted tutorial one, an enemy's rage
+//     wind-up) leaves the player and the world on the same clock and is left completely alone;
+//   * only for the enemies this client is authoritative for (owned and taken over -- a puppet's
+//     motion belongs to its owner and is written wholesale by ./enemy-puppet.js every frame, so
+//     there is nothing there to rescale).
+//
+// The compensation is the engine's own: 1/world is exactly what makes an entity's tick the tick it
+// would have had with no slow-motion at all, and per-entity time effects still apply on top of it
+// (MoveInfluenceEntry.apply multiplies core.time.factor, move-influencer.js:100-110), so hit-stops and
+// status slows are untouched. It is also self-healing: the value is recomputed every frame from the
+// engine's own published factor, and every exit path (no peers, no slow-motion, feature off, enemy no
+// longer ours) puts the entity back to the 1.0 MoveInfluencer itself resets to (move-influencer.js:69-70).
+//
+// The cost, stated plainly: while a player IS the caster of such an ability, the enemies around them
+// no longer slow down for them either. The alternative -- let the caster keep the slowed enemies and
+// make every other client slow its own world to match -- is a product decision, not a sync decision:
+// it would change what the OTHER player experiences (their whole world, their own character included,
+// would run in slow motion) and it needs the slow-motion state on the wire. What this module can
+// guarantee by itself is that a shared enemy is simulated identically on both clients, and that is
+// what it does. Reported as an explicit question rather than assumed.
+
+// The world's slow factor, but only while THIS client's player is exempt from it -- i.e. the player's
+// own time scale is above 1 (the inverse factor the engine gives the caster) while the world's is
+// below 1. That pair is the same one ./snapshot.js publishes to peers as `timeFactor`
+// (snapshot.js:112-117). 1 means "no bullet-time here": no slow-motion, a slow-motion that catches the
+// player too, a dead/absent player entity, or a full stop (world 0, which must still freeze enemies).
+function bulletTimeSlow() {
+	const world = terra.export.g_system?.timeFactor?.world;
+	if (!(typeof world === "number" && world > 0 && world < 1))
+		return 1;
+	const own = terra.export.g_player?.entity?.core?.time;
+	const ownScale = own ? (own.factor ?? 1) * (own.logicFactor ?? 1) : 1;
+	return ownScale > 1 ? world : 1;
+}
+
+// The entities whose time scale this module is currently overriding, so every exit path can hand each
+// one back the value the engine would have left it with (MoveInfluencer's own 1.0 rest state).
+const timeScaled = new Set();
+
+// Put every entity in `keep`'s complement back on the engine's default and forget it. The single exit
+// from the override, so the set and the values can never disagree.
+function clearEnemyTimeScale(keep) {
+	for (const ent of timeScaled) {
+		if (keep && keep.has(ent))
+			continue;
+		const influencer = ent?.move?.influencer;
+		if (influencer && influencer.globalInvTime !== 1)
+			influencer.globalInvTime = 1;
+	}
+	timeScaled.clear();
+	if (keep)
+		for (const ent of keep)
+			timeScaled.add(ent);
+}
+
+// The per-frame half, run from the frame's pre-update hook so the value is in place before this
+// frame's entity updates (that is where each entity's influencer copies it onto core.time).
+function syncEnemyTimeScale(live) {
+	const slow = live !== null && isEnemySyncEnabled() && isConnected() && hasPeers() ? bulletTimeSlow() : 1;
+	if (slow === 1) {
+		clearEnemyTimeScale(null);
+		return;
+	}
+	const inverse = 1 / slow;
+	const next = new Set();
+	for (const [id, core] of live) {
+		if (!isOwner(id) || !adopted.has(id))
+			continue;
+		const ent = core.ent;
+		const influencer = ent?.move?.influencer;
+		if (!influencer)
+			continue;
+		influencer.globalInvTime = inverse;
+		next.add(ent);
+	}
+	// Anything that was scaled and no longer is ours to scale (a handoff, a death, a map change) gets
+	// the engine's default back here rather than being left to run at the warped rate until the
+	// slow-motion happens to end.
+	clearEnemyTimeScale(next);
 }
 
 // ─────────────────────────────── public readers ───────────────────────────────
@@ -1404,7 +1578,12 @@ class EnemySync {
 		// option per call), and there is no hook that fires on the moment the option changes.
 		ensureDespawnPatch();
 		ensureRespawnPatch();
-		applyPeerState(syncEnemies());
+		const live = syncEnemies();
+		applyPeerState(live);
+		// Last, and before this frame's entity updates: the enemies we are simulating and publishing go
+		// back on the real-time clock while our own player is running on a warped one (see the note on
+		// syncEnemyTimeScale).
+		syncEnemyTimeScale(live);
 	}
 
 	onPostUpdate() {
