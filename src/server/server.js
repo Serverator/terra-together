@@ -7,7 +7,7 @@
  *   - Push host-authoritative settings (revive, estus-share) on change.
  *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients, and
  *     enemy_state to other clients once its entries are checked against the arbiter, and
- *     enemy_handoff to other clients with the sender's id stamped on it.
+ *     enemy_handoff and enemy_despawn to other clients with the sender's id stamped on them.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
  *     publish it, re-arbitrating when a room's membership changes.
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
@@ -19,7 +19,7 @@
  *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
  *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
  *     every inbound type is matched through MSG.*, so an unknown type falls to the default
- *     branch and is dropped. The direction table for all 17 types is documented there.
+ *     branch and is dropped. The direction table for all 18 types is documented there.
  *   - Enemy-sync ownership is arbitrated here, never simulated: the server is a single
  *     process, so its assignment is the consensus (see src/server/enemy-ownership.js). A
  *     client registers the map-placed enemies it can see and the server answers with the
@@ -44,7 +44,11 @@
  *     entry-validated: it comes from a client that has just STOPPED being the owner of the
  *     enemies in it, so the arbiter would reject the whole message (see the MSG.ENEMY_HANDOFF
  *     case). The recipient is what makes it safe: it applies a handed-on state only to an enemy
- *     it owns itself (src/client/enemies.js onEnemyHandoff).
+ *     it owns itself (src/client/enemies.js onEnemyHandoff). enemy_despawn rides the same trust
+ *     and for the same shape of reason: the sender has just killed the enemies in it, so the
+ *     arbiter's record for them can already be gone or moved by the time it arrives, and
+ *     validate() would drop the very message that removes a ghost (see the MSG.ENEMY_DESPAWN
+ *     case).
  *   - Ordering: each send is one synchronous socket.write, so per-connection order is
  *     preserved, but there is no rate limiting, batching or backpressure -- inbound
  *     traffic is paced by the clients' own tick (see src/client/snapshot.js).
@@ -489,6 +493,38 @@ function startServer(host = '0.0.0.0', port = 17005) {
 							break;
 						// The sender's own claim is never relayed -- the socket identity is the id the
 						// recipients gate on, exactly as in the ENEMY_STATE case above.
+						msg.owner = playerId;
+						broadcast(msg, socket);
+						break;
+					}
+
+					case MSG.ENEMY_DESPAWN: {
+						// The id of an enemy this client owned and has just beaten (the owner half lives in
+						// src/client/enemies.js, sendDespawn): tell everyone else, so each of them can mark it
+						// dead in its OWN per-client dead-set and take it out of the world. Without it a peer
+						// keeps a live copy of an enemy the owner has already killed, and no local event can
+						// ever correct that: a peer's copy of an enemy it does not own has its local hit
+						// application suppressed (enemy-puppet.js patches (c)/(d)), so the owner's word is the
+						// only one there is about that enemy's death.
+						//
+						// Deliberately NOT entry-validated, exactly like ENEMY_HANDOFF just above, and for the
+						// same shape of reason: validate() asks "is this sender the owner right now", and by
+						// the time this frame arrives the honest answer can already be no -- the sender's own
+						// ENEMY_UNREGISTER for the same enemy is written in that same frame (its copy stopped
+						// being "live" the instant it was beaten), and any rebalance in between moves the id.
+						// Dropping it would strand the ghost this type exists to remove, so the check is left
+						// to the recipient, which applies a despawn only to an enemy it holds itself and only
+						// idempotently (src/client/enemies.js onEnemyDespawn). Wire shape (frozen):
+						// { owner, list: [{ id }] }.
+						const despawnList = Array.isArray(msg.list) ? msg.list : null;
+						if (netDebugEnabled())
+							netDebug(`in enemy_despawn from=${shortId(playerId)} entries=${despawnList === null ? 0 : despawnList.length}`);
+						// Nothing to despawn: no frame, in particular no empty one (the same rule as the
+						// handoff case above).
+						if (despawnList === null || despawnList.length === 0)
+							break;
+						// The sender's own claim is never relayed -- the socket identity is the id the
+						// recipients gate and log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF cases.
 						msg.owner = playerId;
 						broadcast(msg, socket);
 						break;
