@@ -23,8 +23,9 @@
  *   - Only text frames (0x1) surface as 'message'; binary frames are consumed and ignored,
  *     close/ping/pong are handled below.
  *   - WebSocketConnection.send() emits unmasked frames, correct for server->client.
- *   - No maximum frame size is enforced, so a peer that declares a huge 64-bit length can
- *     make us buffer indefinitely (see parseRecievedData). Accepted for a co-op host.
+ *   - Inbound frames are capped at MAX_FRAME_BYTES. A peer that declares a longer payload is
+ *     treated as a protocol error and the connection is torn down instead of buffering
+ *     indefinitely (see parseRecievedData).
  */
 const { createServer } = require("http");
 const { createHash } = require("crypto");
@@ -34,6 +35,13 @@ export { WebSocketServer, WebSocketConnection };
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+// Hard cap on the payload length one inbound frame may declare. Our traffic is small JSON text
+// frames -- per-frame player snapshots plus FX/sound/projectile arrays -- comfortably under
+// 1 MB, so 16 MiB is many times larger than anything legitimate and a real snapshot is never
+// dropped; only a broken or hostile peer can trip it. Without a cap, a peer declaring a huge
+// 64-bit length makes us buffer indefinitely.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
 class WebSocketConnection extends EventEmitter {
 	constructor(socket) {
 		super();
@@ -42,6 +50,10 @@ class WebSocketConnection extends EventEmitter {
 		this.buffer = Buffer.alloc(0);
 
 		socket.on('data', (chunk) => {
+			// Once the connection is closed (close() called, or a fatal protocol error) no further
+			// bytes may reach the parser: whatever the socket already had queued must not be
+			// dispatched as if the close had not happened.
+			if (!this.isOpen) return;
 			this.buffer = Buffer.concat([this.buffer, chunk]);
 			this.parseRecievedData();
 		});
@@ -79,10 +91,14 @@ class WebSocketConnection extends EventEmitter {
 
 	close() {
 		if (!this.isOpen) return;
+		// Clear the flag *before* writing, so a send() racing this call finds isOpen false and
+		// is suppressed instead of queueing a data frame behind the close frame. The close frame
+		// itself is safe from that suppression because this path writes to the socket directly
+		// rather than through send(). Clearing first also means a second close() hits the guard
+		// above and returns, so one close frame goes out per connection.
 		// Close frame 0x88 with an empty payload (no status code), then destroy only once
-		// the frame has flushed, so the socket is never torn down mid-write. isOpen stays
-		// true until the socket's own 'close' event fires, so a send() racing this write
-		// would still emit a data frame after the close frame -- do not send after close().
+		// the frame has flushed, so the socket is never torn down mid-write.
+		this.isOpen = false;
 		this.socket.write(Buffer.from([0x88, 0x00]), () =>
 			this.socket.destroy()
 		);
@@ -114,6 +130,22 @@ class WebSocketConnection extends EventEmitter {
 				if (this.buffer.length < 10) return;
 				payloadLen = Number(this.buffer.readBigUInt64BE(2));
 				offset = 10;
+			}
+
+			// Frame-size cap. A declared length past MAX_FRAME_BYTES is a protocol error rather
+			// than something to wait for. Skipping the payload to stay in sync is not an option:
+			// it would mean trusting the very length we just rejected. Returning without consuming
+			// it is worse -- the header would stay in the buffer and misalign every later parse.
+			// So the connection ends here: close frame 0x88 with status 1009 (message too big),
+			// socket destroyed once it has flushed. The buffer is emptied first so nothing stale
+			// can be dispatched afterwards.
+			if (payloadLen > MAX_FRAME_BYTES) {
+				this.buffer = Buffer.alloc(0);
+				this.isOpen = false;
+				this.socket.write(Buffer.from([0x88, 0x02, 0x03, 0xF1]), () =>
+					this.socket.destroy()
+				);
+				return;
 			}
 
 			// Whole frame = header + masking key (only when the peer masked it) + payload.
@@ -171,13 +203,32 @@ class WebSocketServer extends EventEmitter {
 		this.http = createServer();
 
 		// Node emits 'upgrade' for any request carrying an Upgrade header; the handshake
-		// below is the RFC6455 4.2 one. It is not re-validated beyond the key, which is the
-		// only peer-supplied field we read -- the game's own client is the only expected
-		// peer, and a stricter check would only reject peers we don't have.
+		// below is the RFC6455 4.2 one.
 		this.http.on('upgrade', (req, socket) => {
 			// Sec-WebSocket-Key is required; without it this is not a websocket upgrade.
 			const key = req.headers['sec-websocket-key'];
 			if (!key) { socket.destroy(); return; }
+
+			// Reject without upgrading: answer 400 and drop the socket (the teardown the
+			// missing-key path above performs).
+			const reject = () => {
+				socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+				socket.destroy();
+			};
+
+			// A browser WebSocket (src/client/session.js, `new WebSocket`) always sends
+			// Upgrade: websocket and Sec-WebSocket-Version: 13, so requiring both turns away
+			// ordinary HTTP requests without ever rejecting our own client. The request path
+			// is deliberately not checked: it varies with how the mod is served, and
+			// rejecting on it would break a working connection.
+			if ((req.headers['upgrade'] || '').toLowerCase() !== 'websocket') {
+				reject();
+				return;
+			}
+			if (req.headers['sec-websocket-version'] !== '13') {
+				reject();
+				return;
+			}
 
 			// Accept = base64(sha1(key + the RFC6455 GUID)); the GUID is the magic constant that
 			// proves to the peer we understood the request rather than echoing it back.

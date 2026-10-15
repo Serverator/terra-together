@@ -149,8 +149,12 @@ export function movePlayerActor(id, state) {
 		}
 	}
 
-	actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]), true, true);
-	if (actor.move?.vel) {
+	// Peer version skew: position/velocity/face_dir are peer-supplied, and this runs on the
+	// per-frame update path (no try/catch), so a differently-versioned or malformed peer that
+	// omits one must not throw here -- skip that field and leave the remote actor as it is.
+	if (Array.isArray(state.position) && state.position.length >= 3)
+		actor.core.setPos(new Vec3(state.position[0], state.position[1], state.position[2]), true, true);
+	if (actor.move?.vel && Array.isArray(state.velocity) && state.velocity.length >= 3) {
 		actor.move.vel = new Vec3(state.velocity[0], state.velocity[1], state.velocity[2]);
 	}
 
@@ -257,7 +261,10 @@ export function movePlayerActor(id, state) {
 	// otherwise it keeps its old orientation while the caster turns during a freeze.
 	let rotateInstantly = terra.export.g_scene?.currentState == SCENE_STATE.MENU || justCreated;
 	const frozen = !(state.timeFactor > 1e-4);
-	actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), rotateInstantly || frozen);
+	// Same skew guard as the position/velocity pair (see there): a missing face vector leaves
+	// the ghost's current facing alone instead of throwing inside onPreUpdate.
+	if (Array.isArray(state.face_dir) && state.face_dir.length >= 2)
+		actor.actor?.setFace(new Vec2(state.face_dir[0], state.face_dir[1]), rotateInstantly || frozen);
 
 	updateWeaponState(actor, state.weapon)
 }
@@ -330,6 +337,14 @@ export function applySyncedVolume(playback, vol) {
 
 // Mirror the sender's equipped weapon (figure + fade fx) onto the peer actor.
 export function updateWeaponState(actor, newWeapon) {
+	// Peer version skew (same family as the guards in movePlayerActor): the weapon block is
+	// peer-supplied and this runs on the per-frame path, so a peer that omits it must not
+	// throw on the newWeapon.weapon read below -- leave the mirrored weapon as it was. Only the
+	// block itself is checked: a missing *weapon id* is not skew, the sender reports that when
+	// unarmed and the code below handles it (weapons.get(undefined) misses, so it detaches).
+	if (!newWeapon || typeof newWeapon !== "object")
+		return;
+
 	actor.terraTogether.weapon ??= {};
 	let weaponState = actor.terraTogether.weapon;
 	let playerFx = terra.export.g_player?.entity?.player?.fx;

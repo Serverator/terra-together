@@ -23,7 +23,7 @@
 import {
 	joinServer, leaveServer, disconnect, isConnected, isConnecting, send, hasClient,
 	hasPeers, getLocalId, getRogueInfo, setLocalDowned, getPeerDowned, isLocalDowned,
-	playerActors, playerUpdates, SCENE_STATE, SCENE_EVENT, initSession,
+	playerActors, playerUpdates, SCENE_STATE, initSession,
 } from "./session.js";
 import { updatePlayerState, sendPlayerData } from "./snapshot.js";
 import { updateOtherPlayers, setActorTimeFactor } from "./actors.js";
@@ -180,12 +180,11 @@ class MultiplayerClient extends terra.export.Observable {
 	}
 
 	onSceneStateEvent(event) {
-		// Gate is effectively inert: the engine only writes g_scene.currentState in
-		// SceneManager.setState(), which always fires SCENE_CHANGED, so on any other event the
-		// scene still equals lastScene and the send below goes through anyway. A "send only on a
-		// real change" reading would test `scene == lastScene` here instead.
+		// Notify peers only on a genuine scene-value change. SceneManager also fires
+		// SCENE_CHANGED for in-place updates (exp/level-up timers, cutscene state) that leave
+		// currentState alone; those must not tell peers the scene changed.
 		let scene = SCENE_STATE[terra.export.g_scene.currentState];
-		if (event != SCENE_EVENT.SCENE_CHANGED && scene != lastScene) return;
+		if (scene == lastScene) return;
 		lastScene = scene;
 
 		if (hasClient())

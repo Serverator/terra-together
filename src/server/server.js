@@ -71,6 +71,12 @@ function startServer(host = '0.0.0.0', port = 17005) {
 	hostPort = port;
 	server = new WebSocketServer({ port, host });
 
+	// The instance this startServer() call owns. The 'error' and 'close' handlers below clear
+	// the module-level `server` only while it is still this instance: a restart issued before
+	// either event fires replaces `server`, and nulling the live reference would make
+	// isHosting() lie (and let a later startServer() hit EADDRINUSE).
+	const srv = server;
+
 	// Resolves once the socket is actually accepting connections. Callers (the
 	// host button) must await this before connecting a client, otherwise the first
 	// join races the bind and gets refused.
@@ -191,9 +197,13 @@ function startServer(host = '0.0.0.0', port = 17005) {
 
 		socket.on("close", () => {
 			// Also fires for a socket we closed ourselves (stopServer) and right after an
-			// 'error' (error -> destroy -> close), so the deletes here must stay idempotent;
-			// this handler is what empties playerData/playerNames for a departing player.
-			clientsSockets.delete(socket);
+			// 'error' (error -> destroy -> close), so this and the 'error' handler below have to
+			// agree on who tears the peer down: clientsSockets.delete() returns whether this
+			// connection was still tracked, i.e. whether this is the first of the two to run.
+			// Only the first one empties playerData/playerNames and announces PLAYER_LEFT, so a
+			// peer that errors and then closes produces exactly one player_left.
+			if (!clientsSockets.delete(socket))
+				return;
 			playerData.delete(playerId);
 			playerNames.delete(playerId);
 			console.log(`Player ${playerId} disconnected. Total: ${clientsSockets.size}`);
@@ -201,11 +211,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		});
 
 		socket.on("error", (err) => {
-			// Same cleanup as 'close' (the socket is destroyed either way, and deleting an
-			// entry twice is harmless). PLAYER_LEFT is announced here as well as from
-			// 'close', so an errored peer can leave two identical messages on the wire; the
-			// client's handling is idempotent (its MSG.PLAYER_LEFT case).
-			clientsSockets.delete(socket);
+			// Same teardown as 'close', gated the same way: whichever handler runs first wins the
+			// clientsSockets.delete() and emits the single PLAYER_LEFT, the other bails out here.
+			if (!clientsSockets.delete(socket))
+				return;
 			playerData.delete(playerId);
 			playerNames.delete(playerId);
 			console.log(`Player ${playerId} crashed. Reason: ${err}`);
@@ -216,19 +225,22 @@ function startServer(host = '0.0.0.0', port = 17005) {
 	server.on("error", (err) => {
 		// Bind failure (e.g. EADDRINUSE): drop the reference so isHosting() tells the truth
 		// and a later startServer() can retry, and reject the promise startServer()
-		// returned -- a no-op if we were already listening.
+		// returned -- a no-op if we were already listening. Guarded on identity like the
+		// 'close' handler below: an error racing a restart must not lose the new reference.
 		console.error(`Failed to start server: ${err.message}`);
-		server = null;
+		if (server === srv)
+			server = null;
 		readyReject(err);
 	});
 
 	// Fires once the http server has stopped accepting peers -- after stopServer(), which
 	// destroys the peer sockets first. Cleared here too so both paths agree; the state maps
-	// are emptied by the per-socket 'close'/'error' handlers above. The clear is guarded on
-	// identity: a restart issued before this fires (startServer replacing `server` while the
-	// old one is still shutting down) would otherwise null the live reference and make
-	// isHosting() lie, so only the instance this handler was registered for clears it.
-	const srv = server;
+	// are emptied by the per-socket 'close'/'error' handlers above, or by stopServer itself
+	// (it empties clientsSockets first, so those handlers no longer see a tracked socket).
+	// The clear is guarded on identity: a restart issued before this fires (startServer
+	// replacing `server` while the old one is still shutting down) would otherwise null the
+	// live reference and make isHosting() lie, so only the instance this handler was
+	// registered for clears it -- the shared `srv` capture above is that instance.
 	srv.on("close", () => {
 		console.log(`[TT Server] Server closed`);
 		clientsSockets.clear();
@@ -246,6 +258,11 @@ function stopServer() {
 	// playerData/playerNames. The http server then has no live peer left to hold it open.
 	for (const [socket] of clientsSockets) socket.close();
 	clientsSockets.clear();
+	// Emptied here as well: clearing clientsSockets above means the per-socket handlers (which
+	// do this for a normal departure) now find no tracked socket and bail out early, so leaving
+	// it to them would strand the finished session's state for a later startServer().
+	playerData.clear();
+	playerNames.clear();
 	server.close();
 	server = null;
 }

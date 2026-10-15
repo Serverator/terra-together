@@ -52,6 +52,26 @@ function loadSkins() {
 			const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 			let id = manifest.id || folder;
 
+			// NOTE: Figure.getFromSheet(sheet, figure) expects a FigureSheet (see the engine's
+			// own Figure.getFromSheet(this.sheet, name) calls), but `skins.default` is the
+			// {name, figure} wrapper built above. Read the engine before "correcting" this
+			// (engine/figure/figure.js:367 and Figure's constructor at :338):
+			//   - `sheet.path` is undefined here, so the figure cache (keyed on path + name) is
+			//     bypassed and every call builds a fresh Figure instead of reusing one;
+			//   - the constructor then takes its `not instanceof FigureSheet` branch and calls
+			//     FigureSheet.get(<the wrapper>); FileResource.get() treats a non-string as
+			//     "build from data", so it hands back a throwaway EMPTY FigureSheet that reports
+			//     itself loaded and is built from the wrapper (no `figures` key => no figures).
+			// Harmless today only because the lines below repair the result: buildContent() has
+			// run by then, so spriteSheets is {} rather than undefined and info is empty, and
+			// everything the renderer reads -- allAnims, animAdd, info -- is copied from the
+			// default Juno figure, with spriteSheets.juno swapped for the skin's sheet. Nothing
+			// renders through figure.sheet, so the empty sheet and the missed cache lookup are
+			// the only artefacts.
+			// If those copying lines are ever removed, this call must be given a real FigureSheet
+			// (e.g. skins.default.figure.sheet) so the engine's buildContent() fills info and
+			// spriteSheets itself -- and the result is then cacheable and ref-counted, so it must
+			// not be mutated per-skin (the spriteSheets.juno swap) the way it is here.
 			let figure = terra.export.Figure.getFromSheet(skins.default, id);
 			let sheet = terra.export.SpriteSheet.get("map", `../mods/terra-together/skins/${folder}/${manifest.sprite_file}`);
 
