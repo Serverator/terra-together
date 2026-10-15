@@ -311,18 +311,25 @@ function round4(value) {
 }
 
 // The enemy's stable map-scoped identity -- the same derivation src/client/enemies.js uses
-// (enemySpotId, enemies.js:112-127: the SOURCE SPOT's map path + mapId, never the actor's own
+// (enemySpotId, enemies.js:135-142: the SOURCE SPOT's map path + mapId, never the actor's own
 // core, whose mapId is 0 for every runtime-spawned enemy; `u:<uid>` when there is no spot). It is
 // duplicated here because this module is self-contained and enemies.js imports it, and it has to
 // agree byte-for-byte with the id that module keys its peer-state map and its puppet set on: the
 // receiving side routes an incoming state by exactly this field.
+//
+// The two copies are kept in LOCKSTEP, and the guard line below is character-for-character the
+// same as the one in enemySpotId (enemies.js, the canonical form): do not reword it in one file
+// alone. The guard is a REJECT guard -- `mapId < 0` only, so 0 (a real map id) and NaN both pass
+// -- and matching it exactly is what stopped the copies drifting on a numeric edge case, where a
+// malformed map's non-numeric entity key once gave the same enemy an id of `m:<map>#NaN` on one
+// side and `u:<uid>` on the other. Edit one guard, edit both.
 function stateId(core, enemy) {
 	const src = enemy?.sourceEntity;
 	const mapPath = src?.core?.gMap?.path ?? terra.export?.g_game?.map?.active?.path ?? "";
 	const mapId = src?.core?.mapId;
-	if (mapPath !== "" && typeof mapId === "number" && mapId >= 0)
-		return "m:" + mapPath + "#" + mapId;
-	return "u:" + (core?.uid ?? "?");
+	if (mapPath === "" || typeof mapId !== "number" || mapId < 0)
+		return "u:" + (core?.uid ?? "?");
+	return "m:" + mapPath + "#" + mapId;
 }
 
 // Snapshot a live enemy's state, or null when the entity cannot be represented (not an enemy, no
