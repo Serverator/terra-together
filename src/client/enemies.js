@@ -84,6 +84,13 @@
  *     LOCAL copy of that enemy exactly while it is driven as a puppet (applyEnemyEffects), and are
  *     dropped when it stops being one (clearRemoteEnemyFx), so a peer renders the owner's enemy
  *     effects and never emits a second copy of them.
+ *   - Damage numbers (the tail of Phase 5a's hit application): a hit's number is drawn inside the
+ *     VICTIM's damage pipeline and is a GUI element, not an fx, so a hit forwarded to us drew its
+ *     number on OUR screen and on the peer's screen nowhere. The owner captures it off
+ *     CombatantCmp.prototype.dealDamage (wrapped once) for forwarded hits only
+ *     (captureForwardedHitNumber) and it rides the same enemy frame as one more batch (`hitNumbers`,
+ *     ENEMY_EFFECT_KEYS); the peer replays it through the engine's own HitNumbers.addCustom
+ *     (replayEnemyHitNumber). Nothing about the reward path or the HP write changes.
  * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
  *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
  *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
@@ -110,8 +117,12 @@
  *   that attribute an effect to an enemy through the probe registered below, the descriptor/replay
  *   helpers spawnRemoteFx / reconcilePersistentFx / spawnRemoteProjectile / clearRemoteEnemyFx) and
  *   ./actors.js's playSyncedSound (the one remote-sound replay, which needs nothing of its target
- *   but a core). Inbound routing: ./client.js (see the note at the handler
- *   registration below).
+ *   but a core). For the damage-number half of a forwarded hit, additionally
+ *   CombatantCmp.prototype.dealDamage (wrapped once, as the capture point) with the engine's own hit
+ *   results (`dmgResult.damage`/`critical`/`defCritical`) and GUI (g_combat.gui.hitNumbers,
+ *   HIT_NUM_STYLE, CRIT_TYPE), plus g_combat.hasDamageDisplay (the engine's own "would a number be
+ *   drawn at all" gate) and Vec3 (the replayed number's position). Inbound routing: ./client.js (see
+ *   the note at the handler registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
  *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
  *   are released too, so no enemy can stay suppressed (or frozen) because this module stopped
@@ -773,15 +784,25 @@ function sendOwnerStates(live) {
 //                  replayed once and its stop is what ends it.
 //   soundStops     those stops.
 //   projectiles    the proxies the enemy fired, mirrored by the peer as visual-only copies.
+//   hitNumbers     one damage number the owner has just DRAWN for a hit that was forwarded to this
+//                  enemy (see the capture section further down): the number lives in the victim's
+//                  damage pipeline, so it was drawn on the owner's screen and on the peer's screen
+//                  nowhere -- the peer's own copy of the hit is suppressed, and its player's damage
+//                  numbers come from this batch instead. An entry carries the amount, the landing
+//                  point and the crit marking (the parts of the engine's own hit-number call that
+//                  vary per hit; its style is a constant on this path -- see the capture section),
+//                  plus the `enemy` every batch entry carries.
 //
 // Nothing is captured for an enemy this client does NOT own: it is puppeting that enemy, so its own
 // action fx/sounds/projectiles are suppressed locally (./enemy-puppet.js's patches) and its owner
 // is the one sending them. That is the mutual exclusivity in both directions: owned -> forward,
-// never locally matched; puppet -> neither emitted by the engine nor forwarded here.
+// never locally matched; puppet -> neither emitted by the engine nor forwarded here. The hit-number
+// batch follows the same rule from a different end: it is only ever filled for an enemy this client
+// owns, and only for a hit that reached it through the forwarding path.
 
 // The enemy channel's queues, in one place: ./session.js's enemyQueues slots and - the same names -
 // the batches they become on the wire (see the MSG.ENEMY_STATE table in ../net/protocol.js).
-const ENEMY_EFFECT_KEYS = ["globalFx", "fxStops", "sounds", "soundStops", "projectiles"];
+const ENEMY_EFFECT_KEYS = ["globalFx", "fxStops", "sounds", "soundStops", "projectiles", "hitNumbers"];
 
 // Drain this frame's enemy effect queues, keeping only what belongs to an enemy the frame
 // publishes. Returns null when nothing survived, so a frame with no enemy effects keeps exactly the
@@ -1023,6 +1044,10 @@ function sendDespawnId(id) {
 //   projectiles   spawnRemoteProjectile on the enemy, which mirrors it as a visual-only copy (the
 //                 same `__ttVisual`/blocked-steps machinery the player channel uses): it shows and
 //                 flies, and can land nothing.
+//   hitNumbers    replayEnemyHitNumber, once per entry, through the engine's own hit-number API --
+//                 the damage numbers the owner drew for this peer's forwarded hits (a GUI element,
+//                 so it is the one batch here that is not an fx; see the capture section below for
+//                 what travels and what the replay can and cannot reproduce).
 function applyEnemyEffects(id, ent, entry) {
 	if (!entry || entry.applied)
 		return;
@@ -1053,6 +1078,8 @@ function applyEnemyEffects(id, ent, entry) {
 	}
 	for (const p of entry.projectiles ?? [])
 		spawnRemoteProjectile(ent, p);
+	for (const n of entry.hitNumbers ?? [])
+		replayEnemyHitNumber(n);
 }
 
 // The per-enemy home of what an owner's stream has put on OUR copy of an enemy: the fx it spawned
@@ -1077,6 +1104,221 @@ function stopSyncedEnemyFx(holder, stop) {
 		return;
 	try { live.stop(stop.delay ?? 0, stop.softStop ?? false); } catch (e) { /* already gone */ }
 	delete holder.fxMap[stop.id];
+}
+
+// ──────────── damage numbers for a forwarded hit (owner capture / peer replay) ────────────
+//
+// A damage number is born inside the VICTIM's own damage pipeline: `CombatantCmp.dealDamage` ends
+// with `g_combat.gui.hitNumbers.add(dmgResult, force.hitPoint, ...)` (combatant-cmp.js:904-905), so
+// the number is drawn on whichever client ran that pipeline. `HitNumbers` is a GUI ELEMENT
+// (combat-gui.js:24-25), not an FxEntity, so no fx channel can carry it either. A forwarded hit is
+// applied by the OWNER -- the owner is the only party that writes an enemy's HP, which is the whole
+// design of Phase 5a -- so the owner's screen is the one that drew the number while the peer, whose
+// hit it was, saw nothing: its own copy of the hit is suppressed locally (./enemy-puppet.js patch
+// (c)) and the owner's number was never on its screen. Neither player saw a number for that hit.
+//
+// The number therefore rides the same enemy frame as the HP change that produced it: the owner
+// captures what it just drew for a hit that arrived on the FORWARDING path, and the peer replays it
+// through the engine's own hit-number API. Scope, deliberately narrow: only a forwarded hit is
+// captured. The owner's OWN hits draw their number on the owner's screen through the usual pipeline
+// and are already visible to the player who dealt them; sending those too would put a number on the
+// peer's screen for damage its player did not deal, and would have to carry every hit on every owned
+// enemy instead of just the hits this client applies on a peer's behalf.
+
+// WHY THE STYLE DOES NOT TRAVEL. The engine's own call picks the number's style with
+// `attackInfo.isWise() ? WISE : isPLayer ? PLAYER : NORMAL` (combatant-cmp.js:903). On the forwarding
+// path both arms are fixed: the victim is always an ENEMY, so it is never the local player's
+// combatant and `isPLayer` is false; and `isWise()` is `attackInfo.limiter === WISE_DMG`
+// (attack-info.js:126), which the rebuilt attack info can never be because `limiter` is one of the
+// fields the hit descriptor deliberately does not carry (./enemy-puppet.js, the NOT-carried note in
+// readHitDescriptor). The owner's number for a forwarded hit is therefore always a NORMAL one, so a
+// style field would be a constant on the wire -- dead data that would misdescribe the protocol. The
+// peer draws with HIT_NUM_STYLE.NORMAL and nothing else. (What DOES vary per hit, and so does
+// travel, is the crit marking below: the crit is re-rolled on the owner and changes the number's
+// sprite, its lifetime and its boom.)
+
+// The crit marking the engine's own call reads off the damage result, as a wire code. It is
+// `critical ? CRITICAL : defCritical ? DEF_CRITICAL : NONE` (hit-number.js:113-115) and the codes are
+// CRIT_TYPE's own values (hit-number.js:47-53), read through the export here and on the peer, so
+// neither side retypes the enum. The literals are the fallback for a build whose CRIT_TYPE is not
+// exported; the value only selects a sprite.
+function hitNumberCritCode(result) {
+	const crit = terra.export.CRIT_TYPE;
+	if (result?.critical)
+		return crit?.CRITICAL ?? 1;
+	if (result?.defCritical)
+		return crit?.DEF_CRITICAL ?? 2;
+	return 0;
+}
+
+// True when `force` is THE synthetic force this client applies a peer's forwarded hit with (see the
+// phase 5a section below: one rebuilt HitForce per process, `forwardedRig`). It is an identity test
+// on purpose, and it is the discriminator between the two ways a hit can reach an enemy on this
+// client: a forwarded one (impossible to confuse with a local one, which the engine builds itself)
+// and this client's own. Nothing else about the rig is inspected, so a rig that failed to build
+// (`getForwardedRig` returned null) can never match and forwards no hit number.
+function isForwardedForce(force) {
+	return force !== null && force !== undefined && forwardedRig !== null && force === forwardedRig.force;
+}
+
+// Whether the GUI would draw a damage number at all: the engine gates its own hit-number call on
+// `g_combat.hasDamageDisplay()` (combatant-cmp.js:904; combat.js:403-405 -- false in a cutscene,
+// during a teleport and while a blocking event is up). Mirroring that gate here is what keeps the
+// two screens showing the same thing: a hit the owner drew no number for sends no number. Fail-open
+// when the export is missing, so an unknown build degrades to "always draw" rather than to "never
+// send" -- the number is cosmetic, and a missing accessor is not a reason to lose it.
+function damageDisplayOn() {
+	const combat = terra.export.g_combat;
+	if (typeof combat?.hasDamageDisplay !== "function")
+		return true;
+	return combat.hasDamageDisplay() === true;
+}
+
+// Install-once, called every frame from the addon (see onPreUpdate) alongside the other owner
+// seams, for the same reason: a forwarded hit can arrive in any frame, whether or not this module
+// has driven anything yet and whether or not the option was on at the last map start. The wrapper is
+// inert while the feature is off (it re-tests it per call), and a missing export leaves the flag
+// alone so a later frame can retry instead of giving up on the seam for the rest of the session.
+let hitNumberPatched = false;
+
+function ensureHitNumberPatch() {
+	if (hitNumberPatched)
+		return;
+	const proto = terra.export.CombatantCmp?.prototype;
+	if (!proto || typeof proto.dealDamage !== "function") {
+		if (debugEnabled())
+			debugLog("cannot install the hit-number patch: terra.export.CombatantCmp.dealDamage is missing");
+		return;
+	}
+	const original = proto.dealDamage;
+	if (original.__ttHitNumberPatched !== true) {
+		const wrapper = function (...args) {
+			// AFTER the original: the number the engine draws is what dealDamage leaves in
+			// `dmgResult.damage` -- the engine's own hit-number call is its last statement, by which
+			// point reduceHP has folded in the HP barriers and the clamp -- so a value read before it
+			// could be one the owner's screen never showed.
+			const result = original.apply(this, args);
+			captureForwardedHitNumber(this, args);
+			return result;
+		};
+		wrapper.__ttHitNumberPatched = true;
+		proto.dealDamage = wrapper;
+	}
+	hitNumberPatched = true;
+}
+
+// Queue the number one forwarded hit just drew on THIS client's screen, for the peer that made the
+// hit. `combatant` is the victim (the receiver of the engine's own call) and `args` is dealDamage's
+// argument list -- (dmgReact, dmgResult, vel, force, defParams, coll, instant), the engine's own
+// signature (combatant-cmp.js:835).
+//
+// Fail-soft in every direction: a hit that did not arrive on the forwarding path, a victim this
+// client does not own, a result with no usable damage, a landing point that is missing or not
+// finite, and a scene the engine would not have drawn in are all dropped rather than queued. A
+// zero-damage hit is dropped too: the two ways the engine itself produces one (the NO_DMG limiter
+// and a damage-ignore party) are exactly the two its own call site is gated against, so the owner
+// draws no such number to forward.
+function captureForwardedHitNumber(combatant, args) {
+	if (!isEnemySyncEnabled())
+		return;
+	const force = args[3];
+	if (!isForwardedForce(force))
+		return;
+	// The victim has to be an enemy THIS client owns, and its wire id is what the batch entry is
+	// addressed by (the frame publishes that enemy, and the peer routes the entry back to its local
+	// copy of it). The ownership probe is the same one ./fx-sync.js attributes effects through, so
+	// there is one definition of "an enemy we own, and its id".
+	const id = enemyOwnership.ownedIdOf(combatant?.ent);
+	if (id === null)
+		return;
+	const result = args[1];
+	const amount = result?.damage;
+	if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0)
+		return;
+	// The landing point is the vector the engine's own call passes as the number's position
+	// (`force.hitPoint`, combatant-cmp.js:905). This is our own Vec3, read synchronously here and
+	// copied into plain numbers: the rig, and the vector on it, are reused by the next hit.
+	const point = force.hitPoint;
+	if (!point)
+		return;
+	const x = point.x, y = point.y, z = point.z;
+	if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
+		return;
+	if (!damageDisplayOn())
+		return;
+	enemyQueues.hitNumbers.push({
+		enemy: id,
+		amount,
+		pos: [x, y, z],
+		crit: hitNumberCritCode(result),
+	});
+}
+
+// The crit marking on the wire, checked back against this build's own CRIT_TYPE: only the three
+// values the engine's own call can carry (hit-number.js:113-115) are accepted, and anything else --
+// a code from a build whose enum differs, a junk field on a malformed entry -- degrades to NONE
+// rather than being handed to the engine as a sprite index it would never choose itself.
+function wireHitCrit(code) {
+	const crit = terra.export.CRIT_TYPE;
+	const values = crit ? [crit.NONE, crit.CRITICAL, crit.DEF_CRITICAL] : [0, 1, 2];
+	return values.includes(code) ? code : (crit?.NONE ?? 0);
+}
+
+// The engine's own endZ for an instantly placed number: `setInstantPos(pos, endZ = 2.0)`
+// (hit-number.js:278). `addCustom`'s own default is 1.0, the convention of the SCORE style it
+// targets by default (:152), so the value is passed explicitly to place a damage number the way the
+// engine places an instant one.
+const HIT_NUMBER_END_Z = 2.0;
+
+// Replay one forwarded hit number on OUR copy of the enemy, through the engine's own hit-number API.
+//
+// WHICH API, and why. `HitNumbers` has two entries (hit-number.js:111, :152). `add(dmgRes, pos, dir,
+// fly, stable, style, instant)` derives the number's TYPE from the damage result -- break, weak or
+// strong (:118-128) -- and needs a direction vector to place a non-instant number: those two inputs
+// are exactly what a forwarded hit cannot supply, because the type is a reading of the victim's own
+// defence rolls and the direction is a velocity we do not carry. `addCustom(amount, pos, endZ, style,
+// crit)` (:152-160) takes a FINISHED amount, positions the number instantly (:157 -> setInstantPos,
+// :278-284, which is also where a pooled number is given its block entry) and leaves the type at
+// DEFAULT -- which is what a damage number is drawn as when no break/weak/strong reading applies. It
+// is therefore the API this replay uses, with the amount, the crit marking, the landing point and the
+// one style a forwarded hit can carry (NORMAL, see the note above) all reproduced. NOT reproduced:
+// the BREAK/WEAK/STRONG glyph the owner's number may have carried (that is a reading of the VICTIM's
+// own defence rolls, which do not travel) and the popup's lerp along the hit direction (the position
+// is the landing point and the rise is the engine's own instant one).
+// `amount` goes over the wire un-rounded and is rounded by `init` here, exactly as it was on the
+// owner's screen (hit-number.js:270-273).
+//
+// Fail-soft: a malformed entry, an unusable position, a missing GUI or style table, or an engine
+// that throws while adding the number skips the number instead of breaking the frame it arrived in
+// (a peer's payload is not trusted input, and a frame carries state too).
+function replayEnemyHitNumber(entry) {
+	if (!entry || typeof entry !== "object")
+		return;
+	const amount = entry.amount;
+	if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0)
+		return;
+	const pos = entry.pos;
+	if (!Array.isArray(pos) || pos.length < 3)
+		return;
+	const x = pos[0], y = pos[1], z = pos[2];
+	if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
+		return;
+	const style = terra.export.HIT_NUM_STYLE?.NORMAL;
+	if (!style)
+		return;
+	const numbers = terra.export.g_combat?.gui?.hitNumbers;
+	if (typeof numbers?.addCustom !== "function")
+		return;
+	const Vec3 = terra.export.Vec3;
+	if (typeof Vec3 !== "function")
+		return;
+	try {
+		numbers.addCustom(amount, new Vec3(x, y, z), HIT_NUMBER_END_Z, style, wireHitCrit(entry.crit));
+	}
+	catch (e) {
+		if (debugEnabled())
+			debugLog(`damage number from a peer's hit was not drawn: ${e?.message ?? e}`);
+	}
 }
 
 // ───────────────────── peer half: drive what we do not own ─────────────────────
@@ -1399,7 +1641,8 @@ export function onEnemyOwner(msg) {
 // enemy when it stops arriving.
 //
 // The frame also carries that owner's effects for those enemies (Phase 6: globalFx/fxStops/
-// persistentFx/sounds/soundStops/projectiles, each entry tagged with its enemy). They are stored
+// persistentFx/sounds/soundStops/projectiles, each entry tagged with its enemy) and, the same way,
+// the damage numbers it drew for the hits this client forwarded to it (hitNumbers). They are stored
 // with the state they arrived with and applied by the same per-frame half, for exactly the same
 // reason: an effect belongs to the frame whose state it accompanied, and the enemy's own entity is
 // only steered on the frame path (see applyEnemyEffects).
@@ -1422,6 +1665,7 @@ export function onEnemyState(msg) {
 	const soundStops = groupEnemyEffects(msg.soundStops);
 	const projectiles = groupEnemyEffects(msg.projectiles);
 	const persistentFx = groupEnemyEffects(msg.persistentFx);
+	const hitNumbers = groupEnemyEffects(msg.hitNumbers);
 	const now = nowMs();
 	for (const state of list) {
 		// Malformed and partial entries are skipped, never thrown on: a peer's payload must not
@@ -1449,6 +1693,7 @@ export function onEnemyState(msg) {
 		carryBatch(entry, "soundStops", carried, soundStops.get(id));
 		carryBatch(entry, "projectiles", carried, projectiles.get(id));
 		carryBatch(entry, "persistentFx", carried, persistentFx.get(id));
+		carryBatch(entry, "hitNumbers", carried, hitNumbers.get(id));
 		peerState.set(id, entry);
 	}
 }
@@ -2770,8 +3015,9 @@ class EnemySync {
 
 	onPreUpdate() {
 		// The engine seams that hang off a per-entity decision -- the death seam (ensureDespawnPatch),
-		// the rest seam (ensureRespawnPatch) and Phase 5b's reward gate (ensureRewardPatch) -- are
-		// installed once, and this hook is where it happens because it runs before this frame's entity
+		// the rest seam (ensureRespawnPatch), Phase 5b's reward gate (ensureRewardPatch) and the
+		// damage-number capture for a forwarded hit (ensureHitNumberPatch, which wraps dealDamage) --
+		// are installed once, and this hook is where it happens because it runs before this frame's entity
 		// updates: an enemy can die in any frame, and a player can rest in any frame, whether or not this
 		// module has driven anything yet, so the map-start install the puppet patches use would not cover
 		// a flag switched on mid-map. Installed while the option is off too: the wrappers are inert then
@@ -2780,6 +3026,7 @@ class EnemySync {
 		ensureDespawnPatch();
 		ensureRespawnPatch();
 		ensureRewardPatch();
+		ensureHitNumberPatch();
 		applyPeerState(syncEnemies());
 	}
 

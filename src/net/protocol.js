@@ -91,11 +91,17 @@
  *                                            MSG.ENEMY_STATE case). Payload: { owner, map, variant,
  *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
  *                                            animTime, hp, state, action } ], plus whichever of
- *                                            globalFx, fxStops, persistentFx, sounds, soundStops and
- *                                            projectiles this frame has }. Those six effect batches
- *                                            are the shapes the player snapshot's own arrays already
- *                                            carry (see MSG.UPDATE), so the recipient replays them
- *                                            through the same code, and every entry names the enemy it
+ *                                            globalFx, fxStops, persistentFx, sounds, soundStops,
+ *                                            projectiles and hitNumbers this frame has }. Six of
+ *                                            those batches are the shapes the player snapshot's own
+ *                                            arrays already carry (see MSG.UPDATE), so the recipient
+ *                                            replays them through the same code; the seventh
+ *                                            (hitNumbers) has no player-channel twin -- it is the
+ *                                            damage numbers a client drew for the hits forwarded to
+ *                                            it, which are a GUI element rather than an fx and are
+ *                                            replayed through the engine's own hit-number API
+ *                                            (src/client/enemies.js). Every entry of every batch
+ *                                            names the enemy it
  *                                            belongs to in an `enemy` field: the id of a `list` entry
  *                                            of the same frame, which is how the recipient routes it
  *                                            to the local copy of that enemy and never to the enemy of

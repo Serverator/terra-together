@@ -146,6 +146,13 @@ export const enemyQueues = {
 	soundStops: [],
 	// proxies (projectiles) an owned enemy fired this frame
 	projectiles: [],
+	// damage numbers an owned enemy's OWNER has just drawn for a hit FORWARDED to it this frame
+	// (see ./enemies.js, the dealDamage capture: the number itself is a GUI element, not an fx, so
+	// it cannot ride any of the slots above -- it is captured from the engine's own hit-number call
+	// and replayed with the engine's own API on the peer). Stored here like the rest so the frame
+	// carries it as one more batch, and filled by ./enemies.js itself rather than by fx-sync.js:
+	// the capture point is the owner's damage pipeline, not an fx spawn.
+	hitNumbers: [],
 };
 
 // Enemy-owned *infinite* fx (attack telegraphs, status markers) currently alive on the local

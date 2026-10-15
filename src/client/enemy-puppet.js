@@ -838,12 +838,22 @@ function applyState(ent, state) {
 	}
 
 	// 4. HP. Written as the owner's 0..1 ratio (the same convention the mod uses for players),
-	//    converted with the enemy's own max HP -- the accessor its HP bar reads. setCurrentHP with
-	//    skipTransition=true fires HP_RESET, which snaps the bar instead of animating a drain we
-	//    never saw (hp-hud.js:194-200), and it does NOT touch params.defeated: a puppet can never
-	//    be pushed into local death logic by a driven HP value (defeat is owner-driven, and
-	//    params.isDefeated() reads that flag, combat-params.js:443). Unchanged values are not
-	//    re-written, so an idle peer stream does not spam HP_RESET at the HUD.
+	//    converted with the enemy's own max HP -- the accessor its HP bar reads. The second argument
+	//    of setCurrentHP is the SKIP-TRANSITION flag, and it is what chooses the event the HUD hears:
+	//    true fires HP_RESET and false fires HP_CHANGED (combat-params.js:416-421). An ENEMY's HUD is
+	//    a CombatantHud, and its onCombatParamsEvent handles HP_CHANGED ONLY (combat-hud.js:328-331)
+	//    -- it is the sole observer of an enemy's params (the only `params.addObserver` in the game
+	//    that is not `player_model.g_player.combat.params`, combat-hud.js:172 vs hp-hud.js:166,
+	//    buff-hud.js:153, sp-hud.js:32, cross-lowhp-warning.js:40) -- so passing true published the
+	//    value as an event nothing listened for and the peer's bar stayed at its construction-time
+	//    value forever. false is also the event the engine's own HP write fires (CombatParams.reduceHP,
+	//    :298), which is the path the bar tracks when the OWNER takes damage. (The HP_RESET handler the
+	//    old comment here cited, hp-hud.js:194-200, belongs to the PLAYER's HUD, which observes the
+	//    player's own params; no enemy HUD is an observer of those.)
+	//    It does NOT touch params.defeated: a puppet can never be pushed into local death logic by a
+	//    driven HP value (defeat is owner-driven, and params.isDefeated() reads that flag,
+	//    combat-params.js:443). Unchanged values are not re-written, so an idle peer stream does not
+	//    spam the HUD.
 	const params = ent.combatant?.params;
 	if (params && typeof state?.hp === "number" && typeof params.setCurrentHP === "function") {
 		const maxHp = params.stats?.getStat?.("hp");
@@ -854,7 +864,7 @@ function applyState(ent, state) {
 			// something else.
 			const hp = ratio > 0 ? Math.max(1, Math.round(ratio * maxHp)) : 0;
 			if (params.currentHP !== hp)
-				params.setCurrentHP(hp, true);
+				params.setCurrentHP(hp, false);
 		}
 	}
 
