@@ -4,6 +4,7 @@ import * as skin from './skin.js';
 import * as client from './client.js';
 import * as server from './server.js';
 import * as nameplates from './nameplates.js';
+import { EnemyDebug } from './enemy-debug.js';
 
 window.terraTogether ??= {};
 
@@ -165,5 +166,7 @@ class Multiplayer extends terra.export.Observable {
 
 terra.addAddon(new Multiplayer(), { onAddonInit: -10000, onLoopStart: -10000, onGameMapStart: 35000 });
 terra.addAddon(new SettingsTab(), { onLoopStart: 40000 });
+// Enemy debug overlay: added just after the nameplates so its labels draw on top.
+terra.addAddon(new EnemyDebug(), { onLoopStart: 50001 });
 
 //# sourceURL=/mods/terra-together/main.js

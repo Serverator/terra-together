@@ -27,12 +27,18 @@ const playerNames = new Map();
 window.terraTogether ??= {};
 window.terraTogether.playerActors = playerActors;
 window.terraTogether.playerNames = playerNames;
+// Read-only mirror for consumers that only have the window surface (e.g. the enemy debug
+// overlay): our server-assigned id, as a getter so it always tracks `playerId`.
+Object.defineProperty(window.terraTogether, "playerId", { get: () => playerId, configurable: true });
 
 const playerUpdates = new Map();
 const playerActions = new Map();
 
 // Network ids of other connected players (drives hasPeers()).
 const peers = new Set();
+// Exposed for the enemy debug overlay's player roster; the Set is mutated in place, so
+// this single reference always stays current.
+window.terraTogether.peers = peers;
 
 // Downed/revive state (see revive.js): whether our own player is down, and per-peer
 // down state propagated through the normal player state sync.

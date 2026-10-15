@@ -3,6 +3,7 @@
 
 import { createTextOption, createButtonOption } from "./option-types.js";
 import { createOption } from "./helper.js";
+import { ENEMY_DEBUG_OPTION } from "./enemy-debug.js";
 import * as client from "./client.js";
 import * as server from "./server.js";
 import { createSkinSetting } from "./skin.js";
@@ -324,6 +325,20 @@ export function createModSettings() {
 	g_options.settings["tt-skip-logos"] = skipLogos;
 	if (g_options.values["tt-skip-logos"] === undefined)
 		g_options.values["tt-skip-logos"] = skipLogosData.type.default;
+
+	// === Debug ===
+
+	// Enemy debug overlay (see enemy-debug.js): draws the owning player plus the current
+	// state/action above every enemy. Off by default; also toggleable live from the
+	// devtools console with window.ttEnemyDebug = true.
+	createOption(ENEMY_DEBUG_OPTION, {
+		category: CATEGORY,
+		header: "Debug",
+		local: true,
+		label: { en_US: "Enemy Debug Overlay" },
+		description: { en_US: "Show a debug label above every enemy: the player who owns it and its current state and action.\n\nAlso toggleable live from the devtools console: window.ttEnemyDebug = true" },
+		type: { default: false, type: "CHECKBOX" }
+	}, "CHECKBOX");
 }
 
 // Adds the mod's tab to the Options menu (as an addon, after the menu is built).
