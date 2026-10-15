@@ -124,7 +124,9 @@
  */
 
 import { send, isConnected, addPeerMessageHandler } from "./client.js";
-import { getRogueInfo, hasPeers, enemyQueues, activeEnemyFx, enemyOwnership } from "./session.js";
+import {
+	getRogueInfo, hasPeers, enemyQueues, activeEnemyFx, enemyOwnership, RUN_FX_SPEED_EPS,
+} from "./session.js";
 import { MSG } from "../net/protocol.js";
 import {
 	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet, adoptState,
@@ -1009,6 +1011,11 @@ function sendDespawnId(id) {
 //                 the same reason the player path measures the ghost's: a run-group fx reported by
 //                 an owner that has stopped moving is stale. This and globalFx share the fx map,
 //                 so a lasting fx that came in as a one-shot is not spawned a second time.
+//                 The speed threshold is the SHARED RUN_FX_SPEED_EPS imported from ./session.js --
+//                 the very constant ./actors.js:188 measures a peer player's ghost with, because it
+//                 is one concept ("is this driven entity running") and a second copy of the number
+//                 is exactly the kind of duplicated shared logic this codebase has been bitten by
+//                 before (see the enemyStableId note above).
 //   fxStops       stop the tracked fx (an infinite telegraph ends no other way).
 //   sounds        replay at the enemy's own position (./actors.js's playSyncedSound -- it needs
 //                 nothing but a core, and an enemy has one), remembering the playback per sync id.
