@@ -389,7 +389,7 @@ function debugLog(...parts) {
 // both halves of every surface are built on this format; Phase 2 syncs state and will treat the
 // variant as part of enemy identity, which is the change that closes the gap.
 function enemySpotId(core) {
-	const src = terra.export.EnemyCmp?.get?.(core?.ent)?.sourceEntity;
+	const src = enemyOf(core?.ent)?.sourceEntity;
 	const mapPath = src?.core?.gMap?.path ?? terra.export.g_game?.map?.active?.path ?? "";
 	const mapId = src?.core?.mapId;
 	if (mapPath === "" || typeof mapId !== "number" || mapId < 0)
@@ -421,6 +421,22 @@ function wireEnemyId(core) {
 
 // ──────────────────────────────── entity plumbing ────────────────────────────────
 
+// The ONE door every EnemyCmp read in this module goes through. EnemyCmp.get(ent) is
+// TerraCmpMap.read(ent).enemy (enemy-cmp.js:194-196), and read() is a side-table keyed by the
+// ENTITY: it logs "TerraCmpMap: No entity!" and then dereferences ent.cmpMap (terra-cmp-map.js:29-32),
+// so it tolerates a MISSING component map but THROWS on an undefined/null entity. Handing it one is
+// therefore never allowed to be a crash, and it is also not an anomaly -- a core with no live entity
+// is a normal per-frame state: Entity.onKill nulls the entity's own back-reference and destroys its
+// cmpMap (entity.js:219-227), while the spot that spawned that enemy keeps holding the
+// half-dismantled entity until the spot respawns (EnemySpotEntity.enemyEnt, cleared only in
+// respawn(), enemy-spot-entity.js:161). The engine's own copy of that walk guards in exactly this
+// place (`enemyEnt && enemyEnt.enemy`, combat.js:242-247); this module's reads do the same here rather
+// than once per call site. No entity, no component -- the same enumeration rule the walks below
+// apply (`!core || !core.ent`).
+function enemyOf(ent) {
+	return ent ? terra.export.EnemyCmp?.get?.(ent) : null;
+}
+
 function isWorldSceneActive() {
 	return !!terra.export.g_scene?.isRunning?.() && !terra.export.g_scene?.isCutscene?.();
 }
@@ -439,7 +455,7 @@ function activeMapPath() {
 function getLiveEnemy(core) {
 	if (!core || !core.ent || core.isKilled?.())
 		return null;
-	const enemy = terra.export.EnemyCmp?.get?.(core.ent);
+	const enemy = enemyOf(core.ent);
 	if (!enemy || !enemy.combatant)
 		return null;
 	if (typeof enemy.isAlive === "function" && !enemy.isAlive())
@@ -745,6 +761,8 @@ function syncEnemies() {
 	const live = new Map();
 	const added = [];
 	for (const core of terra.export.g_gState?.entities ?? []) {
+		if (!core || !core.ent)
+			continue;                      // the enumeration rule: no core or no entity, no id
 		const id = wireEnemyId(core);
 		if (id === null)
 			continue;                      // runtime spawn / unknown map: not wire-addressable
@@ -2646,7 +2664,7 @@ function findCoreById(enemyId) {
 // its caller grants the local player's share first (grantKillReward, Phase 5b), because for a client
 // that did not simulate the death this removal IS the moment the death is certain.
 function removeDefeatedEnemy(core) {
-	const enemy = terra.export.EnemyCmp?.get?.(core?.ent);
+	const enemy = enemyOf(core?.ent);
 	// The dead-set FIRST: killing the entity destroys its components' links, so the spot has to be
 	// read off the enemy while the enemy is still there.
 	markSpotDefeated(enemy?.sourceEntity);
@@ -2775,7 +2793,7 @@ function wakeIdList(core, live) {
 	// world is running); the lookup is what is guarded, not the call.
 	const map = terra.export.g_gState?.getMainMap?.();
 	const group = map ? terra.export.g_group : null;
-	const spot = terra.export.EnemyCmp?.get?.(core?.ent)?.sourceEntity;
+	const spot = enemyOf(core?.ent)?.sourceEntity;
 	if (spot?.core?.entityGroups?.length && group && typeof group.getEnemySpots === "function") {
 		for (const member of group.getEnemySpots([], spot.core.entityGroups))
 			addWakeId(ids, member?.enemyEnt);
@@ -2804,8 +2822,18 @@ function wakeIdList(core, live) {
 
 // One group member's wire id. A spot that has not spawned its enemy yet contributes nothing (see the
 // dormant-spot note above), and neither does an enemy with no map-placed identity.
+//
+// The test has to be on the CORE, not on the entity. This walk reaches into the group manager's spots,
+// and a spot holds the enemy it spawned until the spot respawns -- so the entity handed over here can
+// be one the engine has already killed, whose `core` is null (entity.js:227). Asking for an id from
+// that is exactly the crash this guard closes: the id helper reads the entity's EnemyCmp, and the
+// engine's side-table read throws on a missing entity instead of returning nothing. Same enumeration
+// rule as the sibling walks in this file (getLiveEnemy, findCoreById, calmAllEnemies): no core or no
+// entity, no id.
 function addWakeId(ids, ent) {
-	const id = ent ? wireEnemyId(ent.core) : null;
+	if (!ent || !ent.core)
+		return;
+	const id = wireEnemyId(ent.core);
 	if (id !== null)
 		ids.add(id);
 }
@@ -2888,7 +2916,7 @@ function sendWake(ids) {
 // cancelAction is what makes a woken enemy pick a combat action instead of finishing whatever it was
 // doing, and it is the engine's own choice there, not this module's.
 function wakeEnemyAt(core) {
-	const enemy = terra.export.EnemyCmp?.get?.(core?.ent);
+	const enemy = enemyOf(core?.ent);
 	if (!enemy || enemy.aggressive === true || typeof enemy.setAggressive !== "function")
 		return false;
 	if (typeof enemy.isAlive === "function" && !enemy.isAlive())
@@ -3179,8 +3207,9 @@ function calmEnemy(enemy, spot) {
 // authored behaviour. Only a spot this module actually respawned has it cleared.
 function calmAllEnemies() {
 	for (const core of terra.export.g_gState?.entities ?? []) {
-		const ent = core?.ent;
-		const enemy = ent ? terra.export.EnemyCmp?.get?.(ent) : null;
+		if (!core?.ent)
+			continue;                      // the enumeration rule: no entity, no enemy (see enemyOf)
+		const enemy = enemyOf(core.ent);
 		// Only enemies that ARE aggressive: a calm one is already in the state a rest wants, and
 		// setAggressive(false) would early-return on it anyway (enemy-cmp.js:377-379) -- so touching it
 		// would be a write with no effect at best, and a setPassive mid-action at worst.
@@ -3865,7 +3894,7 @@ function grantKillReward(enemyId, ent) {
 			debugLog(`kill reward for ${enemyId}: our player was neither in combat with nor near it, nothing paid`);
 		return false;
 	}
-	const enemy = terra.export.EnemyCmp?.get?.(ent);
+	const enemy = enemyOf(ent);
 	if (!enemy || typeof enemy.giveExp !== "function" || typeof enemy.dropItems !== "function")
 		return false;
 	// Marked BEFORE the calls: a grant that throws half-way must not be repeatable, and the mark is
