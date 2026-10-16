@@ -10,7 +10,8 @@
  *     enemy_handoff, enemy_despawn, enemy_respawn and enemy_hit to other clients with the
  *     sender's id stamped on them.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
- *     publish it, re-arbitrating when a room's membership changes.
+ *     publish it, re-arbitrating when a room's membership changes or, on a timer, when a
+ *     different player has become the nearest one to an enemy (Phase 7 proximity).
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
  * Engine touchpoints: window.addEventListener('beforeunload') (stops the server on reload);
  *   crypto.randomUUID() from the ambient global (the NW.js page, not terra.*); no direct
@@ -102,6 +103,56 @@ const playerNames = new Map();
 // what makes split ownership safe. The server never simulates an enemy itself -- it only
 // arbitrates, and being one process means it needs no consensus protocol to do so.
 const enemyOwnership = new EnemyOwnership();
+
+// Last known position per enemy id, for the proximity pass: the arbiter needs to know which of
+// an enemy's candidates is standing nearest to it, and only the server sees everyone's traffic.
+// Fed from the enemy_state frames it already relays (list[].x/y/z, cached only for entries whose
+// sender it just vouched for as the owner, so a non-owner's claim can never move the arbitration)
+// and from the `position` field of the state snapshots, which is the same source playerData's
+// own downed/hp fields come from. Bounded by the number of live enemies: an id leaves on the
+// despawn or the withdrawal that ends it, and the whole map is emptied when the server stops.
+const enemyPositions = new Map();
+
+// A player's last known position, as the { x, y, z } the proximity pass reads. Missing (undefined)
+// while we have not heard from that player yet, which reads as UNMEASURABLE there -- never as
+// "far away". A malformed or non-finite vector is dropped for the same reason.
+function playerPosition(playerId) {
+	const state = playerData.get(playerId);
+	const p = state?.position;
+	if (!Array.isArray(p) || p.length < 3)
+		return undefined;
+	const [x, y, z] = p;
+	if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
+		return undefined;
+	return { x, y, z };
+}
+
+// Record one relayed enemy_state entry's position. Only the fields the arbitration uses are kept
+// (the vx/vy/vz, hp, anim of the frame are not this cache's business), and a malformed vector is
+// DROPPED rather than coerced: NaN would compare false against everything and quietly turn the
+// distance test into a no-op, and storing a partial vector would make an enemy look nearer or
+// further than it is.
+function cacheEnemyPosition(entry) {
+	const x = entry.x;
+	const y = entry.y;
+	const z = entry.z;
+	if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
+		return;
+	enemyPositions.set(entry.id, { x, y, z });
+}
+
+// Forget the cached positions of the enemies named in `ids` (a despawn or a withdrawal). Called
+// with a list that may name enemies this server never had a position for, so it is safe on every
+// path. A wrong id is not an error: it simply removes nothing.
+function forgetEnemyPositions(ids) {
+	if (!Array.isArray(ids))
+		return;
+	for (const entry of ids) {
+		const id = entry && typeof entry === "object" ? entry.id : entry;
+		if (typeof id === "string")
+			enemyPositions.delete(id);
+	}
+}
 
 // Room key for a map + rogue variant; variant is null outside rogue. The clients match peers
 // on this same pair (their JOIN_MAP flow), so the key is what "same room" means here.
@@ -233,7 +284,7 @@ function reassignRoom(room, leavingId = null, joiningId = null) {
 	const members = rosterOf(room).filter((id) => id !== leavingId);
 	if (joiningId !== null && !members.includes(joiningId))
 		members.push(joiningId);
-	const changed = enemyOwnership.onRosterChange(room, members);
+	const changed = enemyOwnership.onRosterChange(room, members, Date.now());
 	if (netDebugEnabled())
 		netDebug(`rebalance ${room} roster=[${members.map(shortId).join(",")}]${leavingId !== null ? ` leaving=${shortId(leavingId)}` : ""}${joiningId !== null ? ` joining=${shortId(joiningId)}` : ""} -> ${changed.length} moved`);
 	publishOwners(changed);
@@ -249,6 +300,73 @@ function reassignOwnedRooms(playerId, exceptRoom = null) {
 	for (const room of enemyOwnership.ownedRooms(playerId)) {
 		if (room !== exceptRoom)
 			reassignRoom(room, playerId);
+	}
+}
+
+// ─── proximity cadence (Phase 7) ─────────────────────────────────────────────────
+// How often ownership is re-evaluated against where the players actually are. A CADENCE, not a
+// per-frame or per-message reaction, and that is the whole point: positions change every frame,
+// so a pass that chased them would move owners -- each move a handoff, each handoff visible
+// mid-fight -- continuously. The arbiter is idempotent, so a tick that finds nothing to move
+// publishes nothing at all.
+const OWNERSHIP_TICK_MS = 1000;
+let ownershipTimer = null;
+
+// Everything the proximity pass needs to know about where a player or an enemy is, as one map
+// from id to { x, y, z }: the players' last snapshots plus the enemies' last relayed states.
+// The two id spaces cannot alias -- an enemy id is always `m:<mapPath>#<mapId>`
+// (src/client/enemies.js wireEnemyId) and a player id is a bare uuid -- so one map is safe, and
+// it is exactly the shape the arbiter's distance lookup takes. A missing entry means
+// UNMEASURABLE, which the arbiter treats as "no evidence", never as "far away".
+function positionsSnapshot() {
+	const positions = new Map();
+	for (const [id] of clientsSockets) {
+		const p = playerPosition(id);
+		if (p !== undefined)
+			positions.set(id, p);
+	}
+	for (const [id, p] of enemyPositions)
+		positions.set(id, p);
+	return positions;
+}
+
+// One proximity pass: who is in each room, where everyone and every enemy is, who is down, and
+// the clock. The arbiter returns exactly the assignments that moved, and those are all that is
+// published -- MSG.ENEMY_OWNER, same shape, same field-for-field epoch rule, so no client can
+// tell this phase happened from the wire.
+function ownershipTick() {
+	// One client cannot disagree with itself. With no peer there is nobody to hand an enemy to,
+	// so the pass could only ever keep the incumbent: skip it and pay nothing.
+	if (clientsSockets.size < 2)
+		return;
+
+	// The roster per room, from the same source the membership-driven rebalance uses, so a tick
+	// and a rebalance of the same state see the same candidates.
+	const rosterByRoom = new Map();
+	for (const room of enemyOwnership.rooms())
+		rosterByRoom.set(room, rosterOf(room));
+
+	// Downed players are the one liveness fact that matters: a downed player cannot fight, and
+	// an enemy's target follows its owner, so an enemy left on a downed owner stops fighting
+	// even after its owner is revived. Read from the same cached snapshot fields (downed) the
+	// rest of the server reads; a state from before anyone was down simply does not report one.
+	const downed = new Set();
+	for (const [id, state] of playerData) {
+		if (state.downed)
+			downed.add(id);
+	}
+
+	const changed = enemyOwnership.onProximityTick(rosterByRoom, positionsSnapshot(), downed, Date.now());
+	if (changed.length > 0)
+		publishOwners(changed);
+}
+
+// Stop the cadence. Idempotent, and safe to call from every teardown path (stopServer, the
+// bind-failure handler, the http server's own close): the timer is the only thing it owns.
+function stopOwnershipTimer() {
+	if (ownershipTimer !== null) {
+		clearInterval(ownershipTimer);
+		ownershipTimer = null;
 	}
 }
 
@@ -278,6 +396,12 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		console.log(`[TerraTogether] Server listening on ws://${host}:${port}`);
 		readyResolve();
 	});
+
+	// The proximity cadence starts with the server and dies with it (see stopOwnershipTimer):
+	// it reads clientsSockets/playerData, so a tick that outlived the session would read an
+	// emptied world and hand nothing out. Created once per startServer() call -- the early
+	// return above makes a second one impossible while one is running.
+	ownershipTimer = setInterval(ownershipTick, OWNERSHIP_TICK_MS);
 
 	server.on('connection', (socket) => {
 		// One id per connection: it is the identity every relayed message carries and the
@@ -418,7 +542,7 @@ function startServer(host = '0.0.0.0', port = 17005) {
 							noteRoom(playerId, messageRoom);
 						const room = messageRoom ?? roomOf(playerId);
 						const roster = rosterOf(room);
-						const assignment = enemyOwnership.register(msg.id, room, playerId, roster);
+						const assignment = enemyOwnership.register(msg.id, room, playerId, roster, Date.now());
 						if (netDebugEnabled())
 							netDebug(`in enemy_register ${msg.id} (msg map=${msg.map} variant=${msg.variant}) room=${room ?? "(none)"} from=${shortId(playerId)} roster=[${roster.map(shortId).join(",")}] -> owner=${shortId(assignment?.owner) || "none"} epoch ${assignment?.epoch ?? "-"} moved=${assignment?.changed?.length ?? 0}`);
 						// Everyone, the registrant included: it has to learn who owns the enemy it just
@@ -458,6 +582,12 @@ function startServer(host = '0.0.0.0', port = 17005) {
 								passed++;
 								if (kept !== null)
 									kept.push(entry);
+								// Remember where this enemy is, for the proximity pass. Cached only for entries
+								// whose sender the arbiter just vouched for as the owner, which is what keeps a
+								// non-owner's claim out of the arbitration. Free: the frame is already in hand and
+								// this is one property read per entry, on a path this loop already walks (a
+								// malformed vector is dropped by the helper).
+								cacheEnemyPosition(entry);
 							} else if (kept === null) {
 								kept = list.slice(0, i);
 							}
@@ -532,6 +662,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// The sender's own claim is never relayed -- the socket identity is the id the
 						// recipients gate and log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF cases.
 						msg.owner = playerId;
+						// This enemy's cached position goes with it: the owner has just killed it, so a
+						// later proximity pass must not reason about where the corpse was, and the map's
+						// enemy count (not the session's) is what bounds the cache.
+						forgetEnemyPositions(despawnList);
 						broadcast(msg, socket);
 						break;
 					}
@@ -593,6 +727,12 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// both its owner and its epoch instead of being re-registered from scratch. Nothing is
 						// reassigned -- a removal never moves load around.
 						const dropped = enemyOwnership.unregister(msg.ids, playerId);
+						// The enemy is no longer anywhere on this client's screen (it died there, or its
+						// map unloaded), so its cached position is stale for the proximity pass whether or
+						// not the record survives this withdrawal. Dropping it bounds the cache to the
+						// enemies that are live RIGHT NOW, and costs nothing: the surviving owner is
+						// publishing on the same frame that re-fills it.
+						forgetEnemyPositions(msg.ids);
 						if (netDebugEnabled())
 							netDebug(`in enemy_unregister [${(msg.ids ?? []).join(", ")}] from=${shortId(playerId)} -> ${dropped} record(s) dropped, ${(msg.ids ?? []).length - dropped} still held elsewhere`);
 						break;
@@ -649,6 +789,9 @@ function startServer(host = '0.0.0.0', port = 17005) {
 		console.error(`Failed to start server: ${err.message}`);
 		if (server === srv)
 			server = null;
+		// The cadence started with this instance even though it never listened: leaving it
+		// running would keep re-arbitrating (and reading) a session that does not exist.
+		stopOwnershipTimer();
 		readyReject(err);
 	});
 
@@ -663,6 +806,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 	srv.on("close", () => {
 		console.log(`[TT Server] Server closed`);
 		clientsSockets.clear();
+		// Also the cadence's stop: 'close' is the last word on this instance, whichever path
+		// got here (stopServer clears it first, which makes this a no-op), and a timer left
+		// running past it would tick against an emptied world forever.
+		stopOwnershipTimer();
 		if (server === srv)
 			server = null;
 	});
@@ -672,6 +819,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 
 function stopServer() {
 	if (!server) return;
+	// Stop the proximity cadence first: it arbitrates over the state the next two lines are
+	// about to empty, and a tick landing in between would publish owners for a session that is
+	// already ending.
+	stopOwnershipTimer();
 	// Close every peer first: the close frames are queued and each socket is destroyed from
 	// its write callback, which is what fires the per-socket handlers that empty
 	// playerData/playerNames. The http server then has no live peer left to hold it open.
@@ -683,6 +834,10 @@ function stopServer() {
 	playerData.clear();
 	playerNames.clear();
 	playerRooms.clear();
+	// The enemy positions go with the session they were gathered in: they are keyed by enemy
+	// id, which the next session's clients re-announce from scratch, so a kept entry could only
+	// mislead the next session's first ticks.
+	enemyPositions.clear();
 	server.close();
 	server = null;
 }

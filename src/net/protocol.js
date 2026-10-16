@@ -75,7 +75,8 @@
  *   MSG.ENEMY_OWNER       "enemy_owner"      server -> all clients, from the ownership arbiter
  *                                            (src/server/enemy-ownership.js): the authoritative
  *                                            answer to a register, and the republish whenever a
- *                                            room's membership changes. `owner` null means the
+ *                                            room's membership changes or the proximity pass moves an
+ *                                            enemy to a nearer player (Phase 7). `owner` null means the
  *                                            enemy is unowned, i.e. nobody simulates it. Client
  *                                            case: MSG.ENEMY_OWNER.
  *   MSG.ENEMY_STATE       "enemy_state"      client -> server -> other clients, per frame, and only
@@ -88,7 +89,12 @@
  *                                            (enemy-ownership.js validate()) and DROPS any the sender
  *                                            does not own, then relays the surviving frame with
  *                                            `owner` stamped to the sender (server.js, the
- *                                            MSG.ENEMY_STATE case). Payload: { owner, map, variant,
+ *                                            MSG.ENEMY_STATE case). It is also where the server
+ *                                            learns where each enemy IS: the entries' x/y/z are
+ *                                            cached per id for the proximity pass and dropped when
+ *                                            that enemy is despawned or withdrawn -- a server-side
+ *                                            cache only, with no effect on the frozen payload below.
+ *                                            Payload: { owner, map, variant,
  *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
  *                                            animTime, hp, state, action } ], plus whichever of
  *                                            globalFx, fxStops, persistentFx, sounds, soundStops,
