@@ -357,9 +357,9 @@ export function createModSettings() {
 		category: CATEGORY,
 		header: "Miscellaneous",
 		label: { en_US: "Always Focused" },
-		description: { en_US: "Disable game pause on lost focus." },
+		description: { en_US: "Disable game pause on lost focus. Recommended to leave this option ON to prevent desyncs on alt-tabbing." },
 		type: {
-			default: false,
+			default: true,
 			type: 'CHECKBOX'
 		}
 	};
