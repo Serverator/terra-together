@@ -377,9 +377,12 @@ export function createModSettings() {
 		g_options.values["tt-auto-host"] = autoHostData.type.default;
 
 	// === Miscellaneous ===
-	// No explicit seed for this one or for tt-hide-party below: both default to false, and
-	// every read site coalesces the missing entry with `?? false`, so an absent value behaves
-	// exactly like false. (The truthy defaults above do need the seed, as noted there.)
+	// Defaults ON (the checkboxes below it default to false): g_options.get() has no fallback to
+	// option.default and the engine does not seed a mod-injected row, so this one needs the seed
+	// like the truthy defaults above — without it neither the reader (main.js
+	// applyAlwaysFocused) nor the checkbox itself ever sees the declared default. tt-hide-party
+	// below is the other case: it defaults to false and every read site coalesces the missing
+	// entry with `?? false`, so an absent value already behaves exactly like false.
 	let alwaysFocusedData = {
 		category: CATEGORY,
 		header: "Miscellaneous",
@@ -392,6 +395,8 @@ export function createModSettings() {
 	};
 	let alwaysFocused = new (terra.export.OptionTypeBuilder.builders.get('CHECKBOX'))("tt-always-focused", alwaysFocusedData);
 	g_options.settings["tt-always-focused"] = alwaysFocused;
+	if (g_options.values["tt-always-focused"] === undefined)
+		g_options.values["tt-always-focused"] = alwaysFocusedData.type.default;
 
 	let hidePartyData = {
 		category: CATEGORY,

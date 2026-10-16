@@ -105,7 +105,11 @@ class Multiplayer extends terra.export.Observable {
 	}
 
 	applyAlwaysFocused() {
-		const alwaysFocused = terra.export.g_options.get("tt-always-focused") ?? false;
+		// The option's declared default is the fallback (settings.js seeds the value with it, so
+		// this only covers an absent/null one). Reading it off the option keeps the two from
+		// drifting apart again — which is exactly what a hard-coded `?? false` did.
+		const option = terra.export.g_options.settings["tt-always-focused"];
+		const alwaysFocused = terra.export.g_options.get("tt-always-focused") ?? option?.default ?? false;
 		window.IG_KEEP_WINDOW_FOCUS = alwaysFocused;
 		terra.export.g_system.setWindowFocus(false);
 	}
