@@ -18,7 +18,12 @@
  *   the addon/loop wiring and forwards net messages to onMessage/onPreUpdate.
  * Wire: MSG.AREA_HEAL from ../net/protocol.js. Unlike the revive payloads, this one
  *   carries `from`, which the receiver validates against a tracked actor (see onMessage),
- *   plus a `targets` map of player id -> that player's share of the flask.
+ *   plus a `targets` map of player id -> that player's share of the flask. A peer on an
+ *   older build still sends the pre-split flat `amount`, which the receiver honours as its
+ *   own share (see the legacy note in onMessage) so a mixed-version pair heals both ways.
+ * Diagnostics: window.ttAreaHealDebug = true (or window.terraTogether.areaHealDebug) in the
+ *   devtools console logs what the sender decided at a drink and which gate (if any) dropped
+ *   the heal on the receiving end. Off by default, like window.ttEnemyDebug.
  */
 
 import { MSG } from "../net/protocol.js";
@@ -46,14 +51,25 @@ import { MSG } from "../net/protocol.js";
 // update, so a peer right on the radius boundary can be included by the healer and
 // rejected by the receiver (both use CONFIG.radius, just measured from two sources).
 //
-// The divisor is decided once, when the message is sent: whoever is hurt and in range at
-// that moment is counted and gets a share in the payload. "Hurt" is a downed peer or one
-// below full HP, and it is read from the peer's current HP rather than from the
-// in-flight-heals preview — see hurtPeersInRange for why that distinction matters. Nobody
-// hurt in range means nothing is sent: the flask stays local. A peer who dies, disconnects
-// or walks out of range before the message lands fails the receiver's own gate and simply
-// loses that share — it is not redistributed to the others (one flask heals at most its
-// own amount, never more).
+// The divisor is decided once, and that once is when the flask is DRUNK, not when the
+// message goes out: whoever is hurt and in range at the drink is counted and gets a share,
+// and the resulting `targets` map is snapshotted into the pending broadcast (see beginSend /
+// splitTargets). It matters because the two flush paths evaluate at very different times:
+// a full-HP drink has no HoT to wait for and broadcasts in the same frame as the drink,
+// while a hurt drink waits for the drinker's own heal-over-time to tick out (up to
+// CONFIG.maxWait). Deciding the split at *send* time therefore made the deferred path
+// announce a different, later view of the world than the immediate one — up to 8s late, by
+// which point a peer who has walked out of the 4-unit radius, been topped up by something
+// else, or whose actor is not yet visible empties the list and the flask silently healed
+// nobody, with no retry (`pending` is already cleared). One decision, taken when the player
+// drinks, is the world state they could actually see.
+//
+// "Hurt" is a downed peer or one below full HP, and it is read from the peer's current HP
+// rather than from the in-flight-heals preview — see hurtPeersInRange for why that matters.
+// Nobody hurt in range at that moment means nothing is sent: the flask stays local. A peer
+// who dies, disconnects or walks out of range before the message lands fails the receiver's
+// own gate and simply loses that share — it is not redistributed to the others (one flask
+// heals at most its own amount, never more).
 //
 // Works in rogue (the heal carries no rogue guard; only the downed/revive path is
 // rogue-gated elsewhere — see revive.js goDowned).
@@ -101,13 +117,26 @@ class AreaHealer {
 	constructor(host) {
 		this.host = host;
 		this.installed = false;
-		// Pending outgoing broadcast while the user's own heal finishes.
-		// { params, hot, data } — hot is the flask's HoT (or null when there is none).
+		// Pending outgoing broadcast while the user's own heal finishes: { params, hot, amount,
+		// duration, targets } — hot is the flask's HoT (or null when there is none) and
+		// targets is the split decided at drink time (or null when there was nobody to heal).
 		this.pending = null;
 		this.wait = 0;
 
 		window.terraTogether ??= {};
 		window.terraTogether.areaHealConfig = CONFIG;
+	}
+
+	// Diagnostics, off by default: a window flag rather than an option, like
+	// window.ttEnemyDebug (src/debug/enemy-debug.js). The older pre-restructure name is
+	// accepted too. Console: `window.ttAreaHealDebug = true`.
+	debugOn() {
+		return window.ttAreaHealDebug === true || window.terraTogether?.areaHealDebug === true;
+	}
+
+	debug(...args) {
+		if (this.debugOn())
+			console.debug("[TT heal]", ...args);
 	}
 
 	// ---- addon hooks --------------------------------------------------------
@@ -225,7 +254,8 @@ class AreaHealer {
 
 	// Every visible peer within reach who needs healing, as {id, actor} pairs: a downed peer,
 	// or one below full HP. Drives BOTH the full-HP use allowance and the split — the
-	// eligible set and the divisor are this one list.
+	// eligible set and the divisor are this one list, read when the flask is drunk (see
+	// splitTargets and the note at the top of this file).
 	//
 	// Read the peer's *current* HP, never `hpTarget`. ../client/snapshot.js publishes
 	// hpTarget as getHPRatio(0, true), which the engine defines as currentHP *plus every
@@ -265,6 +295,32 @@ class AreaHealer {
 		return list;
 	}
 
+	// The drinker's split of one flask: { playerId: share } over the hurt peers in range, or
+	// null when that list is empty (divide by nobody) or the share is not a usable number.
+	//
+	// Called ONCE, at drink time, from beginSend: the result rides in `pending` until the
+	// broadcast goes out. The drinker is not in the divisor — the engine already applied their
+	// own full self-heal inside useItem — and a single hurt peer gets the whole flask.
+	splitTargets(amount) {
+		const hurt = this.hurtPeersInRange();
+		const n = hurt.length;
+		const share = amount / n;
+		if (this.debugOn()) {
+			this.debug("split:",
+				"myHP", terra.export.g_player?.combat?.params?.getHPRatio?.(),
+				"amount", amount, "n", n, "share", share,
+				"peers", hurt.map(({ id, actor }) => `${id}:hp=${actor.terraTogether?.hp}`));
+		}
+		if (n === 0)
+			return null;
+		if (!(Number.isFinite(share) && share > 0))
+			return null;
+		const targets = {};
+		for (const { id } of hurt)
+			targets[id] = share;
+		return targets;
+	}
+
 	beginSend(params, hotsBefore) {
 		if (!enabled())
 			return;
@@ -274,9 +330,15 @@ class AreaHealer {
 		// Two flasks in quick succession: flush the previous heal before replacing it.
 		if (this.pending)
 			this.flush();
-		// The heal the user's flask produces: amount (absolute HP, the total to be shared)
-		// and HoT duration.
-		const data = { amount: estus.amount, duration: estus.duration };
+		// The heal the user's flask produces: amount (absolute HP, the total to be shared) and
+		// HoT duration. Both are plain fields read once here, at drink time: EstusFlask.use()
+		// only spends a charge (player-flask.js:74) and applyDish() — the only other writer —
+		// only runs when a dish is cooked or eaten. Snapshotted, never re-read at flush time.
+		const amount = estus.amount;
+		const duration = estus.duration;
+		// Decide the split here and carry it: see the note at the top of this file for why it
+		// must not be re-derived later.
+		const targets = this.splitTargets(amount);
 		// Wait for the flask's own heal to complete; if the user was already at full HP
 		// no HoT starts, so there's nothing to wait for and we send right away.
 		let hot = null;
@@ -284,8 +346,9 @@ class AreaHealer {
 			const before = new Set(hotsBefore);
 			hot = params.hots.find(h => !before.has(h)) ?? null;
 		}
-		this.pending = { params, hot, data };
+		this.pending = { params, hot, amount, duration, targets };
 		this.wait = 0;
+		this.debug("drink:", hot ? "waiting for own HoT" : "no HoT, sending now", "targets", targets);
 		if (!hot)
 			this.flush();
 	}
@@ -296,23 +359,19 @@ class AreaHealer {
 		this.wait = 0;
 		if (!pending)
 			return;
-		if (!enabled() || !this.host.isConnected?.() || !this.host.hasPeers?.())
+		if (!enabled() || !this.host.isConnected?.() || !this.host.hasPeers?.()) {
+			this.debug("flush dropped: not enabled/connected/peers");
 			return;
-		const { amount, duration } = pending.data;
-		// Divide the flask between the hurt peers in range right now (the drinker is not in
-		// the divisor: see the note at the top of this file). Nobody hurt in range means
-		// nothing to send - one full-HP flask use with no one to help stays local.
-		const hurt = this.hurtPeersInRange();
-		const n = hurt.length;
-		if (n === 0)
+		}
+		// The split taken at drink time (one full-HP flask use with nobody to heal stays
+		// local: splitTargets returned null then).
+		const { amount, duration, targets } = pending;
+		if (!targets) {
+			this.debug("flush dropped: nobody hurt in range at drink time, amount", amount);
 			return;
-		const share = amount / n;
-		if (!(Number.isFinite(share) && share > 0))
-			return;
-		const targets = {};
-		for (const { id } of hurt)
-			targets[id] = share;
+		}
 		this.host.send?.({ type: MSG.AREA_HEAL, from: this.host.getLocalId?.(), duration, targets });
+		this.debug("sent area heal:", "amount", amount, "duration", duration, "targets", targets);
 	}
 
 	// ---- incoming -----------------------------------------------------------
@@ -329,26 +388,49 @@ class AreaHealer {
 			return;
 		const me = terra.export.g_player?.entity;
 		const params = terra.export.g_player?.combat?.params;
-		if (!me?.core || !params)
+		const myId = this.host.getLocalId?.();
+		if (!me?.core || !params) {
+			this.debug("recv dropped: local player unavailable");
 			return;
+		}
 
 		// The sender must be an actor we track in our current room.
 		const healer = this.host.getPlayerActors?.()?.get?.(msg.from);
-		if (!healer?.core?.isVisible?.())
+		if (!healer?.core?.isVisible?.()) {
+			this.debug("recv dropped: healer", msg.from, "not tracked or not visible");
 			return;
+		}
 		const r2 = CONFIG.radius * CONFIG.radius;
-		if (dist2(me.core.pos, healer.core.pos) > r2)
+		const d2 = dist2(me.core.pos, healer.core.pos);
+		if (d2 > r2) {
+			this.debug("recv dropped: healer out of range", Math.sqrt(d2).toFixed(2), ">", CONFIG.radius);
 			return;
+		}
 
 		// The healer divides the flask between the players it can see needing it, so our heal
-		// is our own entry in `targets`. No usable entry (an older peer still sending a flat
-		// `amount`, or a malformed payload) means no heal: fail-safe rather than healing for
-		// an amount nobody agreed on. This does NOT re-derive the divisor - the payload is the
-		// healer's decision, and the gates below are what keep a stale one from applying.
-		const share = msg.targets?.[this.host.getLocalId?.()];
+		// is our own entry in `targets`. This does NOT re-derive the divisor - the payload is
+		// the healer's decision, and the gates above are what keep a stale one from applying.
+		//
+		// Legacy payload (a peer on a pre-split build) carries no `targets`, only the flat
+		// `amount` it heals *every* peer in range with: honour it as our own share rather than
+		// dropping the heal. Dropping instead would make a mixed-version pair heal nobody in
+		// either direction, since the old reader finds no `amount` in our split payload.
+		let share = msg.targets?.[myId];
+		let legacy = false;
+		if (typeof share !== "number" || !Number.isFinite(share) || share <= 0) {
+			if (typeof msg.amount === "number" && Number.isFinite(msg.amount) && msg.amount > 0) {
+				share = msg.amount;
+				legacy = true;
+			}
+			else {
+				this.debug("recv dropped: no usable share for", myId,
+					"targets[", myId, "]=", msg.targets?.[myId], "amount=", msg.amount);
+				return;
+			}
+		}
+		this.debug("recv:", "myId", myId, "from", msg.from, legacy ? "legacy amount" : "share", share,
+			"targets[" + myId + "]=", msg.targets?.[myId]);
 		const duration = typeof msg.duration === "number" ? msg.duration : 0;
-		if (typeof share !== "number" || !Number.isFinite(share) || share <= 0)
-			return;
 
 		// Downed ally: revive at 25% first (same path revive.js uses), then deliver only the
 		// *remainder* of our share. The instant revive counts as healing, so it is subtracted
@@ -356,7 +438,8 @@ class AreaHealer {
 		// Measuring HP (rather than assuming CONFIG.hpFactor) also self-corrects when the
 		// revive gained nothing, e.g. reviveLocal() had no combatant to work on.
 		let healAmount = share;
-		if (this.host.isSelfDowned?.()) {
+		const downed = !!this.host.isSelfDowned?.();
+		if (downed) {
 			const before = params.currentHP;
 			try { this.host.reviveLocal?.(); }
 			catch (err) { console.warn("[TT heal] revive failed:", err); }
@@ -364,6 +447,7 @@ class AreaHealer {
 			healAmount = Math.max(0, share - instant);
 		}
 
+		this.debug("applying:", "healAmount", healAmount, "duration", duration, "downed", downed);
 		try {
 			// Same heal call the flask makes on its own user (player-flask.js:92); recipients
 			// keep their charges.
