@@ -829,12 +829,35 @@ export function installFxSyncHooks() {
 				}
 
 				// A mirrored copy must never spawn (possibly damaging) sub-proxies, so
-				// block the single spawn path for its sub-proxies too.
+				// block the single spawn path for its sub-proxies too -- with ONE exception, a victim
+				// mirror.
+				//
+				// A victim mirror IS an enemy's real attack replayed on the client that can receive it
+				// (see spawnRemoteProjectile), and a whole family of enemy attacks carries its payload as
+				// a sub-proxy: the bomb a mortar drops, the ground explosion a slime leaves, the thunder
+				// orb a bird calls down. The parent travels (it is a proxy like any other), so the shot
+				// flies and the impact lands -- but the sub-proxy never existed here, and with it went
+				// everything the sub-proxy IS: its telegraph (shroomBomb's first steps are FORCE_TO_GROUND
+				// then START_AIM_FX), its spawn/aura/boom fx, its own fxDie. That is the visible half of
+				// the attack going missing while its damage still arrives.
+				//
+				// So a victim mirror MAY spawn its sub-proxy, and it is spawned as a VISUAL copy: the flag
+				// is re-set around the call, which is what the ProxyDef.spawn wrapper reads (it assigns
+				// `__ttVisual` unconditionally, so a spawn inside a mirror stays a mirror) and what keeps
+				// the sub-proxy inert -- its hits are refused by the HitForce guard and its own
+				// spawn/camera/nav steps no-op (see VISUAL_BLOCKED_STEPS), while every purely visual step
+				// it has runs. `spawningVictimMirror` is deliberately NOT set: the explosion is not being
+				// re-derived here, so it must not damage. A sub-proxy of a sub-proxy is refused as before
+				// (the child is `__ttVisual` and not itself a victim mirror), so nothing cascades.
 				let originalSpawnSubProxy = Projectile.prototype.spawnSubProxy;
 				Projectile.prototype.spawnSubProxy = function (...args) {
-					if (this.__ttVisual)
+					if (this.__ttVisual && !this.__ttVictimMirror)
 						return undefined;
-					return originalSpawnSubProxy.apply(this, args);
+					if (!this.__ttVictimMirror)
+						return originalSpawnSubProxy.apply(this, args);
+					spawningVisualCopy = true;
+					try { return originalSpawnSubProxy.apply(this, args); }
+					finally { spawningVisualCopy = false; }
 				};
 
 				// A VICTIM mirror is consumed by the body it reaches, exactly as the shot it mirrors is
