@@ -14,7 +14,7 @@
  *     that fx-sync.js attributes an owned enemy's effects with and enemies.js implements.
  *   - Lifecycle: joinServer/leaveServer/disconnect/send + detachClient/clearPeers/
  *     onDisconnected, and the inbound dispatch (MSG.* -> peer state, snapshot ingest,
- *     revive/area-heal/enemy-owner/enemy-despawn/enemy-respawn/enemy-hit routing).
+ *     revive/area-heal/enemy-owner/enemy-despawn/enemy-respawn/enemy-hit/enemy-wake routing).
  * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send,
  *   hasClient, hasPeers, initSession, getLocalId, getDownedFraction, setLocalDowned,
  *   getPeerDowned, isLocalDowned, getRogueInfo, getPeerRogueSeed, playerActors, playerNames,
@@ -388,8 +388,8 @@ export function joinServer(address, options = {}) {
 				// Types owned by a feature module rather than by this dispatch: the downed/revive
 				// + estus area-heal protocol (../features/revive.js, ../features/area-heal.js)
 				// and the enemy ownership broadcast, state snapshots, ownership handoffs,
-				// death despawns, map-wide respawn resets and forwarded hits (../client/enemies.js).
-				// ./client.js is the composition root that routes them on.
+				// death despawns, map-wide respawn resets, forwarded hits and group wakes
+				// (../client/enemies.js). ./client.js is the composition root that routes them on.
 				case MSG.REVIVE:
 				case MSG.REVIVE_PROGRESS:
 				case MSG.AREA_HEAL:
@@ -399,6 +399,7 @@ export function joinServer(address, options = {}) {
 				case MSG.ENEMY_DESPAWN:
 				case MSG.ENEMY_RESPAWN:
 				case MSG.ENEMY_HIT:
+				case MSG.ENEMY_WAKE:
 					deps.onPeerMessage(msg);
 					break;
 			}

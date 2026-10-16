@@ -12,20 +12,32 @@
  *     restoration on release, and the ACTION hygiene both transitions run (clearAction, below), so
  *     an entity can neither inherit a half-finished action nor be handed back holding one. Every
  *     press is in makePuppet and every undo in releasePuppet, including the two pieces of state
- *     this module's CALLER hangs on the entity -- the HUD's combat bit (clearPuppetAggro) and the
- *     hit acts an owner's stream started on it (clearPuppetHitActs, the peer half of the
- *     enemy-attack sync in ./enemies.js): releasePuppet is the only place the mark is removed, so
- *     it is the one place an undo cannot be missed.
+ *     this module's CALLER hangs on the entity -- the combat state the owner's stream carried
+ *     (dropPuppetCombat) and the hit acts an owner's stream started on it (clearPuppetHitActs, the
+ *     peer half of the enemy-attack sync in ./enemies.js): releasePuppet is the only place the mark
+ *     is removed, so it is the one place an undo cannot be missed. What the undo is NOT allowed to
+ *     do is end a fight: an enemy whose owner's last word was "in combat" has to stay engaged when
+ *     it stops being driven (Sam: a pause, a downed host or a handover must not de-aggro it), which
+ *     is why the caller reads puppetInCombat() BEFORE releasing and re-engages through the engine
+ *     afterwards (src/client/enemies.js, engageLocally).
  *   - readEnemyState (OWNER side) / drivePuppet (PEER side, every frame) / adoptState (ONCE, for an
  *     entity this client is about to simulate itself): the per-frame state snapshot and its
- *     application to an entity.
- * Public surface: installPuppetPatches, makePuppet, releasePuppet, isPuppet, readEnemyState,
- *   drivePuppet, adoptState, readHitDescriptor, setEnemyHitSink
- * Engine touchpoints: terra.export.{EnemySheet, EnemyCmp, ActorCmp, LoopCheckReaction,
- *   ACTOR_FACING, ACTOR_FX_TYPE, Vec2, Vec3, g_game}. Patched seams (all prototypes, all gated on
- *   the ENTITY mark): EnemySheet.updateAction (AI choice/action selection, the one funnel every
+ *     application to an entity. The snapshot carries the owner's own `aggressive` (the in-combat
+ *     bit, applied on the peer through the engine's setAggressive) and `busy` (its own
+ *     actor.isActionRunning -- the IDLE GATE the server caches to avoid moving an enemy mid-swing;
+ *     the state NAME cannot answer that question: eight enemies in the shipped data spawn in a
+ *     state called COMBAT while perfectly calm, and `idleCombat` is an ACTION, not a state).
+ * Public surface: installPuppetPatches, makePuppet, releasePuppet, isPuppet, puppetInCombat,
+ *   readEnemyState, drivePuppet, adoptState, readHitDescriptor, setEnemyHitSink
+ * Engine touchpoints: terra.export.{EnemySheet, EnemyCmp, ActorCmp, LoopCheckReaction, ACTOR_FACING,
+ *   ACTOR_FX_TYPE, Vec2, Vec3, g_game, g_attackFreq (only to drop a puppet's attack-frequency
+ *   registration again -- see puppetCombatHandles)}. Patched seams (all prototypes, all gated on the
+ *   ENTITY mark): EnemySheet.updateAction (AI choice/action selection, the one funnel every
  *   AI entry point reaches), EnemyCmp.checkAutoAggro / triggerAggression / updateTarget (aggro and
- *   target acquisition, reached from EnemyCmp.update outside updateAction), LoopCheckReaction.
+ *   target acquisition, reached from EnemyCmp.update outside updateAction), EnemyCmp.setAggressive
+ *   (the combat transitions -- the one engine call whose loose-rule de-aggro a driven enemy must
+ *   refuse, see puppetSetAggressive), EnemyCmp.update (marked, not altered: it is the call the loose
+ *   rule runs inside), LoopCheckReaction.
  *   checkTrigger (the auto/dodge reactions, which act outside updateAction too), EnemyCmp.onHit
  *   (local damage -> local HP), EnemyCmp.onDeathHit (giveExp/dropItems/rogue.onEnemyKilled/screen
  *   shake/combat.setEnemyDefeated), EnemyCmp.onNotify (scripted reactions can start actions), and
@@ -79,7 +91,7 @@
 
 // ─────────────────────────────── entity marks ───────────────────────────────
 //
-// All three live on the ENTITY (entities are not pooled; components are). PUPPET_MARK is the only
+// All four live on the ENTITY (entities are not pooled; components are). PUPPET_MARK is the only
 // authoritative test -- every patch below resolves the entity first and checks it per call, which
 // is also what makes a patch installed before any puppet exists completely inert.
 const PUPPET_MARK = "__ttPuppet";
@@ -88,11 +100,23 @@ const PUPPET_MARK = "__ttPuppet";
 // (and read) on the entity, next to the mark, for the same pooling reason.
 const PUPPET_SAVED = "__ttPuppetSaved";
 
-// The COMBAT STATE this client pushed onto the entity's HP bar while it was a puppet (see
-// applyPuppetAggro), or absent when it never pushed one. Also on the entity, for the same pooling
-// reason -- and it is what makes the peer's application a transition on a change rather than a
-// write every frame, and its release an exact undo rather than a guess.
+// The owner's in-combat bit, as the last frame this entity was driven carried it, once this client
+// has applied it (see engagePuppet) -- absent while the owner says the enemy is calm. Set on the
+// ENTITY, for the same pooling reason, and it is what makes the application a transition on a change
+// rather than a write every frame, what the loose-rule seam tests, and what tells the release path
+// that the owner's last word was "in combat" (puppetInCombat).
 const PUPPET_AGGRO = "__ttPuppetAggro";
+
+// The `passive` flag engagePuppet clobbered (setAggressive(true) writes ENEMY_PASSIVE.NONE,
+// enemy-cmp.js:384-385), so dropping the combat state can put back the value the entity's own spot
+// asked for (:264-268 -- the spot owns that flag). On the entity, like the marks above.
+const PUPPET_PASSIVE = "__ttPuppetPassive";
+
+// Set for the duration of ONE EnemyCmp.update call on a puppet (puppetUpdate). Inside that call the
+// engine performs the only de-aggro it ever decides on its own initiative -- the loose rule -- and
+// that one must not be granted while the owner's stream says the enemy is in combat (see
+// puppetSetAggressive).
+const PUPPET_UPDATING = "__ttPuppetUpdating";
 
 export function isPuppet(ent) {
 	return !!ent && ent[PUPPET_MARK] === true;
@@ -237,13 +261,15 @@ export function releasePuppet(ent) {
 	delete ent[PUPPET_MARK];
 	delete ent[PUPPET_SAVED];
 
-	// The HP bar goes back to the entity's OWN combat state, before the AI is handed the entity
-	// again: from here the engine simulates it and owns its HUD, so anything this module pushed
-	// onto it has to be gone first (see clearPuppetAggro). Every path that stops puppeting runs
+	// The combat state the owner's stream put on the entity is dropped, before the AI is handed the
+	// entity again: from here the engine simulates it and owns its flag, so anything this module
+	// applied must be gone first (see dropPuppetCombat). Every path that stops puppeting runs
 	// through this function -- ownership taken, stale state, despawn, the dying latch's cap, a map
 	// change, the feature going off, a disconnect -- which is why the undo lives here and not at
-	// each of them.
-	clearPuppetAggro(ent);
+	// each of them. What it deliberately does NOT do is end the fight when the dropped state was
+	// the owner's "in combat": the caller decides that, from puppetInCombat(), because a handover is
+	// exactly the moment an enemy has to keep fighting (src/client/enemies.js, engageLocally).
+	dropPuppetCombat(ent);
 
 	// ...and the hit acts an owner's stream started on it, for the same reason and with the same
 	// coverage (see clearPuppetHitActs).
@@ -283,88 +309,169 @@ export function releasePuppet(ent) {
 // ─────────────────────── PEER side: the enemy's combat state ───────────────────────
 //
 // What the owner carries in `aggro` is one bit -- its own `enemy.aggressive`, read in readEnemyState
-// -- and the one thing a peer can show for it is the enemy's HP bar, which is drawn in a different
-// colour row while the enemy is in a fight (combat-bar.js:226 `step = this.isPlayer ? 4 : this.
-// aggressive ? 2 : 3`, the colorStep of drawHpBar's fill; the colour Sam reports as "blue" = not in
-// combat). CombatantHud.setAggressive (combat-hud.js:210-219) is the engine's write path for it.
+// -- and it is the input this whole rebuild turns on. Sam: "getting downed or pausing should not
+// affect aggro. Currently it aggro deaggro if hosting player is pausing and other enemies near them
+// completely ignore you." So a peer's copy of an enemy its owner reports as in combat has to BE in
+// combat, not merely look like it: the moment that owner goes quiet -- a pause, a downed host, a
+// rebalance -- the enemy stops being driven here and this client simulates it again, and an enemy
+// that was only SHOWN as angry de-aggros the instant the drive stops, walking away from the player
+// standing next to it. That is the bug this half of the file exists to fix. The HP bar is the
+// visible half of it -- combat-bar.js:226 `step = this.isPlayer ? 4 : this.aggressive ? 2 : 3`, the
+// colour Sam reports as "blue" = not in combat, and CombatantHud.setAggressive (combat-hud.js:210)
+// is the engine's write path -- and it now arrives with the engine's own call rather than instead
+// of it.
 //
-// The obvious way to reflect the bit is the engine's own EnemyCmp.setAggressive, which is what the
-// owner used to set it. It is not what a puppet may use: every other thing it does was checked, and
-// none of it is safe here (enemy-cmp.js:377-404):
-//   * `setPassive(ENEMY_PASSIVE.NONE)` (:384-385) writes a flag that has nothing to do with the
-//     display, on an entity whose passive value came from its own spot (:264-268). It is also the
-//     one side effect that would need an undo, and the undo would have to guess at flags this
-//     client never read -- skipping it means `passive` is simply never touched on the peer.
-//   * `attack_frequency.g_attackFreq.add(this)` (:391) enters the enemy into the manager that
-//     PACES ENEMY ATTACKS: attack-frequency.js:217-237 feeds it into `speedSum`/`totalWeight` and
+// So the bit is applied with the engine's own EnemyCmp.setAggressive (enemy-cmp.js:377-404) -- the
+// method itself, captured before this module wraps it (engineSetAggressive), so the application never
+// re-enters this module's own seam -- and every side effect that makes that call unsafe on an entity
+// this client does not simulate is handled one by one:
+//   * `setPassive(ENEMY_PASSIVE.NONE)` (:384-385) is APPLIED and RECORDED. Applied because it is not
+//     cosmetic: an aggressive enemy's passive is NONE on the client fighting it (that is what that
+//     client's own engagement did there), and `passive == PASSIVE_STILL` is what updateAction returns
+//     on (enemy-type.js:226-230) -- a puppet left PASSIVE_STILL would come out of a handover unable
+//     to choose an action at all. Recorded because the flag belongs to the entity's own spot
+//     (:264-268) and this client never chose it: dropPuppetCombat puts the spot's value back.
+//   * `attack_frequency.g_attackFreq.add(this)` (:391) enters the enemy into the manager that PACES
+//     ENEMY ATTACKS: attack-frequency.js:217-237 feeds it into `speedSum`/`totalWeight` and
 //     recomputes `attackGap`, the shared token duration every LOCALLY simulated enemy attacks
-//     against. A puppet is not in that fight; registering it would re-time this client's own
-//     enemies (and its `danger`) by whatever the other player is fighting.
-//   * the navDanger handle (:393) allocates a navigation-avoidance region for an enemy this
-//     client's navmesh is not simulating.
-//   * actorFx.range (:386) is inert on a puppet: the only consumer is the actor-FX sink, which the
-//     puppet patch already drops (ActorCmp.onPostMove -> puppetOnPostMove).
-//   * the `aggressive` flag itself (:387) is the engine's own state, and setting it on a puppet
-//     hands the entity to the engine's LOOSE rule: EnemyCmp.update is deliberately NOT one of the
-//     patched seams (the entity keeps ticking), so :584-587 makes an enemy more than 20 units from
-//     THIS client's player de-aggro ITSELF after LOOSE_DURATION (5s) -- with the HUD update that
-//     follows, i.e. the bar flipping back to blue on exactly the client this exists for, in the
-//     ordinary co-op case of two players apart. Writing the flag also buys nothing: every path that
-//     reads it on this entity is either suppressed already (the AI seams) or cosmetic.
-// What is left is the state the peer actually reads, and it cannot enable anything: no AI seam is
-// unwrapped, no action is chosen, no manager learns of the enemy. The AI stays exactly as
-// suppressed as it was.
+//     against. A puppet is not in that fight; leaving it registered would re-time this client's own
+//     enemies (and its `danger`) by whatever the other player is fighting. It is removed again at
+//     once, inside the same call (puppetCombatHandles), so it is never observable.
+//   * the navDanger handle (:393) allocates a navigation-avoidance region for an enemy this client's
+//     navmesh is not simulating; it is destroyed again at once, for the same reason.
+//   * actorFx.range (:386) is inert on a puppet: its consumers are the actor-FX sink (whose movement
+//     half the puppet patch already drops, ActorCmp.onPostMove -> puppetOnPostMove) and the marker
+//     range of fx the engine only plays for an actor it simulates itself.
+//   * the `aggressive` flag itself (:387) is the engine's own state, and setting it hands the entity
+//     to the engine's LOOSE rule: :584-587 makes an enemy more than 20 units from THIS client's
+//     player de-aggro ITSELF after LOOSE_DURATION (5s) -- and on a peer that distance is measured
+//     against the wrong player, so the rule would flip the flag and the bar back five seconds into
+//     every handover, in the ordinary co-op case of two players apart. That ONE de-aggro is dropped
+//     while the owner's stream says the enemy is in combat (puppetSetAggressive). Nothing else the
+//     flag enables changes anything here: the AI seams are unwrapped, so no action is chosen, no
+//     damage is applied and no reward is granted.
+//
+// Two consequences the release path has to honour, and both are implemented below: the application
+// is a TRANSITION (the bit repeats every frame of the stream, so the write happens once per change),
+// and an enemy released while the bit was on is reported as still fighting (puppetInCombat) -- which
+// the caller has to turn into a real engagement through the engine, because the frequency
+// registration above was deliberately dropped and an aggressive enemy missing from that list never
+// attacks at all (enemy-state.js:86 gates every attack choice on isFrequencyReady, whose
+// freqProgress is only ever advanced for the enemies in it -- attack-frequency.js:230-236). The same
+// seam settles the other direction: an ENGINE caller may not aggressivise a driven enemy at all,
+// because its verdict is about a client that is not this one (puppetSetAggressive).
 
-// The enemy's HUD -- the component the engine writes the combat state onto (enemy-cmp.js:266/:389
-// `this.combatant.hud`, and EnemyCmp.combatant is the CombatantCmp on the same entity, :205).
-// Absent on an entity that has not been initialised that far, which is a state to skip rather than
-// to throw on: this runs on the per-frame peer path.
-function enemyHudOf(ent) {
-	const hud = ent?.enemy?.combatant?.hud;
-	return hud && typeof hud.setAggressive === "function" ? hud : null;
+// The engine's own EnemyCmp.setAggressive, captured by installPuppetPatches BEFORE this module wraps
+// it. The combat state below goes through this rather than through the (patched) method so that it
+// cannot re-enter its own seam -- and so that it is the same call whichever direction asked for the
+// transition (drivePuppet applying the owner's stream, or the engine itself engaging the entity: a
+// spot triggering its enemy, aggroNearbyEnemy walking a group that contains a puppet, an
+// enemySpawner). Null on a build without the method, which is also the build where nothing else here
+// can run.
+let engineSetAggressive = null;
+
+// The entity behind a puppet, or null when it cannot answer for itself (not initialised that far, or
+// a component already torn down): every function below runs on the per-frame peer path.
+function puppetEnemy(ent) {
+	const enemy = ent?.enemy;
+	return enemy && typeof enemy.setAggressive === "function" ? enemy : null;
 }
 
-// Show (or stop showing) the enemy as in combat, on a puppet. Called by drivePuppet for every
-// frame of peer state the entity is driven with; `aggro` is that frame's carried bit.
+// Was this puppet in combat as of the last frame its owner drove it here -- i.e. did the owner say
+// `aggressive` and did this client apply it? THE reader for the release path: src/client/enemies.js
+// asks before it stops driving an entity, because an enemy whose owner has gone quiet must keep the
+// fight it was in (and the engine's own attack-frequency registration that comes with it -- see
+// engageLocally there). Read BEFORE releasePuppet: the undo drops the record.
+export function puppetInCombat(ent) {
+	return !!ent && ent[PUPPET_AGGRO] === true;
+}
+
+// Drop the two registrations setAggressive(true) made that a puppet must not hold: the
+// attack-frequency entry (which would re-time the LOCAL enemies: attack-frequency.js:217-237) and the
+// navDanger region (an avoidance region for an entity this client's navmesh is not simulating). Called
+// immediately after the engine's own engage, so neither is ever observable -- no frame boundary, and
+// the game's own consumers only read them from the managers' own update, which runs at most once per
+// frame.
+function puppetCombatHandles(enemy) {
+	const freq = terra.export?.g_attackFreq;
+	if (freq && typeof freq.remove === "function")
+		freq.remove(enemy);
+	const danger = enemy.navDanger;
+	if (danger) {
+		try { danger.destroy(); } catch (e) { /* already gone */ }
+		enemy.navDanger = null;
+	}
+}
+
+// Put the owner's in-combat bit onto a puppet, through the engine's own setAggressive. Transition
+// only: the bit rides EVERY frame of the stream (readEnemyState is a per-frame snapshot) and an enemy
+// being fought sends it true for as long as the fight lasts, so the write is gated on the claim this
+// module recorded rather than made per frame. Never records a claim it could not apply: an enemy that
+// is not ALIVE is refused by the engine itself (:379-381) and an entity with no enemy component simply
+// stays out of combat.
 //
-// Transition only: the bit rides EVERY frame of the stream (readEnemyState is a per-frame snapshot),
-// and an enemy that is being fought sends it true for as long as the fight lasts, so the write is
-// gated on the value this module last applied (PUPPET_AGGRO, above) rather than made per frame.
-// True-with-nothing-applied and everything-else (false, or a field a skewed peer omits) are the two
-// transitions that do anything at all; a puppet that is not in combat is never written to.
-function applyPuppetAggro(ent, aggro) {
-	if (aggro === true) {
-		if (ent[PUPPET_AGGRO] === true)
-			return;                            // already shown in combat: nothing changed
-		const hud = enemyHudOf(ent);
-		if (!hud)
-			return;                            // nothing to show it on -- do not record an application
-		ent[PUPPET_AGGRO] = true;
-		hud.setAggressive(true);
+// The passive is saved only when the call below is actually going to clobber it (an enemy the engine
+// already had in combat keeps the NONE its own engagement set, so there is nothing of the spot's to
+// remember) -- and only once per claim, so a re-application cannot overwrite the saved value with the
+// NONE this module set itself.
+function engagePuppet(ent) {
+	const enemy = puppetEnemy(ent);
+	if (!enemy || !engineSetAggressive)
+		return;                            // nothing to engage with -- do not record a claim
+	// Applied, and still applied: the ordinary frame of a fight. This is the hot path (the bit rides
+	// every frame of the stream), so it is one read and nothing else -- including no re-run of the
+	// engine's engage, which would re-register the enemy in the attack-frequency manager once per
+	// frame for `puppetCombatHandles` to take out again.
+	if (ent[PUPPET_AGGRO] === true && enemy.aggressive === true)
+		return;
+	if (ent[PUPPET_AGGRO] !== true) {
+		ent[PUPPET_AGGRO] = true;          // the claim: what the loose-rule seam and the release path
+		if (enemy.aggressive !== true)     // read, alongside the passive flag the engage clobbers
+			ent[PUPPET_PASSIVE] = enemy.passive;
+	}
+	engineSetAggressive.call(enemy, true); // the engine's own engage: flag, passive, HUD, the
+	                                       // attack-frequency registration and the navDanger region
+	if (enemy.aggressive !== true) {
+		delete ent[PUPPET_AGGRO];           // refused (not ALIVE): take the claim back with it
+		delete ent[PUPPET_PASSIVE];
 		return;
 	}
-	clearPuppetAggro(ent);
+	puppetCombatHandles(enemy);            // ...of which a driven enemy must hold neither of the two
 }
 
-// Undo applyPuppetAggro: put the HP bar back on the entity's OWN combat state and forget the
-// applied value. The value to restore TO is `enemy.aggressive`, which this module never writes --
-// so it is whatever the engine believes (false on a calm entity, and the true left by any engine
-// path that aggressivised it), and the pair is exact for every entity: afterwards the HUD shows
-// what a locally simulated enemy's HUD shows, and the engine's own setAggressive has a consistent
-// starting point again (it early-returns on an unchanged flag, :378, so a stale value here would
-// otherwise never be corrected). A puppet nothing was applied to is untouched, HUD call included.
-function clearPuppetAggro(ent) {
-	if (!ent || ent[PUPPET_AGGRO] !== true)
-		return;
+// Undo engagePuppet: the engine's own de-aggro, plus the passive flag it clobbered, plus the record
+// itself. Called for both transitions out of the combat state -- the owner's stream saying the enemy
+// is no longer in combat, and releasePuppet (the one exit from being driven) -- so nothing this
+// mechanism wrote can outlive the mark. A puppet nothing was applied to is untouched: the de-aggro is
+// skipped when the engine does not consider it aggressive either (setAggressive early-returns on an
+// unchanged flag, :377-379), and the passive is only written when this module was the one that
+// changed it.
+function dropPuppetCombat(ent) {
+	const enemy = puppetEnemy(ent);
+	const saved = ent[PUPPET_PASSIVE];
 	delete ent[PUPPET_AGGRO];
-	const hud = enemyHudOf(ent);
-	if (hud)
-		hud.setAggressive(ent.enemy?.aggressive === true);
+	delete ent[PUPPET_PASSIVE];
+	if (!enemy)
+		return;
+	if (enemy.aggressive === true && engineSetAggressive)
+		engineSetAggressive.call(enemy, false);
+	if (saved !== undefined && typeof enemy.setPassive === "function")
+		enemy.setPassive(saved);           // the flag the entity's own spot asked for
+}
+
+// Show (or stop showing) the enemy as in combat, on a puppet: one bit, two transitions. Called by
+// drivePuppet for every frame of peer state the entity is driven with; `aggro` is that frame's
+// carried bit.
+function applyPuppetAggro(ent, aggro) {
+	if (aggro === true)
+		engagePuppet(ent);
+	else
+		dropPuppetCombat(ent);
 }
 
 // ...and the hit acts an owner's stream started on the entity while it was a puppet
 // (./enemies.js's hit-act section: owner act id -> the local CombatAct). Same reasoning as
-// clearPuppetAggro -- engine state this module's caller put on the entity, which must not outlive
+// dropPuppetCombat -- engine state this module's caller put on the entity, which must not outlive
 // the mark: these acts are updated by g_combat every frame for as long as they exist, and a
 // repeating one (a dash or a spin whose hit act has duration -1) would go on damaging whoever is in
 // its way on an enemy this client now simulates itself. cancel() is the engine's own teardown
@@ -432,6 +539,11 @@ export function installPuppetPatches() {
 
 	const exp = terra.export ?? {};
 	const missing = [];
+	// The engine's own setAggressive, captured BEFORE the table below wraps it: the combat-state
+	// functions above call it directly so they can never re-enter this module's own seam (see
+	// engineSetAggressive).
+	if (typeof exp.EnemyCmp?.prototype?.setAggressive === "function")
+		engineSetAggressive = exp.EnemyCmp.prototype.setAggressive;
 	// [label, receiver, method, entity resolver, puppet handler] -- one row per seam, evaluated
 	// below, so the label a failure is reported with can never drift from the seam it names.
 	const table = [
@@ -483,6 +595,33 @@ export function installPuppetPatches() {
 		// owner's copy is the one simulating the movement: same suppression the mod already
 		// applies to peer player ghosts (src/client/actors.js:70-90), for the same reason.
 		["ActorCmp.onPostMove", exp.ActorCmp?.prototype, "onPostMove", entOfSelf, puppetOnPostMove],
+
+		// (e) The engine's own per-entity update, which is where the loose rule lives (:584-587). On
+		// a puppet this wrapper changes NOTHING about the call -- the entity has to keep ticking
+		// (combatant.update, the mode timers and updateTimeTrackers are all inside it, and a puppet
+		// that stops ticking stops animating) -- it only MARKS the call for the duration, so the seam
+		// below can tell the engine's own loose-rule de-aggro apart from every deliberate one. That
+		// distinction is the whole reason this row exists: the loose rule measures the distance to
+		// THIS client's player, which on a peer is the wrong player, and EnemyCmp.update is
+		// deliberately not suppressed for a puppet (see the note on the AI seams above), so the rule
+		// is the one engine decision that would otherwise undo what the owner's stream says.
+		["EnemyCmp.update", exp.EnemyCmp?.prototype, "update", entOfSelf, puppetUpdate],
+
+		// (f) The combat transitions, funnelled for a puppet so its OWNER's stream is the authority on a
+		// driven enemy. Three cases, and each one is decided by who is asking:
+		//   * the loose rule's de-aggro (:587, inside update()) is DROPPED while the owner's stream says
+		//     in combat -- the rule measures the distance to THIS client's player, who on a peer may be
+		//     exactly the player the enemy is not fighting;
+		//   * every other de-aggro (onKill :338, onDeathHit :1122, giveUp :1144, disappear :351, the rest
+		//     path, the attack-frequency manager's own :152) is HONOURED -- the engine always has to be
+		//     able to take an entity it is tearing down out of combat;
+		//   * every engage (EnemySpotEntity.triggerEnemy :229, EnemySpawner :100, the aggro steps,
+		//     aggroNearbyEnemy :248/:263) is DROPPED. Those callers report what is happening on the
+		//     client SIMULATING the enemy, which is not this one; the owner's own stream is what puts a
+		//     driven enemy into combat here, applied directly (engagePuppet) rather than through this
+		//     seam. Dropping it is also what keeps a puppet out of the shared attack-frequency manager,
+		//     which the raw call would enter it into (:391).
+		["EnemyCmp.setAggressive", exp.EnemyCmp?.prototype, "setAggressive", entOfSelf, puppetSetAggressive],
 	];
 
 	for (const [label, proto, name, resolveEnt, apply, observe] of table) {
@@ -504,6 +643,53 @@ function entOfSelf(self) {
 // The entity behind the EnemyCmp first argument of the EnemySheet / reaction seams.
 function entOfEnemyArg(self, args) {
 	return args[0]?.ent;
+}
+
+// Puppet on EnemyCmp.update: mark the call, then run it in full (see (e) in the patch table).
+// `finally`, so a throw inside the engine's own update cannot leave the mark behind and make a later
+// deliberate de-aggro look like the loose rule's. This is the ONLY thing that separates them: the
+// loose rule is the single setAggressive(false) made from inside update().
+function puppetUpdate(ent, original, args) {
+	ent[PUPPET_UPDATING] = true;
+	try {
+		return original.apply(this, args);
+	}
+	finally {
+		delete ent[PUPPET_UPDATING];
+	}
+}
+
+// Puppet on EnemyCmp.setAggressive: drop the engine's own loose-rule de-aggro while the owner's stream
+// says the enemy is in combat, honour every other de-aggro, and drop engages altogether (see (f) in the
+// patch table for why each of the three cases is what it is).
+function puppetSetAggressive(ent, original, args) {
+	if (args[0] !== true) {
+		// The loose rule (the engine's own per-entity aggro upkeep, inside the entity's own update)
+		// asks for a de-aggro the owner's stream forbids: drop it. See (f) in the patch table.
+		if (ent[PUPPET_UPDATING] === true && ent[PUPPET_AGGRO] === true)
+			return;
+		// Any other de-aggro is a DECISION the engine made about an entity it owns the combat state of
+		// -- a kill, a giveUp/disappear, a rest (the calm-down runs calmEnemy, src/client/enemies.js).
+		// Honour it, and forget the owner's claim with it: a claim left standing over an engine
+		// de-aggro would make the release path re-engage an enemy the engine had just calmed (a rest
+		// would then be undone for exactly the enemies it was resetting). The owner's next frame
+		// re-claims if the enemy really is still in combat, which is what makes this a one-frame
+		// correction at worst. The passive is left to the engine path that made the decision: the
+		// engine's own de-aggros never restore the spot's flag (setAggressive :377-404, onKill :338,
+		// giveUp :1144), and the one that does (calmEnemy) applies it itself.
+		delete ent[PUPPET_AGGRO];
+		delete ent[PUPPET_PASSIVE];
+		return original.apply(this, args);
+	}
+	// An ENGAGE of a puppet, from an ENGINE caller -- a spot triggering on this client, an
+	// aggroNearbyEnemy pass walking a circle that happens to contain a puppet, an enemySpawner, a COMBAT
+	// step. Dropped, exactly as the AI seams above are: those callers all describe what is happening on
+	// the client SIMULATING the enemy, and this is not that client. The owner's stream is the only
+	// thing that may put a driven enemy into combat, and it is applied directly (drivePuppet ->
+	// engagePuppet, which does not come back through this seam). Dropping the call is also what keeps
+	// the puppet out of the shared attack-frequency manager, which the raw call would enter it into
+	// (:391) -- a driven enemy must not re-time this client's own attacks.
+	return;
 }
 
 // Puppet onPostMove: run the real body (it also fixes up figState.mod.shiftZ against the ground,
@@ -789,13 +975,23 @@ export function readEnemyState(ent) {
 		// Whether the enemy is in a fight (enemy-cmp.js:151/:228 `aggressive`, set by :377
 		// setAggressive / :1113 triggerAggression and cleared on kill/death/giveUp/rest). Phase 5a
 		// carries it so a peer (and the debug overlay) can tell an enemy that is being fought from
-		// one standing idle, which is the input the engagement/proximity rule in src/client/enemies.js
-		// reads on the owner side. The recipient now SHOWS it on the enemy's HP bar and applies
-		// nothing else of it: setAggressive itself is not usable on a suppressed puppet (its
-		// attack-frequency registration, navDanger handle, passive reset and the engine's own loose
-		// rule all bite there) -- see applyPuppetAggro, which is where the peer's half of this bit
-		// lives.
+		// one standing idle, and it is the input the whole aggro half of this mod reads on both sides
+		// (the peer applies it with the engine's own setAggressive, see engagePuppet above; the
+		// engagement/proximity rule in src/client/enemies.js reads it for its own player).
 		aggro: enemy.aggressive === true,
+		// Whether the enemy is MID-ACTION, i.e. the owner's own `actor.isActionRunning()`
+		// (steps/action.js:106-108: the flag is `!!actionState.sequence`, which is exactly what the
+		// monster AI returns on at enemy-type.js:231). This is the server's IDLE GATE: the fact the
+		// ownership pass needs to avoid moving an enemy out of a swing it is half way through, and it
+		// is authoritative in a way the fields above are not --
+		//   * `state` cannot answer it: eight enemies in the shipped map data spawn in a state named
+		//     COMBAT while perfectly calm, so "in a combat state" says nothing about being busy, and
+		//     the name is only the CURRENT state of a long-lived enemy;
+		//   * `action` is the running sequence's NAME, which is null both for an idle enemy and for a
+		//     busy one whose action has no name (`idleCombat` is an ACTION, not a state), and it says
+		//     nothing about whether the sequence has finished.
+		// One boolean, read off the live actor: the same cost as the `action` field beside it.
+		busy: typeof actor?.isActionRunning === "function" ? actor.isActionRunning() === true : false,
 	};
 }
 
@@ -924,10 +1120,13 @@ export function drivePuppet(ent, state) {
 	if (!applyState(ent, state))
 		return false;
 
-	// ...and the combat state the same frame carries (see applyPuppetAggro). It is applied here,
-	// on the PUPPET path only: adoptState is the one-shot write onto an entity this client is about
-	// to simulate itself, and the engine owns that entity's HUD from the next tick -- which
-	// setAggressive's own early-return (:378) would never correct from a value written here.
+	// ...and the combat state the same frame carries (see applyPuppetAggro): the owner's own
+	// `aggressive`, applied through the engine's setAggressive so this copy is genuinely in a fight
+	// and stays in it when the drive stops. Applied here, on the PUPPET path only: adoptState is the
+	// one-shot write onto an entity this client is about to simulate itself, where the engine's own
+	// state (and its own re-engagement -- see src/client/enemies.js's engageLocally) is the authority
+	// from the next tick, and setAggressive's early-return on an unchanged flag (:377-379) would never
+	// correct it from here.
 	applyPuppetAggro(ent, state?.aggro === true);
 
 	return true;
@@ -963,9 +1162,13 @@ export function adoptState(ent, state) {
 // deliberately NOT applied by drivePuppet: applying them would mean enemy.setState() (cancels the
 // running actor action and applies an action config) or actor.setAction() (resets actionState,
 // then runs the action's steps -- hitboxes and all) per frame, i.e. re-enabling exactly the local
-// simulation a puppet exists to suppress. `id` is not applied either: it is the peer's identity for
-// the receiving side to route on, and every field drivePuppet does apply is listed in its steps
-// above. adoptState applies the same field set and for the same reason leaves `state`/`action` to
-// the local AI, which takes over with its own state machine on the very next tick.
+// simulation a puppet exists to suppress. `id` is not applied either (the receiving side routes on
+// it), and neither are `aggro` and `busy` HERE -- `aggro` is applied by drivePuppet's own last step
+// (the engine's combat state, above), and `busy` is read-only information: it is the OWNER's answer
+// to "is the enemy mid-action", for the server's idle gate and for the debug overlay, and a peer
+// must never write a locally simulated entity's action state from it. Every field drivePuppet does
+// apply is listed in its steps above; adoptState applies the same set and, for the same reason,
+// leaves `state`/`action` to the local AI, which takes over with its own state machine on the very
+// next tick.
 
 //# sourceURL=/mods/terra-together/client/enemy-puppet.js

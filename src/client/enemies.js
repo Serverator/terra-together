@@ -61,10 +61,26 @@
  *   - Engagement (Phase 5a), the input the reward phase consumes: a LATCH WITH A TTL recording
  *     which players have engaged each enemy -- the attackers of the hits we applied, the local
  *     player's own hits on BOTH sides of the split (the ones we applied and the ones we forwarded),
- *     plus every player inside ENGAGE_RADIUS of an enemy that is in a fight (its own `aggressive`
- *     field if we simulate it, the owner's carried `aggro` flag if we puppet it). Exposed as
- *     isEngaged()/engagedPlayers(), per enemy, so Phase 5b never has to re-derive it. The latch is
- *     not a live flag on purpose: the engine de-aggros an enemy before it grants its rewards.
+ *     plus every player inside ENGAGE_RADIUS (= AGGRO_TUNING.aggroShareRadius) of an enemy that is
+ *     in a fight (the engine's own `aggressive` flag on the entity we hold, whichever side of the
+ *     split we are on -- see enemyInFight). Exposed as isEngaged()/engagedPlayers(), per enemy, so
+ *     Phase 5b never has to re-derive it. The latch is not a live flag on purpose: the engine
+ *     de-aggros an enemy before it grants its rewards. A rest drops it (Sam: a rest resets every
+ *     enemy for every player, see dropEnemyCombatState).
+ *   - The fight SURVIVES a handover (the aggro rebuild): an enemy whose owner's stream reports it in
+ *     combat stays in combat here when that owner stops speaking for it -- a pause, a downed host, a
+ *     rebalance -- which is the whole point of applying the owner's `aggro` with the engine's own
+ *     setAggressive on a driven enemy (./enemy-puppet.js, engagePuppet). Every release that hands an
+ *     enemy back to local simulation therefore re-engages it through the engine (relinquishPuppet ->
+ *     engageLocally, which restores the attack-frequency registration the puppet deliberately did
+ *     not hold), and a takeover adopts the previous owner's fight along with its position
+ *     (takeOwnership). A rest is the one event that ends every fight on the map.
+ *   - Group wake (the aggro rebuild), cross-client: aggro is a GROUP event in this engine
+ *     (CombatManager.aggroNearbyEnemy, combat.js:226-271: the enemy's entity groups plus an 8-unit
+ *     recursive chain), but that pass runs on the simulating client only, so a group split across
+ *     clients wakes half of itself. The client that sees an enemy of its own aggro lists the ids
+ *     that pass reached (wakeIdList) and sends them once (detectWakes -> MSG.ENEMY_WAKE); the server
+ *     relays them and each recipient wakes the ids it is simulating itself (onEnemyWake).
  *   - Kill rewards (Phase 5b), the consumer of that latch: every client grants ONLY its own local
  *     player's share of a killed enemy, and only when that player was IN COMBAT with it (the
  *     engagement latch above) or NEAR it (the engine's own player-proximity call, KILL_REWARD_RADIUS
@@ -116,13 +132,16 @@
  *     guard lifted for an enemy's own shot.
  * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
  *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
- *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerId, getEnemyOwnerName, isEngaged,
- *   engagedPlayers, EnemySync
+ *   onEnemyRespawn, onEnemyHit, onEnemyWake, isOwner, getEnemyOwnerId, getEnemyOwnerName,
+ *   isEngaged, engagedPlayers, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
  *   g_game.map.active.path / g_scene.isRunning / g_player (the local player's position, for the
  *   proximity half of engagement) / EnemyCmp (and, through it, each enemy's
- *   sourceEntity.core, which is where identity comes from), plus — for the death half —
+ *   sourceEntity.core, which is where identity comes from), plus — for the group wake —
+ *   g_group.getEnemySpots (the engine's own EntityGroupManager, entity-group-model.js:116-131, on
+ *   the same `spot.core.entityGroups` list aggroNearbyEnemy passes it) and ../config/aggro-tuning.js
+ *   (the shared tunables: aggroShareRadius is ENGAGE_RADIUS); for the death half —
  *   EnemyCmp.prototype.onDeathHit (the owner seam, wrapped once) and g_vars (the engine's var
  *   store, which is where the per-spot dead-set lives); for the two Phase 4b halves, additionally
  *   CombatManager.prototype.onRestReset (the rest seam, wrapped once), EnemySpotEntity (the spot
@@ -169,9 +188,14 @@ import {
 	getRogueInfo, hasPeers, enemyQueues, activeEnemyFx, enemyOwnership, RUN_FX_SPEED_EPS,
 } from "./session.js";
 import { MSG } from "../net/protocol.js";
+// The shared tunables of the aggro rebuild (both halves of the mod read this one file; see its own
+// header for why nothing here is re-declared). Only aggroShareRadius is this module's: it IS the
+// engagement radius below, and it is the same number the server arbitrates ownership with, so "near
+// the fight" means one thing on both sides.
+import { AGGRO_TUNING } from "../config/aggro-tuning.js";
 import {
 	installPuppetPatches, makePuppet, releasePuppet, readEnemyState, drivePuppet, adoptState,
-	readHitDescriptor, setEnemyHitSink,
+	puppetInCombat, readHitDescriptor, setEnemyHitSink,
 } from "./enemy-puppet.js";
 import {
 	spawnRemoteFx, reconcilePersistentFx, clearRemoteEnemyFx, spawnRemoteProjectile,
@@ -250,7 +274,12 @@ const DYING_STREAM_MAX_MS = 5000;
 // widths, while still being "the same fight" for two players standing in it. Phase 5b (rewards)
 // reads engagement through isEngaged()/engagedPlayers() rather than re-deriving a radius, so this
 // one number stays the single definition of near.
-export const ENGAGE_RADIUS = 15;
+// The number itself now lives in ../config/aggro-tuning.js (AGGRO_TUNING.aggroShareRadius), because
+// the SERVER arbitrates a fought enemy's ownership with the same notion of "near the fight": the
+// two halves must agree, and one shared key is the only way they cannot drift. The exported name
+// stays as the client-side name of that knob, which withinEngageRadius (and anything reading the
+// latch through isEngaged()/engagedPlayers()) is defined in terms of.
+export const ENGAGE_RADIUS = AGGRO_TUNING.aggroShareRadius;
 
 // How long an engagement sighting stays valid, in milliseconds -- the TTL of the latch isEngaged()
 // reads. Deliberately LONGER than DYING_REMOVE_MS (3000ms) above, which is the longest gap there
@@ -536,6 +565,15 @@ const engagement = new Map();
 function clearHitState() {
 	pendingHits = [];
 	recentHits.clear();
+	clearEngagement();
+}
+
+// Drop the engagement latch alone, for the one event that resets the WORLD without abandoning it: a
+// rest (see dropEnemyCombatState). The hits themselves are untouched -- a hit in flight belongs to the
+// frame it was made in, and the exactly-once marks of the reward path deliberately survive a rest
+// (see clearKillRewardState) -- but the latch, whose records name the enemies of a world that has just
+// been put back, does not.
+function clearEngagement() {
 	engagement.clear();
 }
 
@@ -587,6 +625,54 @@ function removeDyingPuppets() {
 	for (const id of [...dyingPuppets.keys()])
 		despawnEnemyLocally(id);
 	dyingPuppets.clear();
+}
+
+// Stop driving one enemy and hand it back to local simulation WITHOUT ending the fight its owner left
+// it in. The only difference from releasePuppet on its own: an enemy whose owner's last word was "in
+// combat" is re-engaged here (engageLocally), because the enemy is about to be simulated by THIS
+// client -- and left calm it would walk away from the player standing next to it, which is exactly the
+// bug this rebuild fixes (Sam: "getting downed or pausing should not affect aggro").
+//
+// Used by the two release paths that keep the enemy in the world and put it under this client's
+// simulation: a takeover (it is ours now) and an owner going quiet (its state went stale: nobody is
+// speaking for the enemy any more, so this client simulates it -- the paused/downed host case). Every
+// OTHER release is an abandonment -- the enemy was killed, or is being torn down with the map or with
+// the sync -- where keeping a fight alive would be wrong, and those call releasePuppet directly.
+function relinquishPuppet(ent) {
+	const fighting = puppetInCombat(ent);
+	releasePuppet(ent);
+	if (fighting)
+		engageLocally(ent);
+}
+
+// Put a locally simulated enemy into combat, through the engine's own entry point for it.
+//
+// setAggressive(true) is the call the engine itself makes when something aggros an enemy of a player
+// (enemy-cmp.js:377-404), and a REAL engagement is what this needs to be: it registers the enemy in
+// the shared attack-frequency manager (:391), which is not optional -- every attack choice is gated on
+// `isFrequencyReady`, whose per-enemy progress is only advanced for the enemies in that list
+// (attack-frequency.js:230-236 with enemy-state.js:86), so an aggressive enemy missing from it never
+// attacks at all. The call also clears the enemy's passive (the aggressive state its owner was in),
+// turns the HP bar red and sets the actor-FX range correctly.
+//
+// Deliberately NOT `enemy.triggerAggression()` (:1113-1118), the engine's other way in: that one also
+// runs `combat.aggroNearbyEnemy(this, 8, true)` -- a recursive physics query that triggers the group's
+// dormant spots and aggros every enemy in the neighbourhood. The group is the wake message's job (see
+// the group-wake section), decided once per aggro event and shared with the other client, so running
+// the local chain again here -- once per enemy a handover releases, in one frame -- would aggro (and
+// possibly spawn) a second time what that pass already covers. The actor target needs no help either:
+// the AI re-acquires it for an aggressive enemy that has none (enemy-type.js:233-235).
+function engageLocally(ent) {
+	const enemy = ent?.enemy;
+	if (!enemy || enemy.aggressive === true || typeof enemy.setAggressive !== "function")
+		return;
+	// A dead or already-removed entity is not ours to re-engage: the engine refuses an aggressive flag
+	// on a combatant that is not ALIVE anyway, and a killed core is on its way out of the world.
+	if (ent.core?.isKilled?.() === true)
+		return;
+	if (typeof enemy.isAlive === "function" && !enemy.isAlive())
+		return;
+	enemy.setAggressive(true);
 }
 
 // The prototype patches that make the puppet flag mean anything. Installed exactly once, never
@@ -2066,7 +2152,9 @@ function applyPeerState(live) {
 				continue;
 			}
 			if (puppets.delete(id)) {
-				releasePuppet(ent);
+				// Handing the enemy to local simulation, with the fight its owner left it in (see
+				// relinquishPuppet): a takeover must not be the thing that ends a battle.
+				relinquishPuppet(ent);
 				// The owner's effect stream stops being applied to this enemy the moment it becomes
 				// OURS (Phase 6): the fx it left on it are the previous owner's presentation of an
 				// enemy we now simulate, and nothing will ever stop them.
@@ -2128,7 +2216,10 @@ function applyPeerState(live) {
 			continue;
 		}
 		if (puppets.delete(id)) {
-			releasePuppet(ent);
+			// The owner has gone quiet: this client simulates the enemy again (that is the whole
+			// point of the freshness gate), and it keeps the fight that owner left it in -- the
+			// paused or downed host whose enemies used to walk away. See relinquishPuppet.
+			relinquishPuppet(ent);
 			clearRemoteEnemyFx(ent);       // the owner stopped speaking for it: drop its effects too
 		}
 	}
@@ -2219,8 +2310,15 @@ function takeOwnership(id, ent) {
 		peerState.delete(id);
 		releaseHold(id);
 		adopted.add(id);
+		// The enemy was being FOUGHT when it changed hands: the fight travels with the state (the
+		// carried `aggro` bit is the same one the per-frame peer half applies to a puppet), so this
+		// client continues the battle instead of picking the enemy up calm and letting it walk off --
+		// a handover is not a truce. After releaseHold(), so the engage is the engine's own call on
+		// an entity that is no longer suppressed (see engageLocally).
+		if (state.aggro === true)
+			engageLocally(ent);
 		if (debugEnabled())
-			debugLog(`takeover ${id}: adopted ${handoff ? "handoff" : "cached peer"} state (x=${state.x} y=${state.y} z=${state.z})`);
+			debugLog(`takeover ${id}: adopted ${handoff ? "handoff" : "cached peer"} state (x=${state.x} y=${state.y} z=${state.z}${state.aggro === true ? ", in combat" : ""})`);
 		return;
 	}
 	// Nothing to adopt. No hold without peers (nobody to hand anything on, nobody to be wrong on),
@@ -2630,6 +2728,214 @@ export function onEnemyDespawn(msg) {
 	}
 }
 
+// ───────────────────── group wake: the cross-client half of group aggro ─────────────────────
+//
+// Aggro is a GROUP event in this engine: CombatManager.aggroNearbyEnemy (combat.js:226-271) walks the
+// aggroed enemy's entity groups and an 8-unit recursive chain and aggressivises every enemy it
+// reaches. That pass, however, runs on the SIMULATING client only, so the group members that client
+// does not own stay calm on the client that owns them -- and the arbiter spreads a group across
+// clients by proximity and balance as a matter of course. The result is visible in co-op: one player
+// walks into a pack, the two enemies their client owns wake up, and the three the other client owns
+// keep standing there and ignore the fight.
+//
+// MSG.ENEMY_WAKE closes that gap. The client that sees the aggro (detectWakes) lists the ids the
+// engine's own pass reached and sends them once; the server relays them (no arbiter check -- see the
+// contract in ../net/protocol.js) and every recipient wakes the ids it is simulating itself
+// (onEnemyWake). Nothing arbitrates and nothing is authoritative: the ids are advisory, and a stale
+// or foreign one is a no-op on the receiving side. Same coop trust as MSG.ENEMY_RESPAWN and
+// MSG.ENEMY_HIT.
+
+// The engine's own radius for the recursive part of group aggro (`aggroNearbyEnemy(this, 8, true)`,
+// combat.js:226 with :248/:263). Deliberately NOT a tunable: it is the engine's authored number for a
+// local chain, and widening it on the wire would wake enemies the engine's own pass would not have.
+const WAKE_CHAIN_RADIUS = 8;
+
+// The aggressive state this module last SAW on an entity, so the wake fires on the TRANSITION rather
+// than on the state. On the ENTITY (entities are not pooled, components are -- the same reasoning as
+// every mark in ./enemy-puppet.js), which is also what makes a spot that respawns report a fresh
+// transition: the replacement is a different entity.
+const OWNER_AGGRO_SEEN = "__ttOwnerAggroSeen";
+
+// The ids a wake for `core`'s enemy has to reach: exactly the enemies the engine's own group pass
+// would have woken, as wire ids, deduplicated. Computed once per aggro event, and small by
+// construction (a group is authored per encounter; the chain only walks enemies).
+//   (a) every enemy of a spot in the same ENTITY GROUPS as the aggroed enemy's spot, through the
+//       engine's own EntityGroupManager on the very group list the engine passes it
+//       (g_group.getEnemySpots(dest, spot.core.entityGroups), combat.js:238-239);
+//   (b) the recursive 8-unit chain from the aggroed enemy and from those members.
+// Two deliberate differences from the engine's pass, both of them things a wire list cannot carry: a
+// dormant spot the engine would TRIGGER (spot.onEnemyTrigger(true, delay), combat.js:241-245) is
+// skipped -- a wake names enemies that EXIST, and this client cannot spawn another client's enemy for
+// it -- and only WIRE-ADDRESSABLE enemies are listed (wireEnemyId), since a client-local `u:<uid>` is
+// a different enemy on the other client and so a no-op there.
+function wakeIdList(core, live) {
+	const ids = new Set();
+	// The entity groups, through the engine's own manager. Its `groups` getter reads the main map, which
+	// exists on any frame that has live enemies at all (syncEnemies only hands out a `live` map while a
+	// world is running); the lookup is what is guarded, not the call.
+	const map = terra.export.g_gState?.getMainMap?.();
+	const group = map ? terra.export.g_group : null;
+	const spot = terra.export.EnemyCmp?.get?.(core?.ent)?.sourceEntity;
+	if (spot?.core?.entityGroups?.length && group && typeof group.getEnemySpots === "function") {
+		for (const member of group.getEnemySpots([], spot.core.entityGroups))
+			addWakeId(ids, member?.enemyEnt);
+	}
+	// The chain is walked over the frame's live enemies rather than through a physics query: the
+	// engine's own loop drops every non-enemy core it finds and only ever recurses into ENEMIES
+	// (combat.js:257-266), so over enemies the two walks are the same one -- and this one needs no
+	// physics world, no scratch arrays and no query per step.
+	let queue = [core];
+	const visited = new Set([core]);
+	while (queue.length > 0) {
+		const next = [];
+		for (const from of queue) {
+			for (const [id, other] of live) {
+				if (visited.has(other) || !withinWakeChain(from, other))
+					continue;
+				visited.add(other);
+				next.push(other);
+				ids.add(id);
+			}
+		}
+		queue = next;
+	}
+	return [...ids];
+}
+
+// One group member's wire id. A spot that has not spawned its enemy yet contributes nothing (see the
+// dormant-spot note above), and neither does an enemy with no map-placed identity.
+function addWakeId(ids, ent) {
+	const id = ent ? wireEnemyId(ent.core) : null;
+	if (id !== null)
+		ids.add(id);
+}
+
+// The engine's own radius test for the chain, on XY: `checkEnemy.ent.core.pos` minus 16 in z is the
+// query centre the engine uses (combat.js:255) and the third dimension is ignored here for the same
+// reason the mod's own proximity tests ignore it (see withinEngageRadius) -- two enemies stacked on a
+// ledge are the same cluster for an 8-unit radius and a 32-unit z band.
+function withinWakeChain(a, b) {
+	const pa = a?.pos, pb = b?.pos;
+	if (!pa || !pb)
+		return false;
+	const dx = pa.x - pb.x, dy = pa.y - pb.y;
+	return dx * dx + dy * dy <= WAKE_CHAIN_RADIUS * WAKE_CHAIN_RADIUS;
+}
+
+// The owner-side detection, run on the frame path over the enemies this frame knows about. The
+// trigger is the engine's own flag going false -> true on an enemy THIS client simulates: that is the
+// one moment the engine's group pass cannot have covered the peer's members (it walked the group here
+// and nowhere else), and it is one shot per event because the mark then stays true for as long as the
+// enemy stays aggressive.
+//
+// A puppet's flag is skipped: on a driven enemy the bit is the OWNER's (applied by
+// ./enemy-puppet.js), and that owner sends its own wake -- re-sending it from here would be a
+// duplicate. An enemy this client does not (or not yet) simulate is skipped for the same reason.
+//
+// With no peer connected there is nobody to tell, so the whole walk is skipped -- including the
+// marks, which means a peer that joins later sees every enemy already in combat as a fresh
+// transition and gets a wake per group. That is the wanted outcome for a newcomer (its own members of
+// those groups have to be woken too) and it costs one message per group, once.
+function detectWakes(live) {
+	if (!live || live.size === 0 || !hasPeers())
+		return;
+	for (const [id, core] of live) {
+		const ent = core?.ent;
+		const enemy = ent?.enemy;
+		if (!enemy)
+			continue;
+		const aggressive = enemy.aggressive === true;
+		if ((ent[OWNER_AGGRO_SEEN] === true) === aggressive)
+			continue;
+		ent[OWNER_AGGRO_SEEN] = aggressive;
+		if (!aggressive || puppets.has(id) || !isOwner(id) || !adopted.has(id))
+			continue;
+		const ids = wakeIdList(core, live);
+		wakeOwnGroup(ids, live);
+		sendWake(ids);
+	}
+}
+
+// Wake the members of `ids` this client simulates itself, exactly the way the engine's own pass wakes
+// one (`setAggressive(true)` + `actor.cancelAction()`, combat.js:246-249): the local half of the
+// message, and the reason the sender's own group is not left behind when an enemy aggros from a path
+// that does NOT run the engine's group pass (an enemySpawner, a COMBAT step, a rest's respawn).
+function wakeOwnGroup(ids, live) {
+	for (const id of ids) {
+		if (!isOwner(id) || !adopted.has(id))
+			continue;
+		const core = live.get(id);
+		if (core)
+			wakeEnemyAt(core);
+	}
+}
+
+// One MSG.ENEMY_WAKE per aggro event, carrying the whole group in one `ids` list (the contract's
+// shape). Silent when there is nothing to say: no id (an enemy in no group with nothing within 8
+// units), no connection, or no peer to tell. `from` is our own playerId -- a convenience for the log
+// only, the server stamps the sender's socket id over it exactly as it does for ENEMY_RESPAWN.
+function sendWake(ids) {
+	if (ids.length === 0 || !isConnected() || !hasPeers())
+		return;
+	if (debugEnabled())
+		debugLog(`wake: ${ids.length} group member(s): ${ids.join(", ")}`);
+	send({ type: MSG.ENEMY_WAKE, from: localPlayerId(), ids });
+}
+
+// Wake ONE enemy this client simulates: the engine's own single-enemy body from its group pass
+// (`setAggressive(true)` + `actor.cancelAction()`, combat.js:246-249), with the engine's own guards --
+// nothing to do for an enemy already in combat (:247) or one that is not alive (:246). The
+// cancelAction is what makes a woken enemy pick a combat action instead of finishing whatever it was
+// doing, and it is the engine's own choice there, not this module's.
+function wakeEnemyAt(core) {
+	const enemy = terra.export.EnemyCmp?.get?.(core?.ent);
+	if (!enemy || enemy.aggressive === true || typeof enemy.setAggressive !== "function")
+		return false;
+	if (typeof enemy.isAlive === "function" && !enemy.isAlive())
+		return false;
+	enemy.setAggressive(true);
+	if (enemy.actor && typeof enemy.actor.cancelAction === "function")
+		enemy.actor.cancelAction();
+	return true;
+}
+
+// Inbound MSG.ENEMY_WAKE (a client whose own simulation just stirred a group -> server -> everyone
+// but the sender). Routed here from ./client.js. Each id is woken only where it is OURS to wake, and
+// idempotently; everything else is ignored, which is what makes a stale or foreign id a no-op.
+//
+// "Ours to wake" is two cases, and the second is the one Sam reported:
+//   * an enemy this client OWNS and has taken over -- the ordinary case;
+//   * an enemy this client is simulating because nobody is streaming for it: its owner went quiet and
+//     the puppet was handed back to local simulation (relinquishPuppet). A paused or downed host's
+//     enemies are exactly that -- undriven, locally simulated, and before this message unreachable by
+//     any wake, which is why they used to "completely ignore you".
+// An enemy that is still DRIVEN is skipped: its combat state is its owner's to send and
+// ./enemy-puppet.js applies the owner's bit every frame, so a local write here would be undone by the
+// next frame that arrives.
+//
+// Nothing is verified about the SENDER (the payload names no enemy that aggros, only ids), and nothing
+// needs to be: the worst a hostile or malformed message can do is wake an enemy this client already
+// simulates, which is the same thing the engine does on its own when a player walks into the group.
+// Malformed entries are skipped, never thrown on -- the same rule as every other peer payload here.
+export function onEnemyWake(msg) {
+	if (!isEnemySyncEnabled() || !isConnected())
+		return;
+	const ids = msg?.ids;
+	if (!Array.isArray(ids))
+		return;
+	for (const id of ids) {
+		if (typeof id !== "string" || id === "")
+			continue;
+		if (!(isOwner(id) && adopted.has(id)) && puppets.has(id))
+			continue;                      // driven by its owner's stream: not ours to write
+		const core = findCoreById(id);
+		if (!core)
+			continue;                      // an id this client does not hold at all
+		if (wakeEnemyAt(core) && debugEnabled())
+			debugLog(`wake applied to ${id} (sent by ${msg?.from == null ? "?" : msg.from})`);
+	}
+}
+
 // ──────────────────────────── rest / respawn sync ────────────────────────────
 
 // THE REST SEAM. Resting is the one world event that puts a map's enemy population back, and the
@@ -2674,13 +2980,16 @@ function ensureRespawnPatch() {
 			// a rest that did not take effect locally.
 			const result = original.apply(this, args);
 			if (isEnemySyncEnabled()) {
-				// The rester's own end of the de-aggro (see calmAllEnemies). Normally a no-op: the shipped
-				// rest reloads the map, so its enemies are rebuilt fresh and calm anyway -- but a rest that
-				// does NOT reload (the engine's WAYPOINT_RESET step, waypoint-steps.js:236-238) would
-				// otherwise leave the enemies already on this map attacking. Gated like every other world
-				// write in this module: while it is not syncing it changes nothing about local play.
+				// The rester's own end of the world reset (see dropEnemyCombatState): the enemies already on
+				// this map lose their fights, the engagement latch goes, and the cached peer state -- the
+				// positions, HP and `busy`/`aggro` bits of a world that has just been reset -- goes with it.
+				// Normally the de-aggro half is a no-op: the shipped rest reloads the map, so its enemies are
+				// rebuilt fresh and calm anyway -- but a rest that does NOT reload (the engine's
+				// WAYPOINT_RESET step, waypoint-steps.js:236-238) would otherwise leave the enemies already
+				// on this map attacking. Gated like every other world write in this module: while it is not
+				// syncing it changes nothing about local play.
 				if (isConnected())
-					calmAllEnemies();
+					dropEnemyCombatState();
 				sendRespawn();
 			}
 			return result;
@@ -2752,8 +3061,37 @@ function applyLocalRespawn() {
 			respawnSpotCalm(ent);
 	}
 	// The enemies the respawn loop did not touch: they were alive and attacking before the rest, and a
-	// fresh map load would have left them calm.
+	// fresh map load would have left them calm. This is also where the rest's shared bookkeeping is
+	// dropped (see dropEnemyCombatState) -- the fights, the engagement latch and the cached state of a
+	// world that no longer exists.
+	dropEnemyCombatState();
+}
+
+// The one place a rest drops the enemy state BOTH ends of it have to drop, called by the rester's own
+// seam (ensureRespawnPatch) and by the peer end of MSG.ENEMY_RESPAWN (applyLocalRespawn).
+//
+// Sam's rule for a rest is total: "All aggro should be dropped when resting. For every player on every
+// map it should completely respawn and reset all enemies." The engine does that by reloading the map,
+// which rebuilds a calm population with no memory; a client that must not reload the map has to
+// reproduce the whole of that state, which is three things and not just the first:
+//   1. calmAllEnemies -- every enemy that is attacking stops (including the ones a respawned spot
+//      would have brought back fighting, see respawnSpotCalm);
+//   2. the ENGAGEMENT LATCH goes with it. Its records name enemies of the pre-rest world, and its
+//      whole job is to decide who gets a kill's rewards: a player who was in a fight that the rest
+//      just erased must not be paid for the next kill of that enemy id (the same enemy spot, back at
+//      full HP, fought by somebody else). Reward bookkeeping that DOES survive a rest -- the
+//      exactly-once marks, grantedKills -- is deliberately left alone (see clearKillRewardState);
+//   3. the cached peer state goes too, which is where the OTHER client's `busy` and `aggro` bits live
+//      on this side: the entries describe positions, HP and combat states of a world that has just
+//      been reset, and the very next frame replaces them from that client's own post-rest frames.
+//      Dropping them is also what stops a pre-rest `aggro: true` from driving an enemy back into combat
+//      on the frame after the reset.
+// Idempotent, like the rest itself: a repeat reset calms nothing already calm and clears empty
+// collections.
+function dropEnemyCombatState() {
 	calmAllEnemies();
+	clearEngagement();
+	clearPeerState();
 }
 
 // Respawn one DEFEATED spot the way the rester's own path respawns it -- CALMLY.
@@ -2803,6 +3141,10 @@ function respawnSpotCalm(spot) {
 //     updateAction -> enemy-cmp.js updateTarget at :654-655), and nothing else would ever clear it.
 //   * setPassive re-applies the spot's own flag, which the trigger's setAggressive(true) cleared
 //     (:384-385 setPassive(ENEMY_PASSIVE.NONE)); the test is the one spawnEnemy uses (:264-268).
+// The spot is OPTIONAL. A map-placed enemy always has one, but an enemy the spawner created rather
+// than a spot (an act add, an enemySpawner) has no spot flags to restore -- and it is still an enemy
+// this client simulates, whose fight a rest has to end like any other. For those the engine's own
+// de-aggro and target clear are the whole job.
 function calmEnemy(enemy, spot) {
 	enemy.setAggressive(false);
 	if (enemy.actor && typeof enemy.actor.setTarget === "function")
@@ -2810,7 +3152,7 @@ function calmEnemy(enemy, spot) {
 
 	const flags = terra.export.ENEMY_SPOT_FLAG;
 	const passive = terra.export.ENEMY_PASSIVE;
-	if (!flags || !passive || typeof enemy.setPassive !== "function")
+	if (!spot || !flags || !passive || typeof enemy.setPassive !== "function")
 		return;
 	if (spot.init & flags.PASSIVE)
 		enemy.setPassive(passive.PASSIVE);
@@ -2826,30 +3168,25 @@ function calmEnemy(enemy, spot) {
 // the map has to reproduce that state instead, so this walks the population and de-aggros the enemies
 // that are actually attacking.
 //
-// The walk is over the map's own EnemySpotEntity spots, because the calm-down needs each spot's own
-// flags -- the passive state a fresh spawn of THAT spot would have had -- and because a map-placed
-// enemy always has its spot (spawnEnemy sets sourceEntity before the actor joins the entity list). An
-// enemy the spawner created rather than a spot (an act add) is not part of a map's authored population
-// and has no spot flags to restore, so it is left alone.
+// The walk is over EVERY live entity rather than over the map's own EnemySpotEntity spots, because the
+// spot is only needed for the passive half of the calm-down (calmEnemy takes it as optional) and a rest
+// resets the whole population, not just the map-placed part of it: an enemy the spawner created has no
+// spot flags to restore, but it is just as fighting as the rest, and the map reload a real rest does
+// would have removed it along with everything else.
 //
 // It deliberately does NOT clear `spot.triggerAggressive`, unlike respawnSpotCalm: that flag can be
 // map-authored (a not-yet-triggered hidden or passive spot), and blanket-clearing it would change
 // authored behaviour. Only a spot this module actually respawned has it cleared.
 function calmAllEnemies() {
-	const Spot = terra.export.EnemySpotEntity;
-	if (typeof Spot !== "function")
-		return;
 	for (const core of terra.export.g_gState?.entities ?? []) {
 		const ent = core?.ent;
-		if (!ent || !(ent instanceof Spot))
-			continue;
-		const enemy = ent.enemyEnt?.enemy;
+		const enemy = ent ? terra.export.EnemyCmp?.get?.(ent) : null;
 		// Only enemies that ARE aggressive: a calm one is already in the state a rest wants, and
 		// setAggressive(false) would early-return on it anyway (enemy-cmp.js:377-379) -- so touching it
 		// would be a write with no effect at best, and a setPassive mid-action at worst.
 		if (!enemy || enemy.aggressive !== true)
 			continue;
-		calmEnemy(enemy, ent);
+		calmEnemy(enemy, enemy.sourceEntity);
 	}
 }
 
@@ -2862,6 +3199,11 @@ function calmAllEnemies() {
 // respawned enemies are re-announced by the ordinary per-frame registration diff, and the server's
 // arbiter re-splits their room as those registrations arrive -- this handler does not touch
 // ownership itself.
+//
+// The application is the WHOLE of a rest's reset (applyLocalRespawn -> dropEnemyCombatState), not just
+// the respawn: every enemy that was fighting stops, the engagement latch is dropped, and the cached
+// peer state -- the pre-rest positions, HP and `busy`/`aggro` bits -- goes with it. See the note on
+// dropEnemyCombatState for why the last two are part of the event rather than an afterthought.
 export function onEnemyRespawn(msg) {
 	if (!isEnemySyncEnabled() || !isConnected())
 		return;
@@ -3368,15 +3710,20 @@ function withinEngageRadius(a, b) {
 	return dx * dx + dy * dy <= ENGAGE_RADIUS * ENGAGE_RADIUS;
 }
 
-// Is this enemy in a fight, for the proximity rule below? Two sources, one per side of the split:
-//   * an enemy WE simulate: the engine's own flag on the entity (`aggressive`);
-//   * an enemy we PUPPET: the owner's carried `aggro` flag (readEnemyState -> the enemy_state
-//     entry), read through the same gate the peer half applies to state -- it must be the enemy's
-//     CURRENT owner's frame, and a fresh one. This is the one use this module makes of the carried
-//     flag; nothing applies it with setAggressive (see the note on the field in ./enemy-puppet.js).
+// Is this enemy in a fight, for the proximity rule below? The entity itself answers whenever this
+// client has one, which is the only answer that stays true across a handover: an enemy we OWN and an
+// enemy we simulate because its owner went quiet (the puppet was handed back to local simulation,
+// relinquishPuppet) are both read from the engine's own `aggressive` flag -- and for a driven PUPPET
+// that flag IS the owner's carried `aggro` bit, because this module APPLIES it (./enemy-puppet.js,
+// engagePuppet). One source, three cases, and no possibility of the two disagreeing.
+//
+// The owner's carried bit is the FALLBACK for an entity that cannot answer -- one this client knows
+// of but holds no EnemyCmp for yet -- read through the same gate the peer half applies to state: it
+// must be the enemy's CURRENT owner's frame, and a fresh one.
 function enemyInFight(id, core) {
-	if (isOwner(id))
-		return core?.ent?.enemy?.aggressive === true;
+	const aggressive = core?.ent?.enemy?.aggressive;
+	if (typeof aggressive === "boolean")
+		return aggressive === true;
 	const entry = peerState.get(id);
 	if (!entry || entry.from !== currentOwner(id))
 		return false;
@@ -3679,7 +4026,7 @@ export function getEnemyOwnerName(enemyId) {
 
 // Routed by ./client.js, which the composition root owns: this module cannot be imported
 // there (it imports send() from it), so it registers its handlers instead. Keeps the client
-// module graph a DAG. ./session.js has the inbound cases that hand these two types to
+// module graph a DAG. ./session.js has the inbound cases that hand these types to
 // ./client.js (see the dispatch there).
 addPeerMessageHandler(MSG.ENEMY_OWNER, onEnemyOwner);
 addPeerMessageHandler(MSG.ENEMY_STATE, onEnemyState);
@@ -3687,6 +4034,7 @@ addPeerMessageHandler(MSG.ENEMY_HANDOFF, onEnemyHandoff);
 addPeerMessageHandler(MSG.ENEMY_DESPAWN, onEnemyDespawn);
 addPeerMessageHandler(MSG.ENEMY_RESPAWN, onEnemyRespawn);
 addPeerMessageHandler(MSG.ENEMY_HIT, onEnemyHit);
+addPeerMessageHandler(MSG.ENEMY_WAKE, onEnemyWake);
 
 // The suppressed-hit seam's sink (./enemy-puppet.js setEnemyHitSink): registered here, at load,
 // because the module that owns the wire is the one that must decide what a hit means -- the puppet
@@ -3772,6 +4120,12 @@ class EnemySync {
 		const live = syncEnemies();
 		sendOwnerStates(live);
 		sendHandoffs(live);
+		// The group wake, one shot per aggro EVENT (see the group-wake section): the frame's diff is
+		// what says which enemies this client is simulating, and the engine's own flag on those is what
+		// says one of them has just gone into combat. Placed with the other owner-side, per-frame
+		// duties -- after the state publish, so the wake never delays it -- and cheap when nothing
+		// changed: one boolean read per enemy we hold.
+		detectWakes(live);
 		// Phase 5a, owner side: apply nothing here -- the hits this client could NOT apply left in one
 		// batch (sendHitQueue), and the engagement record is updated for the enemies the frame's diff
 		// has just confirmed are ours (updateEngagement). Both are cheap and silent when there is
