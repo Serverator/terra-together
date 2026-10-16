@@ -9,7 +9,7 @@
  *     their host callbacks, then inject the collaborators session.js cannot import back.
  *   - Re-export the public API (../main.js and ../config/settings.js consume it).
  * Public surface: joinServer, leaveServer, disconnect, isConnected, isConnecting, send,
- *   addPeerMessageHandler
+ *   addPeerMessageHandler, addFocusLossHandler
  * Engine touchpoints: terra.export.{Observable,System,g_scene,g_options,g_game},
  *   terra.addAddon (onGameMapStart 35000, onLoopStart 35000), System.prototype.setWindowFocus
  * Notes: keep this file thin — it orchestrates only. The peer maps/connection live in
@@ -77,6 +77,16 @@ const areaHealer = new AreaHealer({
 const peerMessageHandlers = new Map();
 export function addPeerMessageHandler(type, handler) {
 	peerMessageHandlers.set(type, handler);
+}
+
+// The same seam for the one event that is not a message: a window focus loss. ./enemies.js has
+// to withdraw the enemies it owns when this client stops running (see onFocusChange), and it
+// cannot be imported here for the same cycle reason as above, so it registers that callback. The
+// callback takes no arguments and must tolerate being called at any time; it is run before this
+// file's own pause sync so the withdraw leaves on the same turn of the browser's event loop.
+const focusLossHandlers = [];
+export function addFocusLossHandler(handler) {
+	focusLossHandlers.push(handler);
 }
 
 // Hand ./session.js the collaborators it must not import (see the header / its own header).
@@ -167,6 +177,13 @@ class MultiplayerClient extends terra.export.Observable {
 		const scene = SCENE_STATE[terra.export.g_scene?.currentState ?? 0];
 		if (scene != "RUNNING")
 			return;
+		// The engine returns from its loop before any addon hook while the window is unfocused
+		// (engine/system.js runInner -> hasFocusLost), so this is the LAST moment this client can
+		// say anything: the modules that own per-frame state get to withdraw it here. ./enemies.js
+		// uses it to hand its enemies on instead of going silent (a silent owner is what the
+		// peer's freshness gate reads as a gone one).
+		for (const handler of focusLossHandlers)
+			handler();
 		// "PAUSED" is the mod's own pseudo-scene (the receiver freezes the peer on it, see the
 		// MSG.SCENE_CHANGED case in ./session.js); it is not a SCENE_STATE value.
 		send({ type: MSG.SCENE_CHANGED, scene: "PAUSED" });

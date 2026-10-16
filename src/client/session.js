@@ -325,9 +325,9 @@ export function joinServer(address, options = {}) {
 					break;
 
 				case MSG.HOST_SETTING:
-					// Host-authoritative: the host's revive toggle, obeyed by every client.
-					// Apply with skipNotify so it does NOT re-fire CHANGED (which would
-					// re-broadcast it and loop); set the runtime flag directly instead.
+					// Host-authoritative: the host's revive / estus-share / enemy-sync toggles, obeyed
+					// by every client. Apply with skipNotify so it does NOT re-fire CHANGED (which
+					// would re-broadcast it and loop); set the runtime flag directly instead.
 					if (msg.key === "tt-revive") {
 						const on = msg.value === true;
 						window.terraTogether.reviveEnabled = on;
@@ -341,6 +341,16 @@ export function joinServer(address, options = {}) {
 						const g = terra.export.g_options;
 						if (g?.settings?.["tt-estus-share"] && g.get("tt-estus-share") !== on)
 							g.set("tt-estus-share", on, true);
+					}
+					// Enemy sync has no runtime mirror: the option IS what ./enemies.js reads
+					// (isEnemySyncEnabled), so writing it here is what puts every one of that module's
+					// call sites on the host's value. The key is a literal for the same cycle reason
+					// it is one in ./enemies.js and ../debug/enemy-debug.js.
+					if (msg.key === "tt-enemy-sync") {
+						const on = msg.value === true;
+						const g = terra.export.g_options;
+						if (g?.settings?.["tt-enemy-sync"] && g.get("tt-enemy-sync") !== on)
+							g.set("tt-enemy-sync", on, true);
 					}
 					break;
 

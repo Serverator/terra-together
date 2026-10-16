@@ -4,10 +4,12 @@
  * Responsibilities:
  *   - Declare every TerraTogether option: Appearance, Gameplay, Connection, Hosting,
  *     Miscellaneous and Debug.
- *   - Own the host-authoritative revive / estus-share toggles and their runtime mirrors.
+ *   - Own the host-authoritative revive / estus-share / enemy-sync toggles and the two runtime
+ *     mirrors the features read.
  *   - Patch the game's CHECKBOX gui so a host-only option greys out and refuses changes.
- * Public surface: CATEGORY, TAB_LABEL, REVIVE_OPTION, ESTUS_OPTION, isReviveEnabled,
- *   syncRevive, isEstusShareEnabled, syncEstusShare, createModSettings, SettingsTab
+ * Public surface: CATEGORY, TAB_LABEL, REVIVE_OPTION, ESTUS_OPTION, ENEMY_SYNC_OPTION,
+ *   isReviveEnabled, syncRevive, isEstusShareEnabled, syncEstusShare, syncEnemySync,
+ *   createModSettings, SettingsTab
  * Engine touchpoints: terra.export.g_options, OptionTypeBuilder, OptionGuiTypeBuilder,
  *   g_menuSFX, ColorDecorator, g_gui, g_label, Observable; window.terraTogether.{reviveEnabled,
  *   estusShareEnabled}; addon hooks — main.js calls createModSettings() from its
@@ -15,7 +17,11 @@
  * Notes: the stored option value (g_options.values[key], read through g_options.get()) is
  *   the source of truth; the terraTogether mirrors are read by revive.js (reviveEnabled) and
  *   area-heal.js (estusShareEnabled, preferring the mirror and falling back to the option),
- *   and are re-pushed to clients by server.js setHostSetting -> host_setting -> client.js. Lifecycle: createModSettings() runs once per
+ *   and are re-pushed to clients by server.js setHostSetting -> host_setting -> client.js.
+ *   Enemy sync has no mirror: its own reader (isEnemySyncEnabled() in ../client/enemies.js)
+ *   reads the option, so a client that takes the host's value writes it into g_options with
+ *   skipNotify (the MSG.HOST_SETTING case in ../client/session.js) and every call site follows.
+ *   Lifecycle: createModSettings() runs once per
  *   game-loop start (main.js Multiplayer.onLoopStart, addon order -10000) and must be done
  *   before the Options menu builds its rows, because option-types.js is what registers each
  *   option in g_options.settings and seeds g_options.values — an option has to be created
@@ -48,12 +54,10 @@ export const REVIVE_OPTION = "tt-revive";
 // Host-authoritative area-heal toggle ("Estus Heals Allies"). Off by default.
 export const ESTUS_OPTION = "tt-estus-share";
 
-// Enemy sync: the client-side identity + ownership bookkeeping in src/client/enemies.js
-// (Phase 1: it announces the enemies this client can see and records which client the server
-// assigned to simulate each one — it changes no enemy behaviour). Defaults ON: on its own it
-// is harmless, and it is what makes the assignment known to everyone. src/client/enemies.js
-// reads this key as a literal for the same cycle reason ../debug/enemy-debug.js does — do not
-// rename it.
+// Host-authoritative enemy-sync toggle (src/client/enemies.js: the identity + ownership
+// bookkeeping and the split itself). Defaults ON: on its own it is harmless, and it is what
+// makes the assignment known to everyone. src/client/enemies.js reads this key as a literal
+// for the same cycle reason ../debug/enemy-debug.js does — do not rename it.
 export const ENEMY_SYNC_OPTION = "tt-enemy-sync";
 
 export function isReviveEnabled() {
@@ -71,6 +75,22 @@ export function syncRevive() {
 
 export function isEstusShareEnabled() {
 	return terra.export.g_options?.get(ESTUS_OPTION) === true;
+}
+
+// The enemy-sync option's value, tested exactly the way the module that owns the feature tests
+// it (../client/enemies.js isEnemySyncEnabled): a strict `=== true`, so the value this module
+// pushes and the value the rest of the mod reads can never disagree about a non-boolean.
+function isEnemySyncOn() {
+	return terra.export.g_options?.get(ENEMY_SYNC_OPTION) === true;
+}
+
+// Host-authoritative push for enemy sync, like syncRevive()/syncEstusShare(). No runtime mirror
+// to keep: the option IS what ../client/enemies.js reads, and a receiving client writes the
+// host's value into the option (see the MSG.HOST_SETTING case in ../client/session.js), so every
+// isEnemySyncEnabled() call site already answers with the host's setting.
+export function syncEnemySync() {
+	if (server.isHosting())
+		server.setHostSetting(ENEMY_SYNC_OPTION, isEnemySyncOn());
 }
 
 // Same host-authoritative mirroring as syncRevive(), for the estus area heal.
@@ -242,17 +262,24 @@ export function createModSettings() {
 	syncRevive();
 	syncEstusShare();
 
-	// Enemy sync (src/client/enemies.js): identity + ownership bookkeeping only, so it is on
-	// by default — switching it off makes that module completely inert (it then reports no
-	// enemies and knows no owners). Per-machine, like the other client-side toggles: the
-	// assignment itself is the server's, not a setting.
-	createOption(ENEMY_SYNC_OPTION, {
+	// Enemy sync (src/client/enemies.js): the split of enemy simulation between players, so it is
+	// host-authoritative like the two toggles above — the host is one of the two ends of every
+	// split, and two clients that disagreed about it would puppet enemies the arbiter says they
+	// own. Defaults ON (carried over from the per-machine toggle it replaces): on its own it is
+	// harmless, and it is what makes the assignment known to everyone. Switching it off makes
+	// that module completely inert (it then reports no enemies and knows no owners).
+	const enemySyncOption = createOption(ENEMY_SYNC_OPTION, {
 		category: CATEGORY,
 		local: true,
 		label: { en_US: "Enemy Sync" },
-		description: { en_US: "Let the server decide which player simulates each enemy, so the work is split between players instead of every client simulating everything.\n\nSafe to leave on: this only shares enemy identity and ownership." },
+		description: { en_US: "Let the server decide which player simulates each enemy, so the work is split between players instead of every client simulating everything.\n\nSet by the host; other players obey." },
 		type: { default: true, type: "CHECKBOX" }
 	}, "CHECKBOX");
+	// Editable only while we host (or are offline); otherwise we follow the host's value.
+	enemySyncOption.getEnabled = () => server.isHosting() || (!client.isConnected() && !client.isConnecting());
+
+	// Push the host's value to clients (a no-op when we are not hosting).
+	syncEnemySync();
 
 	// === Connection ===
 
@@ -321,7 +348,7 @@ export function createModSettings() {
 			// Only join once the server is actually listening: joining immediately races
 			// the bind, so the first attempt is refused and logs a connection error.
 			server.startServer("0.0.0.0", port)
-				.then(() => { client.joinServer(undefined, { force: true }); syncRevive(); syncEstusShare(); })
+				.then(() => { client.joinServer(undefined, { force: true }); syncRevive(); syncEstusShare(); syncEnemySync(); })
 				.catch(() => { /* startServer already logged the failure */ });
 		}
 	});

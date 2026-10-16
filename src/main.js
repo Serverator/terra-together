@@ -5,7 +5,7 @@
  * Responsibilities:
  *   - Import the feature/config modules (skins + nameplates are side-effect imports:
  *     each registers its own addon at import time).
- *   - Multiplayer addon: option observer, profile send, revive/estus host sync,
+ *   - Multiplayer addon: option observer, profile send, revive/estus/enemy-sync host sync,
  *     always-focused, auto-host, and installing the logo-skip patch.
  *   - Register the SettingsTab, EnemyDebug and EnemySync addons.
  * Public surface: none (side effects only; seeds window.terraTogether)
@@ -17,7 +17,7 @@
  */
 
 import { registerOptionTypes } from "./config/option-types.js";
-import { createModSettings, SettingsTab, syncRevive, REVIVE_OPTION, syncEstusShare, ESTUS_OPTION } from "./config/settings.js";
+import { createModSettings, SettingsTab, syncRevive, REVIVE_OPTION, syncEstusShare, ESTUS_OPTION, syncEnemySync, ENEMY_SYNC_OPTION } from "./config/settings.js";
 // Imported for its side effect only: registers the SkinManager addon.
 import "./features/skins.js";
 import * as client from './client/client.js';
@@ -60,6 +60,11 @@ class Multiplayer extends terra.export.Observable {
 		// Estus area-heal toggle: same host-authoritative sync.
 		if (key === ESTUS_OPTION) {
 			syncEstusShare();
+		}
+
+		// Enemy-sync toggle: same host-authoritative sync.
+		if (key === ENEMY_SYNC_OPTION) {
+			syncEnemySync();
 		}
 
 		if (key === "tt-hide-party") {
@@ -113,7 +118,7 @@ class Multiplayer extends terra.export.Observable {
 		if (!(terra.export.g_options.get("tt-auto-host") ?? false))
 			return;
 		const port = parseInt(terra.export.g_options.get("tt-server-port"), 10) || 17005;
-		server.startServer("0.0.0.0", port).then(() => { syncRevive(); syncEstusShare(); }).catch(err => {
+		server.startServer("0.0.0.0", port).then(() => { syncRevive(); syncEstusShare(); syncEnemySync(); }).catch(err => {
 			console.error("[TerraTogether] Auto-host failed:", err);
 		});
 	}

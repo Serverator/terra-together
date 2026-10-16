@@ -139,7 +139,8 @@
  *     none of this -- the synced projectile is a real one (./fx-sync.js) and simply has its damage
  *     guard lifted for an enemy's own shot.
  * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
- *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
+ *   enemyStableId, isEnemySyncEnabled, withdrawOwnedEnemies, onEnemyOwner, onEnemyState,
+ *   onEnemyHandoff, onEnemyDespawn,
  *   onEnemyRespawn, onEnemyHit, onEnemyWake, isOwner, getEnemyOwnerId, getEnemyOwnerName,
  *   isEngaged, engagedPlayers, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
@@ -183,7 +184,10 @@
  *   enemy -- and what makes running a hit act on the peer possible at all). Inbound routing:
  *   ./client.js (see the note at the handler registration below).
  * Notes: the module is a no-op, and holds no state, while its option is off or the client is
- *   not connected, which is what makes it safe to default on. Off or disconnected, its puppets
+ *   not connected, which is what makes it safe to default on. The option is host-authoritative
+ *   (../config/settings.js syncEnemySync -> server.js setHostSetting -> the host_setting case in
+ *   ../client/session.js), and the withdraw on focus loss (withdrawOwnedEnemies) is what stops an
+ *   unfocused owner from going silent and being read as a gone one. Off or disconnected, its puppets
  *   are released too, so no enemy can stay suppressed (or frozen) because this module stopped
  *   running -- except a dying one, which is REMOVED rather than released, because releasing a dead
  *   enemy is exactly the locally-simulating zombie the dying latch exists to prevent. The option KEY
@@ -193,7 +197,7 @@
  *   in ../debug/enemy-debug.js).
  */
 
-import { send, isConnected, addPeerMessageHandler } from "./client.js";
+import { send, isConnected, addPeerMessageHandler, addFocusLossHandler } from "./client.js";
 import {
 	getRogueInfo, hasPeers, enemyQueues, activeEnemyFx, enemyOwnership, RUN_FX_SPEED_EPS,
 } from "./session.js";
@@ -213,7 +217,10 @@ import {
 import { playSyncedSound } from "./actors.js";
 
 // The option key declared in ../config/settings.js (see the header note on why it is a
-// literal here). Read through g_options.get(), which hands back the stored value as-is.
+// literal here). Read through g_options.get(), which hands back the stored value as-is — and
+// while connected that stored value is the HOST's (the host pushes its own value and the
+// receiver writes it into the option; see the MSG.HOST_SETTING case in ./session.js), so this
+// module and every reader below follow the host without a second flag.
 export const ENEMY_SYNC_OPTION = "tt-enemy-sync";
 
 // The username option, same source ../debug/enemy-debug.js uses to name the local player.
@@ -322,7 +329,9 @@ export const KILL_REWARD_RADIUS = 15;
 const HIT_DEDUPE_MS = 250;
 
 // True while the feature is on. Strict `=== true`, like the overlay's flag test: only a real
-// boolean switches it on, and an option that was never seeded counts as off.
+// boolean switches it on, and an option that was never seeded counts as off. The value is the
+// host's once we are connected (see ENEMY_SYNC_OPTION above), so this is the effective setting
+// everywhere it is asked.
 export function isEnemySyncEnabled() {
 	return terra.export.g_options?.get(ENEMY_SYNC_OPTION) === true;
 }
@@ -1098,6 +1107,76 @@ function sendHandoffs(live) {
 	// check it against the arbiter (we have just lost these enemies), it only stamps the sender's
 	// id over it, which is what a recipient compares against.
 	send({ type: MSG.ENEMY_HANDOFF, owner: localPlayerId(), list });
+}
+
+// ─────────────────── owner half: withdraw on focus loss ───────────────────
+
+// The window lost focus: the engine returns from its loop before any addon hook runs from here on
+// (engine/system.js runInner -> `if (this.hasFocusLost()) return`), so this moment is the LAST
+// thing this client does -- no more state is published, and nothing it has already sent is going to
+// be followed up. A silent owner is precisely what the peer's freshness gate reads as a GONE one
+// (see PEER_STATE_FRESH_MS), and half a second later the peer releases these enemies into local
+// simulation while the arbiter still believes this client owns them: two simulators for one enemy,
+// which is the split-brain the split/handoff work exists to prevent.
+//
+// So we say it explicitly while we still can, and the two messages are exactly what a normal
+// handover is made of:
+//   1. MSG.ENEMY_HANDOFF -- the final state of the enemies we were simulating, so whoever takes
+//      them over continues from here (the same one-shot batch sendHandoffs sends);
+//   2. MSG.ENEMY_UNREGISTER -- this client no longer holds these enemies. The peer keeps its own
+//      record (both clients announce the same map-placed enemies, and a withdrawal only drops the
+//      SENDER from a record's registrant set -- src/server/enemy-ownership.js unregister), so the
+//      record survives with us no longer among its candidates, and the arbiter's proximity pass
+//      finds the incumbent owner outside the candidate set: `ownerGone` is a MANDATORY move that
+//      needs neither a measured position nor an elapsed hold, so the enemy is handed to the peer on
+//      the pass's next tick -- while the server still holds the positions and flags it cached from
+//      our last frames.
+//
+// Local bookkeeping goes with it: the registry entries are dropped (so the normal per-frame diff
+// re-announces these enemies when the window comes back, and the server re-splits the room over
+// both clients), as are the per-assignment records that belong to an ownership that has ended.
+//
+// Cheap and guarded: nothing at all happens while the feature is off, the client is not connected
+// or there is no peer to hand to, and a client that owns nothing sends nothing. State is read only
+// for enemies we have actually ADOPTED (plus the dying ones we are still streaming): an enemy we
+// own but are holding for a handoff has a copy that is deliberately not authoritative yet (see
+// takeOwnership), so it is withdrawn without one and the taker falls back to its own copy.
+// Called from ./client.js's focus hook (see addFocusLossHandler there).
+export function withdrawOwnedEnemies() {
+	if (!isEnemySyncEnabled() || !isConnected() || !hasPeers())
+		return;
+	const localId = localPlayerId();
+	if (localId === null)
+		return;
+	const ids = [];
+	for (const [id, entry] of registry) {
+		if (entry.owner !== null && entry.owner === localId)
+			ids.push(id);
+	}
+	if (ids.length === 0)
+		return;
+	const list = [];
+	for (const id of ids) {
+		if (!adopted.has(id) && !dyingOwned.has(id))
+			continue;                      // nothing authoritative to hand on (see above)
+		const core = findCoreById(id);
+		if (!core)
+			continue;                      // gone locally: the taker falls back to its own copy
+		const state = readEnemyState(core.ent);
+		if (state)
+			list.push(state);
+	}
+	if (list.length > 0)
+		send({ type: MSG.ENEMY_HANDOFF, owner: localId, list });
+	send({ type: MSG.ENEMY_UNREGISTER, ids });
+	for (const id of ids) {
+		registry.delete(id);
+		adopted.delete(id);
+		handoffState.delete(id);
+		lostOwnership.delete(id);
+	}
+	if (debugEnabled())
+		debugLog(`focus lost: withdrew ${ids.length} owned (${list.length} handed on): ${ids.join(", ")}`);
 }
 
 // ─────────────────── owner half: announce one of our own deaths ───────────────────
@@ -4141,6 +4220,12 @@ addPeerMessageHandler(MSG.ENEMY_DESPAWN, onEnemyDespawn);
 addPeerMessageHandler(MSG.ENEMY_RESPAWN, onEnemyRespawn);
 addPeerMessageHandler(MSG.ENEMY_HIT, onEnemyHit);
 addPeerMessageHandler(MSG.ENEMY_WAKE, onEnemyWake);
+
+// The focus-loss withdraw (./client.js addFocusLossHandler): the same registration trick as the
+// handler table above and for the same reason -- this module imports ./client.js for send(), so the
+// composition root cannot import it back. Registered at load; harmless while the feature is off,
+// because the function re-tests the option per call.
+addFocusLossHandler(withdrawOwnedEnemies);
 
 // The suppressed-hit seam's sink (./enemy-puppet.js setEnemyHitSink): registered here, at load,
 // because the module that owns the wire is the one that must decide what a hit means -- the puppet
