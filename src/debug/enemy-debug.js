@@ -215,9 +215,12 @@ function getLiveEnemy(core) {
 // The label's FIXED line set, in order: owner, enemy id, logic state, running action. All
 // four lines are emitted on every frame.
 //
-// Order: owner first (who simulates this enemy) and the id second, directly under it, because
-// the id is the cross-client key the owner is derived from -- reading the two together is what
-// makes "same enemy, two screens" checks quick. State then action, as before.
+// Order: the enemy's TYPE first, then who simulates it, then the id, then state, then action.
+// The type leads because the first thing anyone reads the overlay for is "which enemy is this" --
+// the id is a map coordinate, and a report about "the swamp plant shooting a bomb" is only
+// actionable with the type in hand. Owner and id stay adjacent (see below): the id is the
+// cross-client key the owner is derived from, so reading the two together is what makes "same
+// enemy, two screens" checks quick. State then action, as before.
 //
 // Every line is emitted unconditionally, with the same `-` placeholder a missing state already
 // used, because a dropped line is not a cosmetic loss here: ./labels.js placeLabelAbove()
@@ -232,13 +235,52 @@ function getLiveEnemy(core) {
 // rendezvous estimate below stand in -- marked, because the two are not the same claim (see
 // ownerLine), and enemyStableId() always returns a string.
 function buildLabel(core, enemy) {
+	const type = enemyTypeLine(enemy);
 	const id = enemyStableId(core);
 	const owner = ownerLine(id);
 	const state = cleanText(enemy.currentState?.name) ?? "-";
 	const action = cleanText(core.ent?.actor?.actionState?.sequence?.name) ?? "-";
 	// The id goes in VERBATIM, never through cleanText(): the whole point of the line is that
 	// it is byte-for-byte the string the sync exchanges, so the two clients' labels match.
-	return `${owner}\n${id}\n${state}\n${action}`;
+	return `${type}\n${owner}\n${id}\n${state}\n${action}`;
+}
+
+// The enemy's TYPE, the one line written for a human rather than for the sync. The most readable
+// source that is always present is the localized encyclopedia name: `enemy.enemyType.getDBKey()`
+// produces exactly the key the enemy database is filed under ("start-ball", "swamp-mushroom#big",
+// "start-ball#rage1" -- enemy-type.js:395-397 is `sheet.path.replace(".", "-")` + `#<alt>`, and
+// data/database/enemies.json is keyed on the same strings), so one Map lookup and one LangEntry.get()
+// (lang-entry.js:28-31, which falls back to its own en_US text) turn it into "Sphera" /
+// "Boletus Magna" / "Musco Bovis" -- what the boss bar and the codex call the thing.
+// The id key is the FALLBACK, not the primary, for two reasons: the database resource is loaded
+// asynchronously (engine/database.js SimpleJsonResource load listener), so for a moment after a map
+// starts there is no entry to name; and an enemy whose type is not filed there (a test/prototype
+// sheet, a mod-added one) never gets one. `getDBKey()` is then the honest answer -- still far more
+// readable than the raw `start.ball` path, and stable across clients. All of it is defensive: the
+// accessor is looked up both ways the modloader exposes a module (terra.export flattening and
+// terra.file per-file) and every step can miss without throwing, since this runs per enemy per
+// frame on the draw path.
+function enemyTypeLine(enemy) {
+	const type = enemy?.enemyType ?? null;
+	if (!type)
+		return "-";
+	let key = null;
+	try { key = type.getDBKey?.() ?? null; }
+	catch (e) { key = null; }
+	if (key) {
+		const db = terra.export.g_enemies ?? terra.file.enemyDatabase?.g_enemies ?? null;
+		const entry = db?.get?.(key) ?? null;
+		try {
+			const name = entry?.name?.get?.() ?? null;
+			if (name)
+				return cleanText(name) ?? key;
+		}
+		catch (e) { /* fall through to the key */ }
+		return key;
+	}
+	// No key (no sheet path): the enemy's own toString() is `path>alt`, the last readable form.
+	try { return cleanText(type.toString?.()) ?? "-"; }
+	catch (e) { return "-"; }
 }
 
 // The owner line, and the whole point of the marker on it. This runs on the observer's side of a
