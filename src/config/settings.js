@@ -232,7 +232,7 @@ export function createModSettings() {
 		category: CATEGORY,
 		local: true,
 		label: { en_US: "Estus Heals Allies" },
-		description: { en_US: "Drinking your estus flask also heals nearby players by the same amount. A downed teammate in range is revived. Only your own flask is consumed.\n\nSet by the host; other players obey." },
+		description: { en_US: "Drinking your estus flask also heals nearby players: the heal is divided between those in range who need it, so they share one flask instead of each getting its full amount (you still keep your own heal). A downed teammate in range is revived. Only your own flask is consumed.\n\nSet by the host; other players obey." },
 		type: { default: false, type: "CHECKBOX" }
 	}, "CHECKBOX");
 	// Editable only while we host (or are offline); otherwise we follow the host's value.
