@@ -23,7 +23,8 @@
  *   ACTION_STEP,FX_STEPS,ACTOR_FX_TYPE,TARGET_RES_TYPE,COMBATANT_PARTY,DamagerCmp,CombatStats,
  *   getEntAlign,getEntAlignFigure,addFigureToEntAlign,g_rogue,g_player,g_actorGlobals,g_gState},
  *   terraTogether.steps.SPAWN_WINDBOX, terra.file.{sound,audioEvent,playback,actorSound,
- *   hitSounds,playerCombat,fxBase,stepBase}; Vec3 is re-exported by ./session.js.
+ *   hitSounds,playerCombat,fxBase,stepBase}; Vec3 and the peer-actor map (playerActors) come
+ *   from ./session.js.
  * Notes: the sync queues/registries are NOT declared here: they are shared with
  *   ./snapshot.js, ./actors.js and ./enemies.js and live in ./session.js (see its header). This
  *   module owns only capture-local state (fxSyncId, soundSyncId, projSyncId, spawningVisualCopy,
@@ -41,6 +42,7 @@
 import {
 	queues, soundRegistry, activeSyncedSounds, activePersistentFx, soundSyncSuppress,
 	RUN_FX_GROUPS, hasClient, getPeerRogueSeed, Vec3, enemyQueues, activeEnemyFx, enemyOwnership,
+	playerActors,
 } from "./session.js";
 
 // --- Capture-local sync state -------------------------------------------------
@@ -258,6 +260,9 @@ function isSyncableBus(type) {
 // shot is replayed so that it lands on whoever it reaches, which is the victim-side model -- the
 // client that receives the hit decides it, so a mirrored enemy shot is allowed through the
 // engine's own hit path and damages the local player it collides with (`__ttVictimMirror`).
+// Because that one is a real attack, it is also CONSUMED like one: it stops on the body it reaches
+// even when that body is another player's ghost -- the one body the engine itself refuses to stop
+// it on (see the checkHit note in the projectile hooks).
 
 // Resolve a proxy def by name. An entity that fired the shot is asked FIRST when one is given: an
 // enemy's own proxies live on its enemy sheet (enemy-type.js:83-85 builds `EnemySheet.proxies`,
@@ -319,6 +324,21 @@ function getMirrorDamager(actor) {
 	if (actor.enemy)
 		return actor.enemy?.combatant?.attacker?.damager ?? null;
 	return getVisualDamager(actor);
+}
+
+// The players this client is NOT: ./actors.js's ghost actors, the only bodies a mirrored enemy
+// shot can be consumed by on this side (see the mirrored-projectile consumption note in the
+// projectile hooks). Membership of ./session.js's live map is the one authoritative test -- the
+// same map ./enemies.js reads for peer positions and ./actors.js fills -- so nothing has to be
+// marked on the entity itself.
+function isPeerPlayerActor(ent) {
+	if (!ent)
+		return false;
+	for (const actor of playerActors.values()) {
+		if (actor === ent)
+			return true;
+	}
+	return false;
 }
 
 // Cosmetic copies must not take the local player's ranged-weapon extension
@@ -815,6 +835,38 @@ export function installFxSyncHooks() {
 					if (this.__ttVisual)
 						return undefined;
 					return originalSpawnSubProxy.apply(this, args);
+				};
+
+				// A VICTIM mirror is consumed by the body it reaches, exactly as the shot it mirrors is
+				// consumed on the owner's side -- including when that body is a PEER's, which the engine
+				// will not consume on its own.
+				//
+				// On the client that simulates the enemy, an enemy shot flies into the player it was
+				// aimed at and stops there: `checkHit` resolves HIT against that combatant and takes the
+				// "it was hit, stick" branch (`Projectile.onStuck`, proxy-projectile.js:1050-1055). On the
+				// other client the same shot is a mirror and the player it hit is a GHOST: a TerraActor
+				// with no CombatantCmp, whose `onHitCheck` refuses every hit it could take
+				// (terra-actor-entity.js:240-241). The result is IGNORE, `checkHit` leaves through
+				// :1025-1028 before that branch, and the shot visibly flies THROUGH that player's body and
+				// on past them instead of stopping where the owner's stopped -- the one thing an observer
+				// sees the two clients disagree about.
+				//
+				// Damage is deliberately NOT this hook's business: the victim's own client already resolved
+				// the hit, a ghost must never become damageable (it exists to be seen, not fought), and only
+				// the local player can be damaged here. This re-creates the STOP alone -- at the engine's own
+				// hit point, through the engine's own call (`onStuck`, which is also what plays the shot's
+				// hit fx) -- and only for a mirror of an ENEMY's shot: a mirrored PLAYER shot keeps passing
+				// through a ghost, exactly as a friendly shot always has.
+				const PROJECTILE_STATE_FLYING = 0; // proxy-projectile.js:490 -- the enum is module-local
+				let originalCheckHit = Projectile.prototype.checkHit;
+				Projectile.prototype.checkHit = function (...args) {
+					const result = originalCheckHit.apply(this, args);
+					// Still FLYING after the engine looked at this coll means it did not consume the shot
+					// here, which is the ghost case above: a real player hit would have left it STUCK.
+					if (this.__ttVictimMirror && this.state === PROJECTILE_STATE_FLYING
+						&& isPeerPlayerActor(args[0]?.core?.ent))
+						this.onStuck(this.hitForce.hitPoint);
+					return result;
 				};
 
 				// One choke point for every proxy (weapon shots, HIT proxies, sub-proxies).
