@@ -42,7 +42,7 @@
 import {
 	queues, soundRegistry, activeSyncedSounds, activePersistentFx, soundSyncSuppress,
 	RUN_FX_GROUPS, hasClient, getPeerRogueSeed, Vec3, enemyQueues, activeEnemyFx, enemyOwnership,
-	playerActors,
+	playerActors, getLocalId,
 } from "./session.js";
 
 // --- Capture-local sync state -------------------------------------------------
@@ -341,6 +341,36 @@ function isPeerPlayerActor(ent) {
 	return false;
 }
 
+// Which PLAYER an entity is, as the id the wire uses, or null for anything that is not a player.
+// It is the inverse of the lookup the aim replication below needs on the receiving side, and it is
+// the only question that side has to answer -- "is this mine, or is it that peer's?" -- so both
+// halves are kept together and deliberately small. The local player is tested first because it is
+// not in the peer map (./session.js fills `playerActors` with peers only).
+function playerSyncIdOf(ent) {
+	if (!ent)
+		return null;
+	if (ent === terra.export.g_player?.entity)
+		return getLocalId();
+	for (const [id, actor] of playerActors) {
+		if (actor === ent)
+			return id;
+	}
+	return null;
+}
+
+// The player a synced id names, on THIS client, or null while we cannot see them (no such peer, or
+// its actor is not in the world yet). Mirrors playerSyncIdOf: a peer's own id resolves to our own
+// player entity, because a synced target id is the owner's idea of a player and the only player a
+// mirrored attack can possibly be aimed at here is the one we are.
+function playerEntityOfId(id) {
+	if (id == null)
+		return null;
+	const local = getLocalId();
+	if (local !== null && String(id) === String(local))
+		return terra.export.g_player?.entity ?? null;
+	return playerActors.get(id) ?? playerActors.get(Number(id)) ?? null;
+}
+
 // Cosmetic copies must not take the local player's ranged-weapon extension
 // (Projectile.init keys off the *local* player's weaponRanged + def.metaType).
 // Spawn from a shallow clone with metaType forced to NONE; cache per def so the
@@ -408,13 +438,49 @@ export function spawnRemoteProjectile(actor, p) {
 	// HitForce guard and the note on spawnRemoteProjectile).
 	spawningVisualCopy = true;
 	spawningVictimMirror = !!actor.enemy;
+	let proxy = null;
 	try {
-		visualDef(def).spawn(pos, dir, damager, p.group ?? null);
+		proxy = visualDef(def).spawn(pos, dir, damager, p.group ?? null);
 	}
 	finally {
 		spawningVisualCopy = false;
 		spawningVictimMirror = false;
 	}
+
+	applyRemoteAim(proxy, p);
+}
+
+// Point a mirrored shot where its owner was pointing it, so it curves the same way on this client
+// (see the recordAim note on the capture side for what carries this and why the engine needs it).
+//
+// The id the owner sent is a PLAYER, resolved here to the entity this client has for that player --
+// our own player when the id is ours (the usual case: only the victim's client has a reason to be
+// shown the shot, and both sides aim at whoever the enemy is attacking), a peer's ghost otherwise.
+// A peer's ghost works because the aim is only geometry: `initAim`/`adjustToTarget` read a position
+// and steer a direction, so a hit still resolves on this client's own world through the engine's
+// own hit path, exactly as it does for an unaimed mirror.
+//
+// Nothing is set when the owner did not state an aim, or when that player is not in this world yet:
+// the mirror then keeps the straight flight it had before this, which is the correct fallback (a
+// shot with no target does not curve on the owner's side either). Fail-soft throughout -- a pooled
+// proxy, a missing export or a target entity without a core all end in "no aim applied".
+function applyRemoteAim(proxy, p) {
+	if (!proxy || p?.target == null || typeof proxy.setTarget !== "function")
+		return;
+	const targetEnt = playerEntityOfId(p.target);
+	if (!targetEnt?.core)
+		return;
+	const TargetResult = terra.export.TargetResult ?? terra.file.target?.TargetResult;
+	const ENT_ALIGN = terra.export.ENT_ALIGN;
+	if (!TargetResult)
+		return;
+	const res = new TargetResult();
+	res.setEntity(targetEnt, ENT_ALIGN?.CENTER ?? 0);
+	if (res.isInvalid?.())
+		return;
+	const aim = Number.isFinite(p.aim) ? p.aim : 0;
+	try { proxy.setTarget(res, aim); }
+	catch (e) { /* a build where this proxy cannot be aimed: leave it flying straight */ }
 }
 
 // --- Local capture hooks -----------------------------------------------------
@@ -563,6 +629,29 @@ export function installFxSyncHooks() {
 							fx.t2off = this.target2.posOrOffset.v;
 						if (terra.export.TARGET_RES_TYPE && this.target2.type == terra.export.TARGET_RES_TYPE.ENT_REL_OFFSET)
 							fx.t2rel = true;
+					}
+					// ...and the entity the fx's OWN alignment resolves through, when that entity is a
+					// player: an aim/telegraph fx is authored as "on the shooter, aimed at whoever the
+					// shooter is following" (AIM_FX_POS.TARGETING shares the value of ENT_ALIGN.FOLLOWING --
+					// enemy-aim-fx.js:21-26 vs entity-types.js:13-15 -- and EntityTools.getAlignedPos routes
+					// that alignment through `entity.core.following.getTargetingPos`,
+					// engine/entity/entity.js:441-447). On this client the enemy follows the player it is
+					// attacking; on the peer the enemy is a driven puppet, whose following is whatever the
+					// drive left behind -- so the same fx, replayed with the same alignment, is placed from
+					// the wrong reference and lands nowhere the fight is. The old enemy-sync branch carried
+					// exactly this and set it at the far end (setFollowTarget in its `enemy_aim` handler);
+					// the id is what the peer needs to reproduce it, and it is one string.
+					//
+					// Read with getFollowEntity when the target is a TargetResult (the AimFx path) and with
+					// getEntity when it is a Target (the SPAWN_FX-step path); only a non-null answer that is
+					// NOT the enemy itself may travel, so every self-relative fx keeps its geometry.
+					const followEnt = typeof this.target?.getFollowEntity === "function"
+						? this.target.getFollowEntity()
+						: (typeof this.target?.getEntity === "function" ? this.target.getEntity() : null);
+					if (followEnt && followEnt !== attachedEnt) {
+						const followId = playerSyncIdOf(followEnt);
+						if (followId !== null)
+							fx.follow = followId;
 					}
 				}
 				// Infinite fx (e.g. status conditions use start(-1)) never end on their own, so a
@@ -892,6 +981,44 @@ export function installFxSyncHooks() {
 					return result;
 				};
 
+				// How a shot is AIMED, which the spawn above cannot see: every ranged attack points its
+				// proxy at something a moment after spawning it (ShootAct.spawn, acts/shoot-act.js:123-150
+				// -- `proxy.setFollowing(actor.following, aimType, ...)` when the shooter follows
+				// something, or `proxy.setTarget(res.setEntity(actor.getTarget(), CENTER), aimType)`),
+				// and that call is what makes the shot CURVE: initAim turns the aimType plus the target
+				// into `following.adjustSpeed`/`refCoords` (proxy-projectile.js:706-770) and `adjustToTarget`
+				// steers the projectile with it every frame (:771-870, driven from update() at :1496-1505).
+				// A mirror spawned without any of this flies the straight line it was launched on: it
+				// shows the shot at the right place but with the wrong flight, and the flyUp aim fx a
+				// mortar shows is placed from that same reference.
+				//
+				// So the two calls are wrapped to write what they were told into the entry the spawn above
+				// queued, and the target travels as the id of the PLAYER it names -- the one thing the
+				// receiver can resolve, since it has a different entity for that player than we do.
+				// Everything the peer cannot use is left out: an aim the shooter did not state stays
+				// unset, and a target that is not a player (a destructible, another enemy) does not
+				// travel at all, which is a known limit rather than a wrong curve.
+				const recordAim = (proxy, targetRes, aimType) => {
+					const entry = proxy?.__ttProjEntry;
+					if (!entry)
+						return;
+					if (Number.isFinite(aimType))
+						entry.aim = aimType;
+					const targetId = playerSyncIdOf(targetRes?.entity);
+					if (targetId !== null)
+						entry.target = targetId;
+				};
+				let originalSetTarget = Projectile.prototype.setTarget;
+				Projectile.prototype.setTarget = function (targetRes, aimType, coll) {
+					recordAim(this, targetRes, aimType);
+					return originalSetTarget.apply(this, arguments);
+				};
+				let originalSetFollowing = Projectile.prototype.setFollowing;
+				Projectile.prototype.setFollowing = function (follow, aimType, coll) {
+					recordAim(this, follow?.target ?? null, aimType);
+					return originalSetFollowing.apply(this, arguments);
+				};
+
 				// One choke point for every proxy (weapon shots, HIT proxies, sub-proxies).
 				let originalSpawn = ProxyDef.prototype.spawn;
 				ProxyDef.prototype.spawn = function (pos, dir, damager, group) {
@@ -928,6 +1055,12 @@ export function installFxSyncHooks() {
 							};
 							if (enemyId !== null) {
 								entry.enemy = enemyId;
+								// The shot's OWN aim is not known yet: a projectile leaves this choke point
+								// before `ShootAct.spawn` aims it (shoot-act.js:123-150 calls setFollowing/
+								// setTarget AFTER the spawn), so the two wrappers below fill these in,
+								// writing back through this backlink. Only an ENEMY entry carries one: the
+								// player channel's payload is frozen and its mirrors never had an aim.
+								proxy.__ttProjEntry = entry;
 								enemyQueues.projectiles.push(entry);
 							}
 							else {
@@ -948,6 +1081,28 @@ export function installFxSyncHooks() {
 // --- Remote replay -----------------------------------------------------------
 // Spawn one synced fx on a peer actor from a descriptor sent by its owner. Shared by the
 // one-shot globalFx path, the persistent-fx reconcile below and the enemy frame's own effects.
+// Make a replayed enemy's aim resolve against the player its owner was aiming at, so an
+// alignment that reads "whoever this entity is following" lands where the owner drew it (see the
+// caller). Only ever called for a synced enemy fx whose owner named a player, so the player-path
+// replay -- and every self-relative enemy fx -- is untouched.
+//
+// Writes straight onto the entity's own `following` (the same object as `core.following`, see
+// TargetFollowing.setCore): the puppet runs no action and its physics are pinned, so nothing else
+// reads it, and this is what the old enemy-sync branch did at the far end of its aim relay
+// (setFollowTarget in its `enemy_aim` handler). Failure is silent: a missing export, an entity
+// without a following, or a target result that refuses the entity all end in no placement change.
+function pointFollowAt(actor, playerId) {
+	const TargetResult = terra.export.TargetResult ?? terra.file.target?.TargetResult;
+	const following = actor?.core?.following ?? actor?.actor?.following ?? null;
+	if (!TargetResult || !following?.target?.setEntity)
+		return;
+	const targetEnt = playerEntityOfId(playerId);
+	if (!targetEnt?.core)
+		return;
+	try { following.target.setEntity(targetEnt, terra.export.ENT_ALIGN?.CENTER ?? 0); }
+	catch (e) { /* nothing to place it against: leave the fx's own reference alone */ }
+}
+
 export function spawnRemoteFx(actor, fxState) {
 	if (!fxState?.effect)
 		return null;
@@ -955,6 +1110,15 @@ export function spawnRemoteFx(actor, fxState) {
 	const effect = terra.export.Effect.get(fxState.effect);
 	if (!effect)
 		return null;
+
+	// A synced enemy fx that is anchored to the player its shooter is aiming at (the aim/telegraph
+	// family, see the `follow` note in the capture hook) can only be placed if the entity it is
+	// attached to follows the same player here: the alignment resolves through
+	// `core.following.getTargetingPos` (engine/entity/entity.js:441-447), and on this client the
+	// enemy is a driven puppet whose following the owner never set. Done before the spawn, because
+	// the fx resolves its position as it starts.
+	if (fxState.enemy != null && fxState.follow != null)
+		pointFollowAt(actor, fxState.follow);
 
 	const align = clampAlignToFigure(actor, fxState.alignment);
 	const offset = fxState.offset

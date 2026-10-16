@@ -111,7 +111,16 @@
  *                                            own player; hitActStops is that act ending (a hit act
  *                                            with duration -1 repeats until its action ends, which
  *                                            nothing on the recipient would ever do). See the
- *                                            hit-act section in src/client/enemies.js. Every entry
+ *                                            hit-act section in src/client/enemies.js. The
+ *                                            projectile and enemy-fx entries also carry a little of
+ *                                            what the mirror cannot re-derive on its own: a
+ *                                            projectile names the player its shot was aimed at and
+ *                                            the shooter's aim type (`target`/`aim`), and an enemy
+ *                                            fx whose alignment resolves through its target's
+ *                                            following names that player (`follow`) -- all three are
+ *                                            ids/flags, never geometry, and are what let a mirrored
+ *                                            shot curve and a mirrored telegraph land where the
+ *                                            owner drew it (src/client/fx-sync.js). Every entry
  *                                            of every batch
  *                                            names the enemy it
  *                                            belongs to in an `enemy` field: the id of a `list` entry
