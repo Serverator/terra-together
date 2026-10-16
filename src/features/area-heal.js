@@ -2,17 +2,16 @@
  * src/features/area-heal.js
  * Drinking an estus flask also heals every player within `radius` (host-controlled).
  * Responsibilities:
- *   - Detect the local flask use (PlayerCuisine.useItem) and wait for the user's own
- *     heal to finish before broadcasting.
+ *   - Detect the local flask use (PlayerCuisine.useItem) and broadcast that flask's share in
+ *     the same frame it is drunk.
  *   - Allow a full-HP flask use when a nearby ally needs it (isHotFullyHealed shadow).
  *   - Split what the flask heals between the hurt players in range (see hurtPeersInRange).
  *   - Apply the local player's share, reviving a downed self first.
  * Public surface: AreaHealer
  * Engine touchpoints: terra.export.PlayerCuisine.useItem, PlayerCmp.handleItemUse,
- *   PLAYER_ITEM_DIR, g_player(.combat.params, .cuisine.estus), g_tick.real,
- *   g_system.loopPaused, g_playerHeal.playHealFx. Host callbacks are injected by
- *   client.js (send/isConnected/hasPeers/getLocalId/getPlayerActors/getPeerDowned/
- *   isSelfDowned/reviveLocal).
+ *   PLAYER_ITEM_DIR, g_player(.combat.params, .cuisine.estus), g_playerHeal.playHealFx.
+ *   Host callbacks are injected by client.js (send/isConnected/hasPeers/getLocalId/
+ *   getPlayerActors/getPeerDowned/isSelfDowned/reviveLocal).
  * Notes: Gated by window.terraTogether.estusShareEnabled, falling back to the
  *   "tt-estus-share" option. Recipients never spend their own charges. client.js owns
  *   the addon/loop wiring and forwards net messages to onMessage/onPreUpdate.
@@ -44,25 +43,30 @@ import { MSG } from "../net/protocol.js";
 //
 // Peers are visual-only actors with no combat component (see client.js createPlayerActor),
 // so we can't heal them locally: each client heals its OWN g_player. We detect the flask
-// use locally, wait for the user's own heal to finish (the flask's HoT ticking out), then
-// broadcast; recipients re-check the distance against the sender's tracked actor, so only
-// players still near the healer are affected. That actor sits at the ghost's
-// snapshot-interpolated position, which lags the healer's true one by about a network
-// update, so a peer right on the radius boundary can be included by the healer and
-// rejected by the receiver (both use CONFIG.radius, just measured from two sources).
+// use locally and broadcast inside that same call; recipients re-check the distance against
+// the sender's tracked actor, so only players still near the healer are affected. That actor
+// sits at the ghost's snapshot-interpolated position, which lags the healer's true one by
+// about a network update, so a peer right on the radius boundary can be included by the
+// healer and rejected by the receiver (both use CONFIG.radius, just measured from two
+// sources).
 //
-// The divisor is decided once, and that once is when the flask is DRUNK, not when the
-// message goes out: whoever is hurt and in range at the drink is counted and gets a share,
-// and the resulting `targets` map is snapshotted into the pending broadcast (see beginSend /
-// splitTargets). It matters because the two flush paths evaluate at very different times:
-// a full-HP drink has no HoT to wait for and broadcasts in the same frame as the drink,
-// while a hurt drink waits for the drinker's own heal-over-time to tick out (up to
-// CONFIG.maxWait). Deciding the split at *send* time therefore made the deferred path
-// announce a different, later view of the world than the immediate one — up to 8s late, by
-// which point a peer who has walked out of the 4-unit radius, been topped up by something
-// else, or whose actor is not yet visible empties the list and the flask silently healed
-// nobody, with no retry (`pending` is already cleared). One decision, taken when the player
-// drinks, is the world state they could actually see.
+// The broadcast used to be held back until the drinker's own heal-over-time had ticked out,
+// as a proxy for "the flask really fired". That hold is gone, and nothing needs it: a spent
+// charge plus useItem() returning true is that evidence, read at the drink itself — and a
+// drink at full HP, allowed when a nearby ally needs it, starts no HoT at all. The HoT's
+// length is not a readiness signal either: the engine compresses it to
+// `duration * healed / amount` (combat-params.js:255), so holding on it delayed the peer by
+// anything from a frame (no HoT) to the 8s cap that used to live in CONFIG — ~3.4s for a
+// drinker 19% down against a 360 flask. The later the message, the staler the healer actor
+// the receiver measures its range gate against, so the wait could only cost accuracy.
+//
+// The divisor is decided once, and that once is when the flask is DRUNK: whoever is hurt and
+// in range at the drink is counted and gets a share, and the resulting `targets` map is the
+// one that goes out (see beginSend / splitTargets). Re-deriving it at send time would let a
+// peer who had walked out of the 4-unit radius, been topped up by something else, or whose
+// actor is not yet visible empty the list and silently turn the flask into a local-only
+// heal. One decision, taken when the player drinks, is the world state they could actually
+// see.
 //
 // "Hurt" is a downed peer or one below full HP, and it is read from the peer's current HP
 // rather than from the in-flight-heals preview — see hurtPeersInRange for why that matters.
@@ -77,16 +81,10 @@ import { MSG } from "../net/protocol.js";
 export { AreaHealer };
 
 const PLAYER_ITEM_DIR = terra.export.PLAYER_ITEM_DIR;
-// Frame delta is clamped so a hitch (or an unpause) can't fast-forward the timer.
-const MAX_DT = 0.1;
-
 // Tunables, also exposed at runtime as window.terraTogether.areaHealConfig.
 const CONFIG = {
 	radius: 4.0,      // world units (XY): heal range. Slightly more than revive's 3.0, so a
 	                  // flask can still pick up a downed peer who is just outside revive range.
-	// Safety cap on how long we wait for the local heal to complete before sending.
-	// The flask's HoT is at most a few seconds; this only catches abnormal states.
-	maxWait: 8,
 };
 
 // Host-controlled (Options > Multiplayer > Estus Heals Allies). Default OFF. Prefers the
@@ -95,15 +93,6 @@ function enabled() {
 	if (window.terraTogether?.estusShareEnabled === true)
 		return true;
 	return terra.export.g_options?.get?.("tt-estus-share") === true;
-}
-
-// Real-time frame delta (seconds), or 0 while the loop is paused. Uses g_tick.real so a
-// game slow-motion doesn't stretch the wait.
-function dt() {
-	if (terra.export.g_system?.loopPaused)
-		return 0;
-	const real = terra.export.g_tick?.real;
-	return typeof real === "number" && real > 0 ? Math.min(real, MAX_DT) : 1 / 60;
 }
 
 function dist2(a, b) {
@@ -117,11 +106,6 @@ class AreaHealer {
 	constructor(host) {
 		this.host = host;
 		this.installed = false;
-		// Pending outgoing broadcast while the user's own heal finishes: { params, hot, amount,
-		// duration, targets } — hot is the flask's HoT (or null when there is none) and
-		// targets is the split decided at drink time (or null when there was nobody to heal).
-		this.pending = null;
-		this.wait = 0;
 
 		window.terraTogether ??= {};
 		window.terraTogether.areaHealConfig = CONFIG;
@@ -173,8 +157,6 @@ class AreaHealer {
 				forced = true;
 			}
 
-			// Snapshot the HoT list so we can find the one the flask is about to start.
-			const hotsBefore = params?.hots ? params.hots.slice() : null;
 			let result;
 			try {
 				result = originalUseItem.call(this, dir);
@@ -184,9 +166,9 @@ class AreaHealer {
 					delete params.isHotFullyHealed;
 			}
 
-			// The flask was actually drunk (a charge went away); queue the broadcast.
+			// The flask was actually drunk (a charge went away); announce it there and then.
 			if (result === true && (estus?.charges ?? 0) < beforeCharges)
-				self.beginSend(params, hotsBefore);
+				self.beginSend();
 
 			return result;
 		};
@@ -221,33 +203,18 @@ class AreaHealer {
 		}
 	}
 
+	// client.js calls all three unconditionally (client.js:101, 110, 130). The broadcast is
+	// decided by beginSend and sent inside the drink's own frame, so there is no pending heal
+	// to advance each frame and no per-drink state left for a map load or a reconnect to
+	// clear. They stay declared because the wiring calls them.
+
 	onPreUpdate() {
-		if (!this.installed || !this.pending)
-			return;
-		const step = dt();
-		if (step <= 0)
-			return;
-		const { params, hot } = this.pending;
-		this.wait += step;
-		// The HoT is erased from params.hots when it ticks out (updateHOTs, started at
-		// combat-params.js:385; the erase is at :392).
-		const finished = (hot && params?.hots && params.hots.indexOf(hot) === -1)
-			|| this.wait >= CONFIG.maxWait;
-		if (finished)
-			this.flush();
 	}
 
 	onGameMapLoad() {
-		this.reset();
 	}
 
 	onConnectionReset() {
-		this.reset();
-	}
-
-	reset() {
-		this.pending = null;
-		this.wait = 0;
 	}
 
 	// ---- outgoing -----------------------------------------------------------
@@ -298,9 +265,10 @@ class AreaHealer {
 	// The drinker's split of one flask: { playerId: share } over the hurt peers in range, or
 	// null when that list is empty (divide by nobody) or the share is not a usable number.
 	//
-	// Called ONCE, at drink time, from beginSend: the result rides in `pending` until the
-	// broadcast goes out. The drinker is not in the divisor — the engine already applied their
-	// own full self-heal inside useItem — and a single hurt peer gets the whole flask.
+	// Called ONCE, at drink time, from beginSend, and sent with that same call: the number on
+	// the wire is the one derived from the peers the drinker could see when they drank. The
+	// drinker is not in the divisor — the engine already applied their own full self-heal
+	// inside useItem — and a single hurt peer gets the whole flask.
 	splitTargets(amount) {
 		const hurt = this.hurtPeersInRange();
 		const n = hurt.length;
@@ -321,51 +289,32 @@ class AreaHealer {
 		return targets;
 	}
 
-	beginSend(params, hotsBefore) {
+	beginSend() {
 		if (!enabled())
 			return;
 		const estus = terra.export.g_player?.cuisine?.estus;
 		if (!estus)
 			return;
-		// Two flasks in quick succession: flush the previous heal before replacing it.
-		if (this.pending)
-			this.flush();
 		// The heal the user's flask produces: amount (absolute HP, the total to be shared) and
 		// HoT duration. Both are plain fields read once here, at drink time: EstusFlask.use()
 		// only spends a charge (player-flask.js:74) and applyDish() — the only other writer —
-		// only runs when a dish is cooked or eaten. Snapshotted, never re-read at flush time.
+		// only runs when a dish is cooked or eaten.
 		const amount = estus.amount;
 		const duration = estus.duration;
-		// Decide the split here and carry it: see the note at the top of this file for why it
-		// must not be re-derived later.
+		// Decide the split here and send it with this call. There is deliberately nothing to
+		// wait for: see the note at the top of this file on the removed heal-over-time hold.
 		const targets = this.splitTargets(amount);
-		// Wait for the flask's own heal to complete; if the user was already at full HP
-		// no HoT starts, so there's nothing to wait for and we send right away.
-		let hot = null;
-		if (params?.hots && hotsBefore) {
-			const before = new Set(hotsBefore);
-			hot = params.hots.find(h => !before.has(h)) ?? null;
-		}
-		this.pending = { params, hot, amount, duration, targets };
-		this.wait = 0;
-		this.debug("drink:", hot ? "waiting for own HoT" : "no HoT, sending now", "targets", targets);
-		if (!hot)
-			this.flush();
+		this.debug("drink:", "sending now", "targets", targets);
+		this.flush({ amount, duration, targets });
 	}
 
-	flush() {
-		const pending = this.pending;
-		this.pending = null;
-		this.wait = 0;
-		if (!pending)
-			return;
+	// Sends one flask's already-decided split. One flask, one broadcast: this runs once per
+	// successful drink (beginSend's only caller is the useItem wrapper).
+	flush({ amount, duration, targets }) {
 		if (!enabled() || !this.host.isConnected?.() || !this.host.hasPeers?.()) {
 			this.debug("flush dropped: not enabled/connected/peers");
 			return;
 		}
-		// The split taken at drink time (one full-HP flask use with nobody to heal stays
-		// local: splitTargets returned null then).
-		const { amount, duration, targets } = pending;
 		if (!targets) {
 			this.debug("flush dropped: nobody hurt in range at drink time, amount", amount);
 			return;
