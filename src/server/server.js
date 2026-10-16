@@ -7,11 +7,17 @@
  *   - Push host-authoritative settings (revive, estus-share) on change.
  *   - Relay update/scene_changed/join_map/revive/revive_progress/area_heal to other clients, and
  *     enemy_state to other clients once its entries are checked against the arbiter, and
- *     enemy_handoff, enemy_despawn, enemy_respawn and enemy_hit to other clients with the
- *     sender's id stamped on them.
+ *     enemy_handoff, enemy_despawn, enemy_respawn, enemy_hit and enemy_wake to other clients with
+ *     the sender's id stamped on them.
  *   - Arbitrate enemy-sync ownership (which client simulates which map-placed enemy) and
  *     publish it, re-arbitrating when a room's membership changes or, on a timer, when a
- *     different player has become the nearest one to an enemy (Phase 7 proximity).
+ *     different player has become the nearest one to an enemy (Phase 7 proximity). The timer's
+ *     cadence, and the holds/margins/radii the arbiter applies, come from
+ *     src/config/aggro-tuning.js -- the shared, editable knob file for both halves of the mod.
+ *   - Feed the arbiter the aggro rebuild's three extra facts, all cached from traffic it already
+ *     relays: whether an enemy is mid-action (the idle gate), whether it is in a fight (the
+ *     engagement radius) and which client most recently attacked it (an attack claim, recorded
+ *     from the enemy_hit frames it forwards).
  * Public surface: startServer, stopServer, send, broadcast, isHosting, getHostPort, setHostSetting
  * Engine touchpoints: window.addEventListener('beforeunload') (stops the server on reload);
  *   crypto.randomUUID() from the ambient global (the NW.js page, not terra.*); no direct
@@ -21,7 +27,7 @@
  *     setHostSetting() de-dupes on value to avoid echoing its own push back out.
  *   - Wire message types live in src/net/protocol.js (MSG.*) as the single source of truth;
  *     every inbound type is matched through MSG.*, so an unknown type falls to the default
- *     branch and is dropped. The direction table for all 20 types is documented there.
+ *     branch and is dropped. The direction table for all 21 types is documented there.
  *   - Enemy-sync ownership is arbitrated here, never simulated: the server is a single
  *     process, so its assignment is the consensus (see src/server/enemy-ownership.js). A
  *     client registers the map-placed enemies it can see and the server answers with the
@@ -55,7 +61,11 @@
  *     (see the MSG.ENEMY_RESPAWN case). enemy_hit is relayed on that same coop trust for the same
  *     shape of reason: any client may hit any enemy, so there is no ownership claim in it to
  *     validate -- the sender is never the owner of the enemies in the frame (see the
- *     MSG.ENEMY_HIT case).
+ *     MSG.ENEMY_HIT case). enemy_wake rides that same coop trust for the mirror image of the
+ *     enemy_respawn reason: it is about a GROUP of enemies waking together, not about who owns any
+ *     one of them, so there is nothing for the arbiter to authorise, and the recipient is what
+ *     makes it safe -- it wakes only enemies it holds itself, and idempotently (see the
+ *     MSG.ENEMY_WAKE case).
  *   - Ordering: each send is one synchronous socket.write, so per-connection order is
  *     preserved, but there is no rate limiting, batching or backpressure -- inbound
  *     traffic is paced by the clients' own tick (see src/client/snapshot.js).
@@ -66,6 +76,7 @@ export { startServer, stopServer, send, broadcast, isHosting, getHostPort, setHo
 import { WebSocketServer } from "../net/ws.js";
 import { MSG } from "../net/protocol.js";
 import { EnemyOwnership } from "./enemy-ownership.js";
+import { AGGRO_TUNING } from "../config/aggro-tuning.js";
 
 let server = null;
 let hostPort = 17005;
@@ -113,6 +124,27 @@ const enemyOwnership = new EnemyOwnership();
 // despawn or the withdrawal that ends it, and the whole map is emptied when the server stops.
 const enemyPositions = new Map();
 
+// The other per-enemy facts the ownership pass needs, cached from the SAME owner-validated
+// enemy_state entries as the positions above and cleared on exactly the same paths (see
+// forgetEnemyFacts): `enemyBusy` holds the ids whose owner reports the enemy mid-action (its own
+// actor.isActionRunning -- the idle gate, so a switch never cuts a swing in half), and
+// `enemyAggro` the ids the owner reports as aggressive (in a fight -- the input the engagement
+// radius gates a distance-driven switch on). Both are SETS, membership refreshed on every frame
+// an owner reports, so they cannot go stale while an owner is streaming; a missing id means
+// "not known", which every reader treats as `false` (fail-open -- an enemy is moved rather than
+// frozen when nobody says otherwise).
+const enemyBusy = new Set();
+const enemyAggro = new Set();
+
+// Attack claims: enemy id -> { playerId, at }. Recorded when the server relays an enemy_hit
+// frame (the sender has, by construction, just attacked an enemy it does not simulate) and read
+// by the proximity pass, which hands such an enemy to the player attacking it. The claimant is
+// the SENDING SOCKET, the one identity the server can vouch for; the payload's own `attacker` is
+// the same value from an honest client but is only its word. Bounded like the caches above: an
+// entry leaves when the enemy is despawned/withdrawn, on a rest (a world reset), and when the
+// server stops. Ages out on its own too (AGGRO_TUNING.claimTtlMs, read by the arbiter).
+const enemyClaims = new Map();
+
 // A player's last known position, as the { x, y, z } the proximity pass reads. Missing (undefined)
 // while we have not heard from that player yet, which reads as UNMEASURABLE there -- never as
 // "far away". A malformed or non-finite vector is dropped for the same reason.
@@ -127,31 +159,56 @@ function playerPosition(playerId) {
 	return { x, y, z };
 }
 
-// Record one relayed enemy_state entry's position. Only the fields the arbitration uses are kept
+// Record one relayed enemy_state entry's facts. Only the fields the arbitration uses are kept
 // (the vx/vy/vz, hp, anim of the frame are not this cache's business), and a malformed vector is
 // DROPPED rather than coerced: NaN would compare false against everything and quietly turn the
 // distance test into a no-op, and storing a partial vector would make an enemy look nearer or
-// further than it is.
-function cacheEnemyPosition(entry) {
+// further than it is. The two flags are refreshed unconditionally -- a `busy` that goes back to
+// false, or an enemy that leaves combat, has to be able to say so -- while the POSITION is only
+// ever overwritten by a good vector, so a bad frame leaves the last good position standing rather
+// than erasing it.
+function cacheEnemyFacts(entry) {
 	const x = entry.x;
 	const y = entry.y;
 	const z = entry.z;
-	if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z))
-		return;
-	enemyPositions.set(entry.id, { x, y, z });
+	if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z))
+		enemyPositions.set(entry.id, { x, y, z });
+	if (entry.busy === true)
+		enemyBusy.add(entry.id);
+	else
+		enemyBusy.delete(entry.id);
+	if (entry.aggro === true)
+		enemyAggro.add(entry.id);
+	else
+		enemyAggro.delete(entry.id);
 }
 
-// Forget the cached positions of the enemies named in `ids` (a despawn or a withdrawal). Called
-// with a list that may name enemies this server never had a position for, so it is safe on every
-// path. A wrong id is not an error: it simply removes nothing.
-function forgetEnemyPositions(ids) {
+// Forget everything cached about the enemies named in `ids` (a despawn or a withdrawal): their
+// position, their flags and their claim. Called with a list that may name enemies this server
+// never had anything for, so it is safe on every path. A wrong id is not an error: it simply
+// removes nothing.
+function forgetEnemyFacts(ids) {
 	if (!Array.isArray(ids))
 		return;
 	for (const entry of ids) {
 		const id = entry && typeof entry === "object" ? entry.id : entry;
-		if (typeof id === "string")
-			enemyPositions.delete(id);
+		if (typeof id !== "string")
+			continue;
+		enemyPositions.delete(id);
+		enemyBusy.delete(id);
+		enemyAggro.delete(id);
+		enemyClaims.delete(id);
 	}
+}
+
+// Drop EVERY cached enemy fact (position, flags, claims). Used by the rest reset, which is a
+// world-wide event: resting puts every enemy on every map back, so nothing cached about where an
+// enemy was, whether it was mid-swing, or who had claimed it survives it.
+function forgetAllEnemyFacts() {
+	enemyPositions.clear();
+	enemyBusy.clear();
+	enemyAggro.clear();
+	enemyClaims.clear();
 }
 
 // Room key for a map + rogue variant; variant is null outside rogue. The clients match peers
@@ -181,12 +238,16 @@ function shortId(id) {
 	return id === null || id === undefined ? String(id) : String(id).slice(0, 8);
 }
 
-// The room a client's cached STATE puts it in. Null when we cannot tell: no cached state yet, a
-// state that names no map, or a MENU scene -- the engine is paused there, so that client is not
-// simulating anything and must not be picked to own an enemy. This is only the fallback for a
-// client the server has not heard a room report from yet (see roomOf).
+// The room a client's cached STATE puts it in. Null when we cannot tell: no cached state yet, or
+// a state that names no map. A MENU scene is deliberately NOT nulled here, though it used to be:
+// MENU is the in-game pause menu, where the character is still standing in the world, so a merely
+// paused client keeps its room -- and its enemies. Nulling it was what made a paused player's
+// enemies migrate away and the peer's copies go calm (Sam: "walks away on pause"). A client that
+// really leaves the world stops appearing in this state (TITLE) or withdraws its enemies, and is
+// handled there. This is only the fallback for a client the server has not heard a room report
+// from yet (see roomOf), which is why the same rule has to hold in the SCENE_CHANGED case.
 function roomFromState(state) {
-	if (!state || state.scene === "MENU")
+	if (!state)
 		return null;
 	if (typeof state.map !== "string" || state.map.length === 0)
 		return null;
@@ -309,7 +370,7 @@ function reassignOwnedRooms(playerId, exceptRoom = null) {
 // so a pass that chased them would move owners -- each move a handoff, each handoff visible
 // mid-fight -- continuously. The arbiter is idempotent, so a tick that finds nothing to move
 // publishes nothing at all.
-const OWNERSHIP_TICK_MS = 1000;
+const OWNERSHIP_TICK_MS = AGGRO_TUNING.ownershipTickMs;
 let ownershipTimer = null;
 
 // Everything the proximity pass needs to know about where a player or an enemy is, as one map
@@ -330,10 +391,11 @@ function positionsSnapshot() {
 	return positions;
 }
 
-// One proximity pass: who is in each room, where everyone and every enemy is, who is down, and
-// the clock. The arbiter returns exactly the assignments that moved, and those are all that is
-// published -- MSG.ENEMY_OWNER, same shape, same field-for-field epoch rule, so no client can
-// tell this phase happened from the wire.
+// One proximity pass: who is in each room, where everyone and every enemy is, who is down, which
+// enemies are mid-action (the idle gate) or in a fight (the engagement radius), who has claimed
+// what, and the clock. The arbiter returns exactly the assignments that moved, and those are all
+// that is published -- MSG.ENEMY_OWNER, same shape, same field-for-field epoch rule, so no client
+// can tell this phase happened from the wire.
 function ownershipTick() {
 	// One client cannot disagree with itself. With no peer there is nobody to hand an enemy to,
 	// so the pass could only ever keep the incumbent: skip it and pay nothing.
@@ -350,15 +412,32 @@ function ownershipTick() {
 	// an enemy's target follows its owner, so an enemy left on a downed owner stops fighting
 	// even after its owner is revived. Read from the same cached snapshot fields (downed) the
 	// rest of the server reads; a state from before anyone was down simply does not report one.
+	// A downed player is DEMOTED (the enemy moves to a live candidate) but the enemy keeps its
+	// in-combat state -- the aggro bit is the owner's, and the peer shows it (the client half).
 	const downed = new Set();
 	for (const [id, state] of playerData) {
 		if (state.downed)
 			downed.add(id);
 	}
 
-	const changed = enemyOwnership.onProximityTick(rosterByRoom, positionsSnapshot(), downed, Date.now());
-	if (changed.length > 0)
-		publishOwners(changed);
+	// The three aggro-rebuild inputs, all of them server-side caches of traffic already relayed:
+	// the idle gate, the engagement radius and the attack claims (see the caches above). Passed
+	// as the live collections -- the arbiter only reads them.
+	const changed = enemyOwnership.onProximityTick(rosterByRoom, positionsSnapshot(), downed, Date.now(), {
+		busy: enemyBusy,
+		inCombat: enemyAggro,
+		claims: enemyClaims,
+	});
+	if (changed.length === 0)
+		return;
+	// An enemy that has moved has served (or outlived) any claim naming it: drop the claim, so
+	// the next tick does not keep hearing a hit that has already had its effect. A claimant that
+	// is still attacking re-registers one on its next forwarded hit.
+	for (const assignment of changed)
+		enemyClaims.delete(assignment.id);
+	if (netDebugEnabled())
+		netDebug(`tick busy=${enemyBusy.size} combat=${enemyAggro.size} claims=[${[...enemyClaims.keys()].join(",")}] -> ${changed.length} moved`);
+	publishOwners(changed);
 }
 
 // Stop the cadence. Idempotent, and safe to call from every teardown path (stopServer, the
@@ -455,10 +534,18 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						if (playerData.has(playerId))
 							playerData.get(playerId).scene = msg.scene;
 						broadcast({ type: MSG.SCENE_CHANGED, id: playerId, scene: msg.scene }, socket);
-						// MENU takes this client out of every roster (roomOf excludes it), so the rooms it
-						// owned enemies in are re-arbitrated over the members that remain. The scenes that
-						// hide it while it stays in the world (LOADING/TITLE) deliberately do not.
-						if (msg.scene === "MENU")
+						// What this scene does to the client's ROOM. MENU (the in-game pause) now
+						// does nothing: a paused client keeps its room and its enemies, so the fight
+						// does not walk away from it -- and roomFromState no longer nulls a MENU
+						// state either, which the two must agree on because the one UPDATE a paused
+						// loop sends also carries scene MENU. TITLE is the one scene that does take a
+						// client out of its room: the character is unloaded there, so an enemy left on
+						// it would be simulated by nobody (and without this a pause followed by a quit
+						// to the title would keep ownership the client can no longer drive, which the
+						// old MENU eviction used to sweep up). LOADING stays a non-event, as it was:
+						// a map change re-reports the new room through JOIN_MAP, and evicting mid-load
+						// would churn the room's split for a client that is merely between maps.
+						if (msg.scene === "TITLE")
 							noteRoom(playerId, null);
 						// Whichever room it is in now is re-arbitrated as well: it takes over enemies whose
 						// owner is gone AND re-splits the room over the roster that now includes this client
@@ -568,7 +655,10 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// (not per message) is deliberate: a rebalance can move one enemy between friends,
 						// and the rest of the frame is still good. Wire shape (frozen): { owner, map,
 						// variant, list: [{ id, x, y, z, vx, vy, vz, fx, fy, anim, animTime, hp, state,
-						// action }] }.
+						// action, aggro, busy }] } -- `aggro` (in a fight) and `busy` (mid-action) are
+						// per-entry owner facts the server caches for the proximity pass and relays on
+						// untouched; both are additive to the frozen shape and absent means false, so an
+						// older sender costs nothing and only the ownership pass notices.
 						const list = Array.isArray(msg.list) ? msg.list : null;
 						const count = list === null ? 0 : list.length;
 						// `kept` stays null while every entry passes, so the common frame is relayed
@@ -582,12 +672,13 @@ function startServer(host = '0.0.0.0', port = 17005) {
 								passed++;
 								if (kept !== null)
 									kept.push(entry);
-								// Remember where this enemy is, for the proximity pass. Cached only for entries
-								// whose sender the arbiter just vouched for as the owner, which is what keeps a
-								// non-owner's claim out of the arbitration. Free: the frame is already in hand and
-								// this is one property read per entry, on a path this loop already walks (a
-								// malformed vector is dropped by the helper).
-								cacheEnemyPosition(entry);
+								// Remember this enemy's position and its two owner flags (busy/aggro), for the
+								// proximity pass. Cached only for entries whose sender the arbiter just vouched
+								// for as the owner, which is what keeps a non-owner's claim out of the
+								// arbitration. Free: the frame is already in hand and this is a couple of
+								// property reads per entry, on a path this loop already walks (a malformed
+								// vector is dropped by the helper).
+								cacheEnemyFacts(entry);
 							} else if (kept === null) {
 								kept = list.slice(0, i);
 							}
@@ -662,10 +753,11 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// The sender's own claim is never relayed -- the socket identity is the id the
 						// recipients gate and log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF cases.
 						msg.owner = playerId;
-						// This enemy's cached position goes with it: the owner has just killed it, so a
-						// later proximity pass must not reason about where the corpse was, and the map's
-						// enemy count (not the session's) is what bounds the cache.
-						forgetEnemyPositions(despawnList);
+						// Everything cached about these enemies goes with them: the owner has just killed
+						// them, so a later proximity pass must not reason about where the corpses were,
+						// hold a stale claim on one, or believe one is still busy. The map's enemy count
+						// (not the session's) is what bounds the caches.
+						forgetEnemyFacts(despawnList);
 						broadcast(msg, socket);
 						break;
 					}
@@ -676,9 +768,12 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// other client has to run the same reset or it is left simulating a map whose enemies
 						// are gone (src/client/enemies.js applyLocalRespawn). Relayed on the same coop trust as
 						// revive/area_heal: it describes a world event, not an enemy's ownership, so there is
-						// nothing for the arbiter to validate. Nothing is re-arbitrated here either -- the
-						// respawned enemies are re-registered by each client's normal registration diff, which
-						// is what re-splits their room. Wire shape (frozen): { from, map, variant }.
+						// nothing for the arbiter to validate. Broadcast is already EVERY connected client
+						// (not room-scoped), which is what Sam's "for every player on every map" reset needs;
+						// the client half is what must stop ignoring a reset for a map it is not on.
+						// Nothing is re-arbitrated here either -- the respawned enemies are re-registered by
+						// each client's normal registration diff, which is what re-splits their room.
+						// Wire shape (frozen): { from, map, variant }.
 						const respawnMap = typeof msg.map === "string" ? msg.map : "";
 						if (netDebugEnabled())
 							netDebug(`in enemy_respawn from=${shortId(playerId)} map=${respawnMap || "(none)"} variant=${msg.variant ?? null}`);
@@ -688,6 +783,15 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// The sender's own claim is never relayed -- the socket identity is the id the
 						// recipients log on, exactly as in the ENEMY_STATE / ENEMY_HANDOFF / ENEMY_DESPAWN cases.
 						msg.from = playerId;
+						// A rest is a FULL RESET, so every cached enemy fact dies with it: positions,
+						// the busy/aggro flags and the attack claims are all about enemies that this
+						// event has just put back on their spawn spots. Keeping them would let a stale
+						// claim re-home a fresh enemy and a stale `busy` pin an enemy nobody is
+						// swinging at. Cleared GLOBALLY, not just for the rester's map: the reset is
+						// world-wide by design (Sam: "for every player on every map it should
+						// completely respawn and reset all enemies"), so a fact cached for any other
+						// map is just as stale.
+						forgetAllEnemyFacts();
 						broadcast(msg, socket);
 						break;
 					}
@@ -716,6 +820,22 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// recipients attribute the hit to, exactly as in the ENEMY_STATE / ENEMY_HANDOFF /
 						// ENEMY_DESPAWN cases.
 						msg.owner = playerId;
+						// ...and this frame is where an ATTACK CLAIM is recorded (the aggro rebuild): the
+						// sender has just hit an enemy it does NOT simulate -- that is what enemy_hit means,
+						// a suppressed local hit -- so it is asking, in effect, for that enemy to come and
+						// fight it, which is Sam's "I can pummel all the enemies of another player and they
+						// will not aggro on me". Keyed by the SOCKET identity, the one the server can vouch
+						// for (an entry's own `attacker` is the same value from an honest client, but it is
+						// only its word). The claim REGISTERS instantly and the SWITCH lands at the next
+						// proximity tick, where the arbiter applies it to a claimant that is an eligible
+						// candidate and an enemy that is not busy (src/server/enemy-ownership.js).
+						const claimAt = Date.now();
+						for (const entry of hitList) {
+							if (entry && typeof entry.id === "string" && entry.id.length > 0)
+								enemyClaims.set(entry.id, { playerId, at: claimAt });
+						}
+						if (netDebugEnabled())
+							netDebug(`claim [${hitList.map((entry) => entry?.id ?? "?").join(", ")}] by ${shortId(playerId)}`);
 						broadcast(msg, socket);
 						break;
 					}
@@ -728,14 +848,39 @@ function startServer(host = '0.0.0.0', port = 17005) {
 						// reassigned -- a removal never moves load around.
 						const dropped = enemyOwnership.unregister(msg.ids, playerId);
 						// The enemy is no longer anywhere on this client's screen (it died there, or its
-						// map unloaded), so its cached position is stale for the proximity pass whether or
-						// not the record survives this withdrawal. Dropping it bounds the cache to the
-						// enemies that are live RIGHT NOW, and costs nothing: the surviving owner is
-						// publishing on the same frame that re-fills it.
-						forgetEnemyPositions(msg.ids);
+						// map unloaded), so everything cached about it is stale for the proximity pass
+						// whether or not the record survives this withdrawal: its position, its busy/aggro
+						// flags and any claim on it. Dropping them bounds the caches to the enemies that are
+						// live RIGHT NOW, and costs nothing: a surviving owner re-fills the position and the
+						// flags on the same frame.
+						forgetEnemyFacts(msg.ids);
 						if (netDebugEnabled())
 							netDebug(`in enemy_unregister [${(msg.ids ?? []).join(", ")}] from=${shortId(playerId)} -> ${dropped} record(s) dropped, ${(msg.ids ?? []).length - dropped} still held elsewhere`);
 						break;
+
+					case MSG.ENEMY_WAKE: {
+						// "Wake these enemies" from an owner whose own client just stirred a group: the
+						// engine's group aggro (CombatManager.aggroNearbyEnemy, combat.js:226-271) wakes
+						// only the members the SIMULATING client owns, so the rest of a group -- the ones
+						// the peer owns -- would stay calm. The client that saw the aggro lists the group
+						// members that need waking (it has the group and radius data; the server does not,
+						// and deliberately does not compute groups); the server relays the ids verbatim,
+						// exactly like the other enemy relays: `from` stamped to the SENDER'S SOCKET, the
+						// sender excluded (it already woke its own). No arbiter check -- the recipient
+						// wakes only enemies it holds itself, and idempotently, so a wrong or stale id is
+						// a no-op there rather than anything this side has to authorise. Wire shape:
+						// { from, ids: [<enemy id>] }.
+						const wakeIds = Array.isArray(msg.ids) ? msg.ids : null;
+						if (netDebugEnabled())
+							netDebug(`in enemy_wake from=${shortId(playerId)} ids=${wakeIds === null ? 0 : wakeIds.length}`);
+						// Nothing to wake: no frame, in particular no empty one (the same rule as the
+						// handoff/despawn/hit cases above).
+						if (wakeIds === null || wakeIds.length === 0)
+							break;
+						msg.from = playerId;
+						broadcast(msg, socket);
+						break;
+					}
 
 					default:
 						// Unknown type, or one of the six server->client-only types a client has no
@@ -834,10 +979,10 @@ function stopServer() {
 	playerData.clear();
 	playerNames.clear();
 	playerRooms.clear();
-	// The enemy positions go with the session they were gathered in: they are keyed by enemy
-	// id, which the next session's clients re-announce from scratch, so a kept entry could only
-	// mislead the next session's first ticks.
-	enemyPositions.clear();
+	// The enemy facts and claims go with the session they were gathered in: they are keyed by
+	// enemy id, which the next session's clients re-announce from scratch, so a kept entry could
+	// only mislead the next session's first ticks.
+	forgetAllEnemyFacts();
 	server.close();
 	server = null;
 }

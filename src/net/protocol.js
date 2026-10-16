@@ -96,7 +96,7 @@
  *                                            cache only, with no effect on the frozen payload below.
  *                                            Payload: { owner, map, variant,
  *                                            list: [ { id, x, y, z, vx, vy, vz, fx, fy, anim,
- *                                            animTime, hp, state, action } ], plus whichever of
+ *                                            animTime, hp, state, action, aggro, busy } ], plus whichever of
  *                                            globalFx, fxStops, persistentFx, sounds, soundStops,
  *                                            projectiles, hitNumbers, hitActs and hitActStops this
  *                                            frame has }. Six of
@@ -147,7 +147,16 @@
  *                                            :57-74), so it travels as a globalFx entry, is re-sent
  *                                            in persistentFx while it is up (a peer entering the room
  *                                            mid-telegraph still sees it) and is torn down by its
- *                                            fxStops entry. Client case: MSG.ENEMY_STATE.
+ *                                            fxStops entry. `aggro` (the enemy is in a fight) and
+ *                                            `busy` (its owner's actor is mid-action) are per-entry
+ *                                            OWNER facts, absent-means-false: the recipient uses
+ *                                            `aggro` for the puppet's HP bar, and the SERVER caches
+ *                                            both from the frames it relays -- `busy` is the idle gate
+ *                                            that stops ownership moving out from under a swing, and
+ *                                            `aggro` gates a fought enemy's switch to a player inside
+ *                                            the engagement radius (src/server/enemy-ownership.js).
+ *                                            A sender that omits them costs nothing but those two
+ *                                            refinements. Client case: MSG.ENEMY_STATE.
  *   MSG.ENEMY_HANDOFF     "enemy_handoff"    client -> server -> other clients, ONE-SHOT, from the
  *                                            client that has just LOST an enemy (it reads that from
  *                                            the same enemy_owner broadcast the new owner reads):
@@ -235,14 +244,35 @@
  *                                            the owner resolves them against its own copy of the
  *                                            defender. Client case:
  *                                            MSG.ENEMY_HIT.
+ *   MSG.ENEMY_WAKE        "enemy_wake"       client -> server -> other clients, batched, from a client
+ *                                            whose own simulation has just aggroed an enemy: the ids of
+ *                                            the GROUP members that need waking, so the peers wake
+ *                                            THEIRS of the same group. "Aggro" is a group event in the
+ *                                            engine -- CombatManager.aggroNearbyEnemy (combat.js:226-271)
+ *                                            walks the enemy's entity groups and an 8-unit recursive
+ *                                            physics chain -- but it runs on the SIMULATING client only,
+ *                                            so the members that client does not own stay calm when a
+ *                                            peer's enemy wakes its neighbours. This message closes that
+ *                                            gap: the owner's client decides WHICH ids to list (it has
+ *                                            the group and radius data; the server deliberately does not
+ *                                            compute groups) and the server just relays them. The
+ *                                            recipient wakes each id it holds itself, idempotently, and
+ *                                            ignores the rest, so a stale id is a no-op rather than
+ *                                            anything the server has to authorise. Stamp-then-relay like
+ *                                            ENEMY_RESPAWN (the server rewrites `from` to the sender's
+ *                                            socket id) and, like it, NOT entry-validated: it is about a
+ *                                            group waking, not about who owns any one enemy. An empty
+ *                                            list is dropped, like every other batched relay here.
+ *                                            Payload: { from, ids: [<stable enemy ids>] }. Client case:
+ *                                            MSG.ENEMY_WAKE.
  *
- * The server's inbound switch has 14 cases: the 10 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
+ * The server's inbound switch has 15 cases: the 12 relayed types (UPDATE, SCENE_CHANGED, JOIN_MAP,
  * REVIVE, REVIVE_PROGRESS, AREA_HEAL forwarded verbatim; ENEMY_STATE forwarded entry-validated;
  * ENEMY_HANDOFF, ENEMY_DESPAWN and ENEMY_HIT forwarded with `owner` stamped to the sender;
- * ENEMY_RESPAWN forwarded with `from` stamped to the sender), PROFILE --
+ * ENEMY_RESPAWN and ENEMY_WAKE forwarded with `from` stamped to the sender), PROFILE --
  * answered, not relayed -- and ENEMY_REGISTER / ENEMY_UNREGISTER, which are not relayed but
  * answered with ENEMY_OWNER. The
- * client's dispatch has 17: every type except PROFILE,
+ * client's dispatch has 18: every type except PROFILE,
  * ENEMY_REGISTER and ENEMY_UNREGISTER. The six server-only types (WELCOME, HOST_SETTING,
  * PLAYER_PROFILE, PLAYER_JOINED, PLAYER_LEFT, ENEMY_OWNER) are never accepted from a client -- a
  * client that sends one hits the server's default branch and is dropped, because they describe state
@@ -250,6 +280,6 @@
  * enemy ownership it arbitrates).
  */
 
-export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff", ENEMY_DESPAWN:"enemy_despawn", ENEMY_RESPAWN:"enemy_respawn", ENEMY_HIT:"enemy_hit" };
+export const MSG = { UPDATE:"update", SCENE_CHANGED:"scene_changed", PROFILE:"profile", JOIN_MAP:"join_map", REVIVE:"revive", REVIVE_PROGRESS:"revive_progress", AREA_HEAL:"area_heal", WELCOME:"welcome", HOST_SETTING:"host_setting", PLAYER_PROFILE:"player_profile", PLAYER_JOINED:"player_joined", PLAYER_LEFT:"player_left", ENEMY_REGISTER:"enemy_register", ENEMY_UNREGISTER:"enemy_unregister", ENEMY_OWNER:"enemy_owner", ENEMY_STATE:"enemy_state", ENEMY_HANDOFF:"enemy_handoff", ENEMY_DESPAWN:"enemy_despawn", ENEMY_RESPAWN:"enemy_respawn", ENEMY_HIT:"enemy_hit", ENEMY_WAKE:"enemy_wake" };
 
 //# sourceURL=/mods/terra-together/net/protocol.js

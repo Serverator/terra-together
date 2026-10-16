@@ -73,6 +73,15 @@
  *     rebalance, which is what lets a tick that finds nothing to move stay silent -- positions
  *     change every frame, so a pass that reacted to them would churn the handoff machinery
  *     mid-fight.
+ *   - The aggro rebuild adds three more inputs to that pass, all of them optional so a caller
+ *     with none of them gets the Phase 7 behaviour: `busy` (a Set of enemy ids whose owner reports
+ *     them mid-action -- the idle gate: an enemy being swung at keeps its owner), `inCombat` (a
+ *     Set of enemy ids reported aggressive -- a fought enemy only takes a distance-driven switch
+ *     to a player within AGGRO_SHARE_RADIUS, the engagement radius) and `claims` (a Map from enemy
+ *     id to the player most recently reported hitting it, from the MSG.ENEMY_HIT frames the server
+ *     relays -- an attacked enemy goes to the player attacking it). Every number behind them, and
+ *     the three Phase 7 constants above, live in src/config/aggro-tuning.js, which is the shared,
+ *     editable source of truth for both halves of the mod; this module only reads it.
  * Wire: MSG.ENEMY_OWNER (server -> all clients) publishes the { id, owner, epoch } assignment
  *   this module returns. MSG.ENEMY_REGISTER / MSG.ENEMY_UNREGISTER (client -> server) drive
  *   register()/unregister(); all three live in src/net/protocol.js. validate() is also the gate
@@ -80,6 +89,8 @@
  */
 
 export { EnemyOwnership };
+
+import { AGGRO_TUNING } from "../config/aggro-tuning.js";
 
 // A player id is only usable as a candidate when it is a non-empty string. Anything else
 // (undefined from a half-populated roster, a number from a malformed payload) is DROPPED
@@ -137,9 +148,70 @@ function candidatePool(entry, members) {
 // exact tie is settled by load, not by float noise), while the margin keeps the PEACE (two players
 // fighting side by side are, to within the margin, equally good owners, so the assignment the deal
 // produced stands and neither pays a handoff for the other's jockeying).
-const OWNER_SWITCH_MARGIN = 5.0;
-const OWNER_MIN_HOLD_MS = 5000;
-const PROXIMITY_TIE_BAND = 1.0;
+const OWNER_SWITCH_MARGIN = AGGRO_TUNING.ownerSwitchMargin;
+const OWNER_MIN_HOLD_MS = AGGRO_TUNING.ownerMinHoldMs;
+const PROXIMITY_TIE_BAND = AGGRO_TUNING.proximityTieBand;
+
+// ─── aggro rebuild: engagement, the idle gate and attack claims ─────────────────────
+// The Phase 7 pass above chose the nearest eligible player and stopped there. Three more inputs
+// -- one about the fight, one about the owner, one about who is hitting the enemy -- refine that,
+// and all of them are facts the server already has (cached from the state frames it relays) or
+// sees (the hits it relays):
+//   - AGGRO_SHARE_RADIUS is the ENGAGEMENT radius. The engine hard-wires an enemy's target to its
+//     OWNER's local player (enemy-cmp.js:654) and drops a target that stays >20u away for 5s
+//     (:584-588, LOOSE_DURATION). Handing a FIGHTING enemy to a player who is not in that fight
+//     therefore does not just look wrong, it hands the enemy to the one player who would then
+//     lose aggro. So when an in-combat enemy has any candidate within this radius, a
+//     distance-driven switch may only choose among those engaged candidates; when nobody is
+//     engaged it does not move the enemy at all (there is nobody for it to fight). A claim is
+//     exempt -- a ranged attacker may claim from outside the radius, and must, or attacking at
+//     range could never win the enemy.
+//   - The IDLE GATE is the `busy` bit an enemy's owner reports with it (its own
+//     actor.isActionRunning()). An enemy mid-attack keeps its owner, whatever the distances or
+//     the claims say, so a switch never cuts a swing in half. A busy value that is missing or not
+//     true is read as NOT busy (fail-open): a client that does not send the field -- an older
+//     build, or one frame without it -- keeps the old behaviour instead of freezing ownership.
+//   - An ATTACK CLAIM is a forwarded hit (MSG.ENEMY_HIT) on an enemy, seen by the server as it
+//     relays the frame: its sender is, by construction, a client that just attacked an enemy it
+//     does NOT simulate -- exactly the case Sam wants changed ("I can pummel all the enemies of
+//     another player and they will not aggro on me"). The claim is recorded against the SENDING
+//     SOCKET, the one identity the server can vouch for (an honest client's own `attacker` field
+//     carries the same value, but it is the client's word), and it is applied at the next tick to
+//     a claimant that is an ELIGIBLE CANDIDATE: an enemy being hit goes to fight the player
+//     hitting it. ATTACK_CLAIM_HOLD_BYPASS lets that land without waiting out OWNER_MIN_HOLD_MS;
+//     CLAIM_MIN_HOLD_MS rate-limits the claim itself, so two players pummelling one enemy cannot
+//     flip it every tick; CLAIM_TTL_MS forgets a claim whose attacker has stopped.
+// Every number here lives in src/config/aggro-tuning.js, the shared, editable source of truth.
+// The idle gate applies to THIS pass only: onRosterChange is the convergence path (someone left,
+// joined or changed room) and must keep moving an enemy whose owner is gone, busy or not -- the
+// one thing worse than a cut swing is an enemy nobody simulates at all.
+const AGGRO_SHARE_RADIUS = AGGRO_TUNING.aggroShareRadius;
+const ATTACK_CLAIM_HOLD_BYPASS = AGGRO_TUNING.attackClaimHoldBypass;
+const CLAIM_MIN_HOLD_MS = AGGRO_TUNING.claimMinHoldMs;
+const CLAIM_TTL_MS = AGGRO_TUNING.claimTtlMs;
+
+// Shared read-only defaults, so a caller that supplies no busy/claim inputs pays no allocation
+// (see onProximityTick). Never written to.
+const NO_SET = new Set();
+const NO_CLAIMS = new Map();
+
+// The claimant of a LIVE claim on `enemyId`, or null when there is none: no claim, a malformed
+// one, or one older than CLAIM_TTL_MS. Ageing is the caller's clock; a caller with no usable
+// clock cannot age a claim out, so one is taken at face value then -- the same "no evidence is
+// not evidence" rule the hold uses (see stamp()).
+function liveClaim(claims, enemyId, now) {
+	const claim = claims.get(enemyId);
+	if (!claim || typeof claim !== "object")
+		return null;
+	const playerId = claim.playerId;
+	if (typeof playerId !== "string" || playerId.length === 0)
+		return null;
+	const at = claim.at;
+	if (typeof at === "number" && Number.isFinite(at) && typeof now === "number" && Number.isFinite(now)
+		&& now - at > CLAIM_TTL_MS)
+		return null;
+	return playerId;
+}
 
 // A caller's clock value when it is a usable one, else null. The entry's `ownerSince` is only
 // ever compared against another value from the same source (the server's Date.now()), so a
@@ -268,6 +340,12 @@ class EnemyOwnership {
 			// clocked caller", which the proximity pass reads as "no hold claimed" -- the
 			// alternative, treating it as an infinite hold, would freeze such an enemy for good.
 			ownerSince: null,
+			// When a CLAIM-driven move last reassigned this enemy, on the same clock (null =
+			// never). Only CLAIM_MIN_HOLD_MS reads it: it is the anti-ping-pong rate limit on
+			// attack claims (see the aggro-rebuild note above), kept separate from ownerSince so
+			// a distance move does not also make a claim wait -- and so a claim cannot be
+			// followed by another claim until it has held.
+			claimMovedAt: null,
 		};
 		this.enemies.set(enemyId, entry);
 		entry.owner = this.pickOwner(entry, memberIds);
@@ -404,16 +482,26 @@ class EnemyOwnership {
 		return [...out].sort();
 	}
 
-	// The proximity pass (Phase 7): re-home every enemy onto the nearest eligible player who can
-	// simulate it. Pure by construction -- positions, liveness and the clock go IN, the changed
-	// assignments come OUT, and nothing here touches a socket, a timer or the engine -- so the
-	// server owns the cadence and the broadcasting and this can be exercised directly.
+	// The proximity pass: re-home every enemy onto the nearest eligible player who can simulate
+	// it, unless the enemy is mid-attack or someone is attacking it. Pure by construction --
+	// positions, liveness, per-enemy facts, claims and the clock go IN, the changed assignments
+	// come OUT, and nothing here touches a socket, a timer or the engine -- so the server owns the
+	// cadence and the broadcasting and this can be exercised directly.
 	//
 	// `rosterByRoom` maps a room key to that room's member ids (the same roster onRosterChange
 	// takes), `positions` maps an ENEMY id and a PLAYER id to { x, y, z } (the server caches both
 	// from traffic it already relays), `downed` is the set of player ids that are down, and `now`
-	// is the caller's millisecond clock. Returns the changed assignments in enemy-id order, the
-	// same contract as onRosterChange, so the caller publishes exactly what moved.
+	// is the caller's millisecond clock. `inputs` is optional and carries the aggro rebuild's three
+	// extra facts, each absent/empty for a caller that has none (which reads as "no evidence", so
+	// every one of them degrades to the Phase 7 behaviour):
+	//   - `busy`: a Set of ENEMY ids whose owner reports the enemy mid-action. Those are not moved
+	//     by a claim or a distance switch (the idle gate).
+	//   - `inCombat`: a Set of ENEMY ids whose owner reports them aggressive (in a fight). Those
+	//     only take a distance-driven switch to a player within AGGRO_SHARE_RADIUS.
+	//   - `claims`: a Map from ENEMY id to { playerId, at } -- the client that most recently
+	//     reported hitting that enemy, and when. Applied to an eligible claimant (see below).
+	// Returns the changed assignments in enemy-id order, the same contract as onRosterChange, so
+	// the caller publishes exactly what moved.
 	//
 	// Per enemy, walking rooms then enemy ids in sorted order:
 	//   1. The candidate set is UNCHANGED from the roster deal's: registrants(enemy) ∩ roomMembers,
@@ -430,18 +518,36 @@ class EnemyOwnership {
 	//      the target keeps the enemy; so does an incumbent that is nearer than the target by less
 	//      than OWNER_SWITCH_MARGIN -- which is the normal case while two players fight side by
 	//      side, and the reason the split the roster deal made survives inside a fight.
-	//   4. A distance-driven move additionally needs both distances to be measurable and the
+	//      For an enemy reported IN COMBAT the target is instead drawn from the ENGAGED candidates
+	//      (within AGGRO_SHARE_RADIUS), so a fought enemy is never handed to a player outside the
+	//      fight; when nobody is engaged there is no distance target at all -- but the mandatory
+	//      moves below still have one (the nearest of any candidate), because an enemy that has
+	//      lost its owner has to land somewhere.
+	//   4. An ATTACK CLAIM wins over the distance target when there is one, it is fresh
+	//      (CLAIM_TTL_MS) and its claimant is a live candidate: the enemy goes to the player
+	//      hitting it. It needs no proximity (a ranged attacker claims from afar) and, while
+	//      ATTACK_CLAIM_HOLD_BYPASS is on, it does not wait out OWNER_MIN_HOLD_MS -- but it is
+	//      rate-limited by CLAIM_MIN_HOLD_MS so a contested enemy cannot change hands every tick.
+	//   5. A claim and a distance-driven move both additionally need the enemy NOT to be busy (the
+	//      idle gate), and a distance-driven move needs both distances measurable and the
 	//      per-enemy hold (OWNER_MIN_HOLD_MS) to have elapsed. A move for any other reason -- the
-	//      owner has left the candidate set, or is down -- is applied at once: those are not
-	//      distance questions, and waiting would leave the enemy undriven.
+	//      owner has left the candidate set, or is down -- is applied at once regardless of busy:
+	//      those are not distance questions, and waiting would leave the enemy undriven.
 	//
 	// Idempotent and deterministic, which is what makes a 1s cadence safe: the load counter is
 	// seeded from zero and the choice never reads the current owner, so re-running with unchanged
 	// inputs finds every owner already equal to its target -- no bump, no message. Sorted rooms,
 	// ids and members make the result independent of Map iteration order and of the order the
-	// caller collected the roster in, so two runs of the same state agree.
-	onProximityTick(rosterByRoom, positions, downed, now) {
-		const downedIds = downed instanceof Set ? downed : new Set();
+	// caller collected the roster in, so two runs of the same state agree. (The claim map is read,
+	// never written: the caller owns it, and a claim that has been applied stops mattering because
+	// its claimant is then the owner.)
+	onProximityTick(rosterByRoom, positions, downed, now, inputs = null) {
+		const downedIds = downed instanceof Set ? downed : NO_SET;
+		// Missing facts are defaults, never coercion: a `busy` that is not a Set, or an id absent
+		// from one, means "not known to be busy" -- the fail-open the idle gate wants.
+		const busy = inputs?.busy instanceof Set ? inputs.busy : NO_SET;
+		const inCombat = inputs?.inCombat instanceof Set ? inputs.inCombat : NO_SET;
+		const claims = inputs?.claims instanceof Map ? inputs.claims : NO_CLAIMS;
 		const at = stamp(now);
 		const changed = [];
 
@@ -474,22 +580,50 @@ class EnemyOwnership {
 					continue;
 				const live = pool.filter((id) => !downedIds.has(id));
 				const candidates = live.length > 0 ? live : pool;
-				const target = nearestCandidate(enemyId, candidates, positions, load);
+
+				// The nearest player of any kind: the landing place for a move that is not about
+				// distance (owner gone from the candidate set, owner downed).
+				const anywhere = nearestCandidate(enemyId, candidates, positions, load);
+				// ...and among the ENGAGED candidates only, when the enemy is in a fight. A null
+				// `engaged` means nobody is in that fight, which blocks a distance-driven move
+				// (see the AGGRO_SHARE_RADIUS note above) without blocking a mandatory one.
+				const fighting = inCombat.has(enemyId);
+				let engaged = null;
+				if (fighting) {
+					const near = candidates.filter((id) => enemyDistance(positions, enemyId, id) <= AGGRO_SHARE_RADIUS);
+					if (near.length > 0)
+						engaged = nearestCandidate(enemyId, near, positions, load);
+				}
+				const distanceTarget = fighting ? engaged : anywhere;
 
 				const ownerGone = entry.owner === null || !pool.includes(entry.owner);
 				const ownerDown = entry.owner !== null && downedIds.has(entry.owner) && live.length > 0;
+				// The idle gate: an enemy whose owner reports it mid-action keeps its owner.
+				const busyNow = busy.has(enemyId);
 
 				let next = entry.owner;
+				let claimMoved = false;
 				if (ownerGone || ownerDown) {
-					next = target.owner;
-				} else if (target.owner !== null && target.owner !== entry.owner) {
-					const ownerDistance = enemyDistance(positions, enemyId, entry.owner);
+					// Mandatory, and deliberately NOT gated on busy: refusing these would leave
+					// the enemy driven by nobody (its owner is out of the candidate set or down),
+					// which is strictly worse than interrupting a swing.
+					next = anywhere.owner;
+				} else if (!busyNow) {
+					const claimant = liveClaim(claims, enemyId, now);
+					const claimElapsed = entry.claimMovedAt === null || at === null ? Infinity : at - entry.claimMovedAt;
 					const holdElapsed = entry.ownerSince === null || at === null || (at - entry.ownerSince) >= OWNER_MIN_HOLD_MS;
-					// Both distances have to be real numbers: an unmeasured position is not evidence
-					// that the incumbent is remote, and must not be spent as if it were.
-					if (holdElapsed && Number.isFinite(ownerDistance) && Number.isFinite(target.distance)
-						&& ownerDistance - target.distance >= OWNER_SWITCH_MARGIN)
-						next = target.owner;
+					if (claimant !== null && claimant !== entry.owner && candidates.includes(claimant)
+						&& claimElapsed >= CLAIM_MIN_HOLD_MS && (ATTACK_CLAIM_HOLD_BYPASS || holdElapsed)) {
+						next = claimant;
+						claimMoved = true;
+					} else if (distanceTarget !== null && distanceTarget.owner !== null && distanceTarget.owner !== entry.owner) {
+						const ownerDistance = enemyDistance(positions, enemyId, entry.owner);
+						// Both distances have to be real numbers: an unmeasured position is not
+						// evidence that the incumbent is remote, and must not be spent as if it were.
+						if (holdElapsed && Number.isFinite(ownerDistance) && Number.isFinite(distanceTarget.distance)
+							&& ownerDistance - distanceTarget.distance >= OWNER_SWITCH_MARGIN)
+							next = distanceTarget.owner;
+					}
 				}
 
 				// The choice counts against the running load either way: a kept incumbent occupies
@@ -503,6 +637,10 @@ class EnemyOwnership {
 				changed.push({ id: enemyId, owner: next, previous: entry.owner, epoch: entry.epoch + 1 });
 				entry.owner = next;
 				entry.ownerSince = at;
+				// Only a claim-driven move restarts the claim's own rate limit; a distance move
+				// leaves it alone so it does not also delay an unrelated claim.
+				if (claimMoved)
+					entry.claimMovedAt = at;
 				entry.epoch++;
 			}
 		}
