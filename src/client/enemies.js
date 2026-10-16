@@ -74,7 +74,15 @@
  *     enemy back to local simulation therefore re-engages it through the engine (relinquishPuppet ->
  *     engageLocally, which restores the attack-frequency registration the puppet deliberately did
  *     not hold), and a takeover adopts the previous owner's fight along with its position
- *     (takeOwnership). A rest is the one event that ends every fight on the map.
+ *     (takeOwnership) -- through the hold too, when there is no state to adopt (relinquishHold).
+ *     A rest is the one event that ends every fight on the map.
+ *   - A PAUSE does not stop the sync (Sam: "pause breaks sync of enemies"): the engine's MENU /
+ *     COMMAND_MENU scenes gate the game loop but leave the world intact (scene-manager.js:398), so
+ *     both halves of the per-frame loop keep running through them -- a paused client keeps
+ *     publishing (its enemies stay puppets instead of being released as if the owner had gone) and
+ *     keeps applying (no snap and no hoarded one-shots on resume) -- while the two replays that would
+ *     resolve damage against the paused player's own world are held back (isPausedScene). See the
+ *     addon note below.
  *   - Group wake (the aggro rebuild), cross-client: aggro is a GROUP event in this engine
  *     (CombatManager.aggroNearbyEnemy, combat.js:226-271: the enemy's entity groups plus an 8-unit
  *     recursive chain), but that pass runs on the simulating client only, so a group split across
@@ -136,8 +144,10 @@
  *   isEngaged, engagedPlayers, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
- *   g_game.map.active.path / g_scene.isRunning / g_player (the local player's position, for the
- *   proximity half of engagement) / EnemyCmp (and, through it, each enemy's
+ *   g_game.map.active.path / g_scene (isRunning / isMenu / isCommandMenu / isWaypointMenu, the
+ *   scenes this module drives from — the two menus are the engine's pause, see the addon note — and
+ *   isCutscene / isLoading / isInit for the frames it must not read) / g_player (the local player's
+ *   position, for the proximity half of engagement) / EnemyCmp (and, through it, each enemy's
  *   sourceEntity.core, which is where identity comes from), plus — for the group wake —
  *   g_group.getEnemySpots (the engine's own EntityGroupManager, entity-group-model.js:116-131, on
  *   the same `spot.core.entityGroups` list aggroNearbyEnemy passes it) and ../config/aggro-tuning.js
@@ -437,8 +447,36 @@ function enemyOf(ent) {
 	return ent ? terra.export.EnemyCmp?.get?.(ent) : null;
 }
 
+// A scene this module drives enemies from. RUNNING is the world; MENU and COMMAND_MENU are the
+// engine's PAUSED scenes -- scene-manager.js:398 updatePause pauses the loop for exactly the menus
+// and leaves it running for RUNNING/LOADING/WAYPOINT -- and a pause must not stop the enemy half:
+// the world is still there, nothing about the entity list changes while the loop is paused, and
+// standing down for it is what made a paused client look GONE to its peer (it published nothing, so
+// after PEER_STATE_FRESH_MS the peer released its enemies into local simulation, where a kill is
+// unannounceable by design -- see markDying's isOwner gate -- and the paused client's own stream
+// then overwrote it on resume), left its own stored peer state unapplied (the puppet snap and the
+// accumulated one-shot burst of a long pause, see carryBatch) and let its engagement latch expire.
+// WAYPOINT is a menu the engine keeps the loop RUNNING for, so it is a world too. Everything else --
+// TITLE, INIT, LOADING and a teleport, i.e. the frames the entity list is being REBUILT on -- is not
+// a world this module may read: the diff's gone sweep would call the rebuild a mass despawn.
 function isWorldSceneActive() {
-	return !!terra.export.g_scene?.isRunning?.() && !terra.export.g_scene?.isCutscene?.();
+	const scene = terra.export.g_scene;
+	if (!scene || scene.isCutscene?.())
+		return false;
+	return !!(scene.isRunning?.() || scene.isMenu?.()
+		|| scene.isCommandMenu?.() || scene.isWaypointMenu?.());
+}
+
+// The engine's own PAUSE (the same two menus isWorldSceneActive accepts, for a different reason):
+// read once per frame, and only where a frame's work would resolve damage against the LOCAL player
+// (see onPreUpdate and applyEnemyEffects). A paused client keeps syncing state, effects and
+// ownership, but it does not start new attacks on itself -- it is not playing, so an attack it never
+// saw coming is an ambush, and the alternative is worse: g_combat's own act update is gated on the
+// same pause (combat.js:200 updateActs), so an act replayed into a paused world would sit there
+// unresolved and land on the frame the player came back.
+function isPausedScene() {
+	const scene = terra.export.g_scene;
+	return !!(scene?.isMenu?.() || scene?.isCommandMenu?.());
 }
 
 // Data path of the map in play, "" while no map is loaded. The same expression enemySpotId()
@@ -655,10 +693,28 @@ function removeDyingPuppets() {
 // OTHER release is an abandonment -- the enemy was killed, or is being torn down with the map or with
 // the sync -- where keeping a fight alive would be wrong, and those call releasePuppet directly.
 function relinquishPuppet(ent) {
-	const fighting = puppetInCombat(ent);
+	// Two ways an entity can be in a fight, and both have to survive the release: the owner's carried
+	// bit (puppetInCombat -- read BEFORE releasePuppet, whose undo drops the claim) and the entity's
+	// OWN flag, which is what an enemy being fought by this client's player, or one released from a
+	// hold before it was ever driven as a puppet, has to answer with. The second test can only ever ADD
+	// a fight to preserve: on a driven puppet the local flag IS the owner's carried bit (drivePuppet
+	// applies it, ./enemy-puppet.js applyPuppetAggro), so the two agree wherever both are known.
+	const fighting = puppetInCombat(ent) || ent?.enemy?.aggressive === true;
 	releasePuppet(ent);
 	if (fighting)
 		engageLocally(ent);
+}
+
+// End a hold on an entity we are about to simulate -- and hand the fight back with it. A hold is the
+// takeover with NO state to adopt (see takeOwnership), so it is exactly the case where the fight can
+// only come from the entity itself; releasePuppet alone drops the combat state while suppressing it,
+// which is how a handover came out of its hold with a blue HP bar and an enemy that no longer
+// attacked the player standing next to it.
+function relinquishHold(id) {
+	const hold = holding.get(id);
+	holding.delete(id);
+	if (hold)
+		relinquishPuppet(hold.ent);
 }
 
 // Put a locally simulated enemy into combat, through the engine's own entry point for it.
@@ -750,11 +806,13 @@ function syncEnemies() {
 		return null;
 	}
 	const map = activeMapPath();
-	// A map mid-transition / a paused world: the entity list is not the world it will be, and
-	// the map path an id is built from may not be the one the entities came from. Skip the
-	// frame instead of reporting on it, and keep the registry: the sweep below would read the
-	// transition as a mass despawn. Peer state and puppets are kept too — driving or releasing
-	// an entity out of a list that is being rebuilt is exactly the frame it must not happen on.
+	// No world to read: the map is mid-transition (the entity list is being rebuilt, and the map path
+	// an id is built from may not be the one the entities came from) or there is no world scene at all
+	// (see isWorldSceneActive). Skip the frame instead of reporting on it, and keep the registry: the
+	// sweep below would read the transition as a mass despawn. Peer state and puppets are kept too —
+	// driving or releasing an entity out of a list that is being rebuilt is exactly the frame it must
+	// not happen on. A PAUSE is deliberately NOT one of these frames any more: the world is intact
+	// there, so the enemy half keeps running through it (see isWorldSceneActive).
 	if (map === "" || !isWorldSceneActive())
 		return null;
 
@@ -1011,9 +1069,17 @@ function takePersistentEnemyFx(published) {
 function sendHandoffs(live) {
 	if (lostOwnership.size === 0)
 		return;
+	// A GATED frame (no world to read: a map transition, a cutscene) is not an answer -- it is the
+	// absence of one, and spending these ids on it would eat a loss the taker never got. On its side
+	// that is a takeover with no state to adopt: a handover that lands in the hold, or a spawn-point
+	// placeholder on a client that has just rebuilt the map. Hold them for the next readable frame
+	// (an id whose map is gone is dropped there by the `live` lookup below, so a map change cannot
+	// carry one across).
+	if (!live)
+		return;
 	const ids = [...lostOwnership];
 	lostOwnership.clear();                 // one-shot, whatever happens below
-	if (!live || !hasPeers())
+	if (!hasPeers())
 		return;                            // nothing to read / nobody to tell: do not hold it for later
 	const list = [];
 	for (const id of ids) {
@@ -1217,10 +1283,16 @@ function applyEnemyEffects(id, ent, entry) {
 	// The melee/splash half: run the act on OUR copy of the enemy (applyRemoteHitAct) and cancel
 	// the ones the owner has finished with (stopRemoteHitAct). Starts before stops, in the order
 	// the owner queued them, so an act that began and ended within one frame nets out to nothing.
-	for (const a of entry.hitActs ?? [])
-		applyRemoteHitAct(ent, a);
-	for (const s of entry.hitActStops ?? [])
-		stopRemoteHitAct(ent, s);
+	// Not while the game is paused: these are the acts that damage the LOCAL player (see
+	// isPausedScene). The batches are still CONSUMED here -- `applied` is set above either way -- so a
+	// long pause cannot hoard a fight's worth of them to replay on the frame the player comes back,
+	// and the owner's stop for an act we never started is a no-op on this side.
+	if (!isPausedScene()) {
+		for (const a of entry.hitActs ?? [])
+			applyRemoteHitAct(ent, a);
+		for (const s of entry.hitActStops ?? [])
+			stopRemoteHitAct(ent, s);
+	}
 }
 
 // The per-enemy home of what an owner's stream has put on OUR copy of an enemy: the fx it spawned
@@ -2278,7 +2350,10 @@ function applyPeerState(live) {
 		if (live.has(id) && isOwner(id))
 			continue;
 		holding.delete(id);
-		releasePuppet(hold.ent);
+		// Same rule as the hold's own expiry (relinquishHold): the enemy stays in the world under
+		// local simulation (nobody owns it now, or the new owner's stream takes it over next frame),
+		// so the fight goes with it instead of being dropped by the release.
+		relinquishPuppet(hold.ent);
 	}
 }
 
@@ -2369,8 +2444,10 @@ function takeOwnership(id, ent) {
 		return;
 	}
 	// Bounded: the wait is over, so simulate from wherever we are. Release first, so the entity can
-	// act on this very frame.
-	releaseHold(id);
+	// act on this very frame -- with its fight intact if it was in one (relinquishHold): a hold exists
+	// precisely because there was no state left to adopt, so the entity's own flag and the last bit its
+	// owner's stream applied are all there is to go on, and a handover is not a truce.
+	relinquishHold(id);
 	adopted.add(id);
 	if (debugEnabled())
 		debugLog(`takeover ${id}: hold expired without a handoff, simulating from the local state`);
@@ -4108,6 +4185,23 @@ enemyOwnership.ownedIdOf = (ent) => {
 // queue of hits this client could not apply (sendHitQueue) and the engagement pass
 // (updateEngagement). Phase 5b adds nothing to the loop: its peer half hangs off the death events
 // (despawnEnemyLocally), and its owner half is a prototype gate installed by onPreUpdate.
+//
+// BOTH halves keep running while the game is PAUSED (the engine's MENU / COMMAND_MENU, see
+// isWorldSceneActive), which is the one place this loop deliberately runs on a stopped world:
+//   * the owner half keeps publishing, so a paused client's enemies stay puppets on its peer. The
+//     alternative -- going silent for the pause -- is what made the peer treat a merely paused owner
+//     as a GONE one: after PEER_STATE_FRESH_MS it released those enemies into local simulation, and
+//     a kill made there is unannounceable by design (markDying is gated on isOwner), so the paused
+//     client's verdict -- its own copy still being alive -- won the moment it resumed (Sam: "player A
+//     kills an enemy and player B is paused, when player B unpauses they don't know that this enemy
+//     dies"). Publishing also keeps every timer that guards the split fresh, which is exactly what a
+//     pause must not be able to expire: the peer's stored state is refreshed by arrival, the
+//     engagement latch by the pass below, and the server's own busy/aggro facts keep arriving;
+//   * the peer half keeps applying, so the paused client's puppets do not freeze at the pause
+//     position and then snap, and its stored entries are drained frame by frame instead of hoarding
+//     a whole pause's worth of one-shots (carryBatch) to replay in the frame the player comes back.
+// The one carve-out is a frame's own damage against the LOCAL player: the hit-act and tackle replays
+// do not run while paused (isPausedScene), because a paused player cannot answer them.
 class EnemySync {
 	onGameMapStart() {
 		resetForNewMap();
@@ -4139,8 +4233,11 @@ class EnemySync {
 		applyPeerState(syncEnemies());
 		// The tackles an owner's stream started on the enemies we hold have no physics of their own to
 		// land (see the tackle section), so they are tested here, on the frame path, after the peer
-		// state has put the enemy where its owner says it is.
-		driveRemoteTackles();
+		// state has put the enemy where its owner says it is. Not while the game is paused: this is
+		// damage resolved against the local player through our own collision call (see isPausedScene);
+		// the entry stays live, so the tackle is picked up again on the frame the game resumes.
+		if (!isPausedScene())
+			driveRemoteTackles();
 	}
 
 	onPostUpdate() {
