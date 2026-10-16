@@ -35,9 +35,10 @@
  *   ENTITY mark): EnemySheet.updateAction (AI choice/action selection, the one funnel every
  *   AI entry point reaches), EnemyCmp.checkAutoAggro / triggerAggression / updateTarget (aggro and
  *   target acquisition, reached from EnemyCmp.update outside updateAction), EnemyCmp.setAggressive
- *   (the combat transitions -- the one engine call whose loose-rule de-aggro a driven enemy must
- *   refuse, see puppetSetAggressive), EnemyCmp.update (marked, not altered: it is the call the loose
- *   rule runs inside), LoopCheckReaction.
+ *   (the combat transitions -- an engine engage is honoured and stripped of the two registrations a
+ *   driven enemy must not hold, the loose-rule de-aggro is refused, see puppetSetAggressive),
+ *   EnemyCmp.update (marked, not altered: it is the call the loose rule runs inside),
+ *   LoopCheckReaction.
  *   checkTrigger (the auto/dodge reactions, which act outside updateAction too), EnemyCmp.onHit
  *   (local damage -> local HP), EnemyCmp.onDeathHit (giveExp/dropItems/rogue.onEnemyKilled/screen
  *   shake/combat.setEnemyDefeated), EnemyCmp.onNotify (scripted reactions can start actions), and
@@ -100,14 +101,16 @@ const PUPPET_MARK = "__ttPuppet";
 // (and read) on the entity, next to the mark, for the same pooling reason.
 const PUPPET_SAVED = "__ttPuppetSaved";
 
-// The owner's in-combat bit, as the last frame this entity was driven carried it, once this client
-// has applied it (see engagePuppet) -- absent while the owner says the enemy is calm. Set on the
-// ENTITY, for the same pooling reason, and it is what makes the application a transition on a change
-// rather than a write every frame, what the loose-rule seam tests, and what tells the release path
-// that the owner's last word was "in combat" (puppetInCombat).
+// The in-combat state this client has applied to the entity -- the owner's carried bit
+// (engagePuppet) or an engine engage the seam honoured (puppetSetAggressive) -- absent while none is
+// applied. Set on the ENTITY, for the same pooling reason, and it is what makes the application a
+// transition on a change rather than a write every frame, what the loose-rule seam tests, and what
+// tells the release path that the last word was "in combat" (puppetInCombat). The owner's stream
+// still has the last word: a frame carrying `aggro` false drops the claim and the state with it
+// (dropPuppetCombat).
 const PUPPET_AGGRO = "__ttPuppetAggro";
 
-// The `passive` flag engagePuppet clobbered (setAggressive(true) writes ENEMY_PASSIVE.NONE,
+// The `passive` flag the engage clobbered (setAggressive(true) writes ENEMY_PASSIVE.NONE,
 // enemy-cmp.js:384-385), so dropping the combat state can put back the value the entity's own spot
 // asked for (:264-268 -- the spot owns that flag). On the entity, like the marks above.
 const PUPPET_PASSIVE = "__ttPuppetPassive";
@@ -347,7 +350,7 @@ export function releasePuppet(ent) {
 //     player de-aggro ITSELF after LOOSE_DURATION (5s) -- and on a peer that distance is measured
 //     against the wrong player, so the rule would flip the flag and the bar back five seconds into
 //     every handover, in the ordinary co-op case of two players apart. That ONE de-aggro is dropped
-//     while the owner's stream says the enemy is in combat (puppetSetAggressive). Nothing else the
+//     while this client holds the enemy in combat (puppetSetAggressive). Nothing else the
 //     flag enables changes anything here: the AI seams are unwrapped, so no action is chosen, no
 //     damage is applied and no reward is granted.
 //
@@ -358,8 +361,9 @@ export function releasePuppet(ent) {
 // registration above was deliberately dropped and an aggressive enemy missing from that list never
 // attacks at all (enemy-state.js:86 gates every attack choice on isFrequencyReady, whose
 // freqProgress is only ever advanced for the enemies in it -- attack-frequency.js:230-236). The same
-// seam settles the other direction: an ENGINE caller may not aggressivise a driven enemy at all,
-// because its verdict is about a client that is not this one (puppetSetAggressive).
+// seam settles the other direction: an ENGINE engage of a driven enemy is APPLIED -- the flag has to
+// genuinely go true, see puppetSetAggressive -- with the same two registrations taken back at once,
+// while the engine's own self-initiated de-aggro, the loose rule, stays dropped.
 
 // The engine's own EnemyCmp.setAggressive, captured by installPuppetPatches BEFORE this module wraps
 // it. The combat state below goes through this rather than through the (patched) method so that it
@@ -403,17 +407,39 @@ function puppetCombatHandles(enemy) {
 	}
 }
 
+// Record an engage of a driven enemy: the claim this module keys everything else on (PUPPET_AGGRO,
+// plus the passive flag the engage clobbers), and the two registrations the engine's call made on a
+// driven enemy taken back again (puppetCombatHandles). Called straight after BOTH engage paths -- the
+// owner's stream (engagePuppet) and an engine caller the seam honoured (puppetSetAggressive) -- so the
+// claim, the saved passive and the handle removal cannot drift between the two.
+//
+// `passiveBefore` is the entity's passive read BEFORE the engine call, because setAggressive(true)
+// writes ENEMY_PASSIVE.NONE (:384-385); it is saved only on the transition into the claim, so a
+// re-application cannot overwrite the saved value with the NONE this module set itself. Nothing is
+// recorded for an engage the engine REFUSED -- an entity that is not ALIVE (:379-381) -- and any
+// claim left standing is taken back with it: this client must not report a fight the engine did not
+// enter. Returns true when the engage landed.
+function claimPuppetEngage(ent, enemy, passiveBefore) {
+	if (enemy.aggressive !== true) {
+		delete ent[PUPPET_AGGRO];
+		delete ent[PUPPET_PASSIVE];
+		return false;
+	}
+	if (ent[PUPPET_AGGRO] !== true) {
+		ent[PUPPET_AGGRO] = true;          // the claim: what the loose-rule seam and the release path
+		if (passiveBefore !== undefined)   // read, alongside the passive flag the engage clobbers
+			ent[PUPPET_PASSIVE] = passiveBefore;
+	}
+	puppetCombatHandles(enemy);            // ...of which a driven enemy must hold neither of the two
+	return true;
+}
+
 // Put the owner's in-combat bit onto a puppet, through the engine's own setAggressive. Transition
 // only: the bit rides EVERY frame of the stream (readEnemyState is a per-frame snapshot) and an enemy
 // being fought sends it true for as long as the fight lasts, so the write is gated on the claim this
 // module recorded rather than made per frame. Never records a claim it could not apply: an enemy that
 // is not ALIVE is refused by the engine itself (:379-381) and an entity with no enemy component simply
 // stays out of combat.
-//
-// The passive is saved only when the call below is actually going to clobber it (an enemy the engine
-// already had in combat keeps the NONE its own engagement set, so there is nothing of the spot's to
-// remember) -- and only once per claim, so a re-application cannot overwrite the saved value with the
-// NONE this module set itself.
 function engagePuppet(ent) {
 	const enemy = puppetEnemy(ent);
 	if (!enemy || !engineSetAggressive)
@@ -424,19 +450,10 @@ function engagePuppet(ent) {
 	// frame for `puppetCombatHandles` to take out again.
 	if (ent[PUPPET_AGGRO] === true && enemy.aggressive === true)
 		return;
-	if (ent[PUPPET_AGGRO] !== true) {
-		ent[PUPPET_AGGRO] = true;          // the claim: what the loose-rule seam and the release path
-		if (enemy.aggressive !== true)     // read, alongside the passive flag the engage clobbers
-			ent[PUPPET_PASSIVE] = enemy.passive;
-	}
+	const passiveBefore = enemy.aggressive !== true ? enemy.passive : undefined;
 	engineSetAggressive.call(enemy, true); // the engine's own engage: flag, passive, HUD, the
 	                                       // attack-frequency registration and the navDanger region
-	if (enemy.aggressive !== true) {
-		delete ent[PUPPET_AGGRO];           // refused (not ALIVE): take the claim back with it
-		delete ent[PUPPET_PASSIVE];
-		return;
-	}
-	puppetCombatHandles(enemy);            // ...of which a driven enemy must hold neither of the two
+	claimPuppetEngage(ent, enemy, passiveBefore);
 }
 
 // Undo engagePuppet: the engine's own de-aggro, plus the passive flag it clobbered, plus the record
@@ -609,18 +626,26 @@ export function installPuppetPatches() {
 
 		// (f) The combat transitions, funnelled for a puppet so its OWNER's stream is the authority on a
 		// driven enemy. Three cases, and each one is decided by who is asking:
-		//   * the loose rule's de-aggro (:587, inside update()) is DROPPED while the owner's stream says
-		//     in combat -- the rule measures the distance to THIS client's player, who on a peer may be
-		//     exactly the player the enemy is not fighting;
+		//   * the loose rule's de-aggro (:587, inside update()) is DROPPED while this client holds the
+		//     enemy in combat -- the rule measures the distance to THIS client's player, who on a peer
+		//     may be exactly the player the enemy is not fighting;
 		//   * every other de-aggro (onKill :338, onDeathHit :1122, giveUp :1144, disappear :351, the rest
 		//     path, the attack-frequency manager's own :152) is HONOURED -- the engine always has to be
 		//     able to take an entity it is tearing down out of combat;
-		//   * every engage (EnemySpotEntity.triggerEnemy :229, EnemySpawner :100, the aggro steps,
-		//     aggroNearbyEnemy :248/:263) is DROPPED. Those callers report what is happening on the
-		//     client SIMULATING the enemy, which is not this one; the owner's own stream is what puts a
-		//     driven enemy into combat here, applied directly (engagePuppet) rather than through this
-		//     seam. Dropping it is also what keeps a puppet out of the shared attack-frequency manager,
-		//     which the raw call would enter it into (:391).
+		//   * every engage (EnemySpotEntity.triggerEnemy :229, an enemySpawner, the aggro steps,
+		//     aggroNearbyEnemy :248/:263) is HONOURED -- the flag has to genuinely go true -- and then
+		//     stripped of the two registrations a driven enemy must not hold (claimPuppetEngage).
+		//     Honouring it is not the same as letting this client simulate the enemy: the AI seams above
+		//     are still shut, so an engage can produce no action, no target and no attack here -- what it
+		//     produces is the engine's own `aggressive` flag. And that flag is a LOOP GUARD: the recursive
+		//     part of aggroNearbyEnemy re-walks, re-engages and re-queues an enemy exactly while
+		//     `enemy.isAlive() && !enemy.aggressive` (combat.js:262-266), so it terminates only because
+		//     setAggressive(true) clears that test. Dropping the engage left a puppet permanently
+		//     non-aggressive, and two puppets within 8 units of one another then re-found and re-queued
+		//     each other for ever -- the freeze this seam used to cause.
+		//     Taking the two registrations back is still required, for the reasons above; the claim the
+		//     engage records is what tells the release path, and the loose rule, that this client has the
+		//     enemy in combat.
 		["EnemyCmp.setAggressive", exp.EnemyCmp?.prototype, "setAggressive", entOfSelf, puppetSetAggressive],
 	];
 
@@ -659,13 +684,14 @@ function puppetUpdate(ent, original, args) {
 	}
 }
 
-// Puppet on EnemyCmp.setAggressive: drop the engine's own loose-rule de-aggro while the owner's stream
-// says the enemy is in combat, honour every other de-aggro, and drop engages altogether (see (f) in the
-// patch table for why each of the three cases is what it is).
+// Puppet on EnemyCmp.setAggressive: drop the engine's own loose-rule de-aggro while this client has
+// the enemy in combat, honour every other de-aggro, and honour an engage -- stripped down to the flag
+// (see (f) in the patch table for why each of the three cases is what it is).
 function puppetSetAggressive(ent, original, args) {
 	if (args[0] !== true) {
 		// The loose rule (the engine's own per-entity aggro upkeep, inside the entity's own update)
-		// asks for a de-aggro the owner's stream forbids: drop it. See (f) in the patch table.
+		// asks for a de-aggro this client forbids while it holds the enemy in combat: drop it. See (f) in
+		// the patch table.
 		if (ent[PUPPET_UPDATING] === true && ent[PUPPET_AGGRO] === true)
 			return;
 		// Any other de-aggro is a DECISION the engine made about an entity it owns the combat state of
@@ -683,13 +709,29 @@ function puppetSetAggressive(ent, original, args) {
 	}
 	// An ENGAGE of a puppet, from an ENGINE caller -- a spot triggering on this client, an
 	// aggroNearbyEnemy pass walking a circle that happens to contain a puppet, an enemySpawner, a COMBAT
-	// step. Dropped, exactly as the AI seams above are: those callers all describe what is happening on
-	// the client SIMULATING the enemy, and this is not that client. The owner's stream is the only
-	// thing that may put a driven enemy into combat, and it is applied directly (drivePuppet ->
-	// engagePuppet, which does not come back through this seam). Dropping the call is also what keeps
-	// the puppet out of the shared attack-frequency manager, which the raw call would enter it into
-	// (:391) -- a driven enemy must not re-time this client's own attacks.
-	return;
+	// step. HONOURED, unlike every other seam here, and then stripped down to the flag: the engine's
+	// engage is the write that makes `aggressive` true, and the recursive walk in aggroNearbyEnemy
+	// terminates on nothing else (see (f) in the patch table). Refusing it left the puppet permanently
+	// non-aggressive, so the walk kept re-finding it, re-engaging it and re-queuing it -- an infinite
+	// loop inside aggroNearbyEnemy, the freeze this fixes.
+	//
+	// It cannot hand the enemy to a peer's simulation: the AI seams above are still shut for a puppet,
+	// so no action is chosen, no target acquired and no attack made -- and the two registrations the raw
+	// call makes on a driven enemy (the shared attack-frequency entry and the navDanger region) are taken
+	// back at once (claimPuppetEngage -> puppetCombatHandles). What is left is the engine's own combat
+	// state, which is what the local fight around the puppet has already established.
+	//
+	// `original` is the method under this wrapper (the game's own setAggressive, or a previous wrapper
+	// over it, e.g. ../features/revive.js's downed gate) and `this` the EnemyCmp receiver, so the call is
+	// passed on exactly as any non-puppet receiver's would be; the claim then follows the flag the engine
+	// actually wrote, refused engages included. The call is made even when the entity cannot answer for
+	// itself (no enemy component): the flag is what the caller's loop reads, so it is never left unwritten.
+	const enemy = puppetEnemy(ent);
+	const passiveBefore = enemy && enemy.aggressive !== true ? enemy.passive : undefined;
+	original.apply(this, args);            // flag, passive, HUD, the attack-frequency registration and
+	                                       // the navDanger region
+	if (enemy)
+		claimPuppetEngage(ent, enemy, passiveBefore);
 }
 
 // Puppet onPostMove: run the real body (it also fixes up figState.mod.shiftZ against the ground,
