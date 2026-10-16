@@ -47,8 +47,11 @@ import { MSG } from "../net/protocol.js";
 // rejected by the receiver (both use CONFIG.radius, just measured from two sources).
 //
 // The divisor is decided once, when the message is sent: whoever is hurt and in range at
-// that moment is counted and gets a share in the payload. A peer who dies, disconnects or
-// walks out of range before the message lands fails the receiver's own gate and simply
+// that moment is counted and gets a share in the payload. "Hurt" is a downed peer or one
+// below full HP, and it is read from the peer's current HP rather than from the
+// in-flight-heals preview — see hurtPeersInRange for why that distinction matters. Nobody
+// hurt in range means nothing is sent: the flask stays local. A peer who dies, disconnects
+// or walks out of range before the message lands fails the receiver's own gate and simply
 // loses that share — it is not redistributed to the others (one flask heals at most its
 // own amount, never more).
 //
@@ -220,8 +223,26 @@ class AreaHealer {
 
 	// ---- outgoing -----------------------------------------------------------
 
-	// Every visible peer within reach that isn't already topped off, as {id, actor} pairs.
-	// A downed peer counts as hurt. Drives both the full-HP use allowance and the split.
+	// Every visible peer within reach who needs healing, as {id, actor} pairs: a downed peer,
+	// or one below full HP. Drives BOTH the full-HP use allowance and the split — the
+	// eligible set and the divisor are this one list.
+	//
+	// Read the peer's *current* HP, never `hpTarget`. ../client/snapshot.js publishes
+	// hpTarget as getHPRatio(0, true), which the engine defines as currentHP *plus every
+	// heal already in flight* (combat-params.js:433-436, combat-hot.js:54-61) — it is the
+	// "where will my bar stop" preview the nameplates draw, so a peer sitting at 20% HP who
+	// is mid-heal-over-time reports 1.0 and reads as full. Mid-heal is not a rare state
+	// here: every share this feature hands out *is* a HoT, so a teammate healed (or revived)
+	// by the previous flask reports full for the whole duration of that heal, and a second
+	// flask within that window skipped them. With one peer in range that made the list
+	// empty and no message was sent at all, so the flask healed nobody. `hp` is the honest
+	// signal (and is what the nameplate bar itself is drawn from).
+	//
+	// A peer whose HP we cannot classify yet counts as hurt, not as full: including one can
+	// at worst dilute the flask, while excluding one is the "healed nobody" failure above.
+	// `hp` is written for every visible actor (../client/actors.js:164), so this is a
+	// backstop rather than the usual path. The test is written as !(hp >= 1) so that a NaN
+	// ratio (which no `hpTarget ?? 1`-style comparison would catch) also lands as hurt.
 	hurtPeersInRange() {
 		const me = terra.export.g_player?.entity;
 		const actors = this.host.getPlayerActors?.();
@@ -233,9 +254,11 @@ class AreaHealer {
 		for (const [id, actor] of actors) {
 			if (!actor?.core?.isVisible?.())
 				continue;
-			const hurt = down?.get?.(id) || (actor.terraTogether?.hpTarget ?? 1) < 1;
-			// ?? 1: a peer we have no snapshot data for counts as full, so an unknown peer
-			// can never be the reason we spend a charge at full HP, nor dilute a share.
+			const hp = actor.terraTogether?.hp;
+			// A downed peer's HP is 0, but the flag alone still counts them on the frames
+			// where the snapshot that says so has not landed yet (e.g. a one-shot death from
+			// full HP, where the last HP we saw was still 1).
+			const hurt = !!down?.get?.(id) || !(hp >= 1);
 			if (hurt && dist2(me.core.pos, actor.core.pos) <= r2)
 				list.push({ id, actor });
 		}
