@@ -91,6 +91,17 @@
  *     (captureForwardedHitNumber) and it rides the same enemy frame as one more batch (`hitNumbers`,
  *     ENEMY_EFFECT_KEYS); the peer replays it through the engine's own HitNumbers.addCustom
  *     (replayEnemyHitNumber). Nothing about the reward path or the HP write changes.
+ *   - Contact attacks, and this is the one enemy melee that is NOT an act: the TACKLE step hangs a
+ *     `Tackle` on the enemy's AttackerCmp and lets physical contact resolve the damage
+ *     (combat-act-steps.js:302-338, attacker-cmp.js:183-212), so none of it ever reached the other
+ *     player -- the spiky balls charging, the hedgebird's spin, the wasp's dash, the platapus's bite.
+ *     The owner captures the tackle that step leaves on the entity (same step seam as the hit acts)
+ *     and its end (AttackerCmp.clearTackle, the only call that tears one down) and sends them as
+ *     those SAME hitActs/hitActStops entries with the kind "TACKLE"; the peer builds the same Tackle
+ *     from the same authored step and tests it against its OWN player every frame
+ *     (driveRemoteTackles), through the engine's own collision query and its own Tackle.hit -- so the
+ *     damage, the party check, the hit direction and the 1.0s repeat cooldown are the engine's, and
+ *     still nothing arbitrates. See the tackle section below.
  *   - Melee/splash hits on the player who RECEIVES them (the hit-act half), both halves: an enemy's
  *     melee or splash hitbox was resolved only on the client simulating the enemy, so it could only
  *     ever hit the OWNER's player. The owner captures the hit ACT its own enemies start -- the
@@ -1226,6 +1237,12 @@ function stopSyncedEnemyFx(holder, stop) {
 // whose effect is "damage whatever the engine finds in a shape around this enemy".
 const HIT_ACT_KINDS = ["HIT_CIRCLE", "HIT_SWEEP", "HIT_LINE"];
 
+// ...plus the ONE kind that is not an act at all, and needs a different replay: the TACKLE step
+// (see the tackle section below). It is a step of the same family as far as the wire is concerned --
+// an authored step of an authored action, identified by action+index and looked up on the peer -- so
+// it rides the same batch and is resolved by the same lookup; only the replay differs.
+const REPLAYABLE_ACT_KINDS = [...HIT_ACT_KINDS, "TACKLE"];
+
 // Install-once flags. The step wrappers and the act-cancel wrapper are installed together, from
 // the same per-frame hook the other owner-side seams use (see onPreUpdate): the first frame is
 // early enough (an enemy cannot attack before the world runs), and a build whose ACTION_STEP or
@@ -1373,7 +1390,7 @@ function resolveHitActStep(ent, entry) {
 	const name = entry?.action;
 	const idx = entry?.idx;
 	const kind = entry?.kind;
-	if (typeof name !== "string" || !Number.isInteger(idx) || idx < 0 || !HIT_ACT_KINDS.includes(kind))
+	if (typeof name !== "string" || !Number.isInteger(idx) || idx < 0 || !REPLAYABLE_ACT_KINDS.includes(kind))
 		return null;
 	const StepClass = actionStepRegistry()?.[kind];
 	const action = ent?.enemy?.enemyType?.sheet?.actions?.[name];
@@ -1428,6 +1445,12 @@ function applyRemoteHitAct(ent, entry) {
 	const step = resolveHitActStep(ent, entry);
 	if (!step)
 		return;
+	// A tackle is replayed by building the tackle, not by running an act (see the tackle section):
+	// same batch, same identity, different replay.
+	if (entry.kind === "TACKLE") {
+		applyRemoteTackle(ent, entry);
+		return;
+	}
 	const acts = terra.export.g_combat?.acts;
 	const before = Array.isArray(acts) ? acts.length : -1;
 	let act = null;
@@ -1511,6 +1534,41 @@ function ensureHitActPatches() {
 		StepClass.prototype.start = wrapper;
 	}
 
+	// The TACKLE step, wrapped once, exactly like the HIT_* classes above -- but read, not reused: the
+	// step is what tells us WHICH authored attack is running, and the object it leaves on the entity
+	// (`attacker.tackle`) is what the peer re-creates.
+	const TackleStep = ACTION_STEP.TACKLE;
+	if (TackleStep?.prototype && typeof TackleStep.prototype.start === "function"
+		&& TackleStep.prototype.start.__ttHitActPatched !== true) {
+		const originalTackleStart = TackleStep.prototype.start;
+		const wrapper = function (...args) {
+			const ctx = args[0];
+			const ent = ctx?.entity;
+			const enemyId = replayingHitAct ? null : enemyOwnership.ownedIdOf(ent);
+			const result = originalTackleStart.apply(this, args);
+			if (enemyId !== null)
+				captureTackle(this, ctx, ent, enemyId);
+			return result;
+		};
+		wrapper.__ttHitActPatched = true;
+		TackleStep.prototype.start = wrapper;
+	}
+
+	// The tackle's end, wrapped once. clearTackle is the ONLY teardown (see the tackle section), so
+	// this is where the owner's stop is reported from -- and it is load-bearing rather than
+	// bookkeeping: the peer has nothing else that can end its tackle.
+	const AttackerCmp = terra.export.AttackerCmp ?? terra.file.attackerCmp?.AttackerCmp ?? null;
+	if (AttackerCmp?.prototype && typeof AttackerCmp.prototype.clearTackle === "function"
+		&& AttackerCmp.prototype.clearTackle.__ttHitActStopPatched !== true) {
+		const originalClearTackle = AttackerCmp.prototype.clearTackle;
+		const wrapper = function (...args) {
+			reportTackleStop(this.tackle);
+			return originalClearTackle.apply(this, args);
+		};
+		wrapper.__ttHitActStopPatched = true;
+		AttackerCmp.prototype.clearTackle = wrapper;
+	}
+
 	const proto = CombatAct.prototype;
 	if (proto.cancel.__ttHitActStopPatched !== true) {
 		const originalCancel = proto.cancel;
@@ -1533,6 +1591,231 @@ function ensureHitActPatches() {
 	hitActPatchesInstalled = true;
 	if (missing.length)
 		console.warn("[TT enemy-sync] hit acts not synced for (unknown game build?): " + missing.join(", "));
+}
+
+// ───────────────────── tackle: the contact attack that has no act ─────────────────────
+//
+// The gap this closes. Every other enemy melee or splash in the game is an ACT: an authored
+// HIT_CIRCLE/HIT_SWEEP/HIT_LINE step builds a CombatAct, and the act is what resolves the hitbox --
+// which is why the section above can replay one step and get the whole attack. The TACKLE step is
+// not that. TackleStep.start (combat-act-steps.js:302-338) builds NO act and lands NO hit: it hangs a
+// `Tackle` on the AttackerCmp (`attacker.setTackle(this.attackInfo)`, attacker-cmp.js:183-187),
+// points the entity's movement at it, and from then on the damage is resolved by PHYSICS CONTACT --
+// AttackerCmp.onCollision (attacker-cmp.js:208-212), which the engine calls for every coll the moving
+// entity touches, calls straight into `tackle.hit` (`:80-102`: isHitCompatible -> onHit -> hitCount++,
+// `cancelOnHit` ends it, `addHitColl` starts the 1.0s repeat cooldown that IS the tackle's multi-hit
+// semantics). A puppet produces no collisions at all (its physics are pinned and its position is
+// teleported by the drive, ./enemy-puppet.js), so nothing about a tackle reaches the other player:
+// the spiky balls' charge, the hedgebird's spin, the wasp's dash, the turtle's spin attack and the
+// platapus's bite are all invisible to the peer.
+//
+// The model, and why it is the same one as the hit acts. Damage is resolved where it LANDS, so the
+// peer re-runs the tackle's contact test against its OWN world -- but only against its own player
+// (that is the whole victim-side property: a client can only ever damage itself), and using the
+// engine's own `Tackle` object and the engine's own collision query rather than any new maths. What
+// travels is the identity of the step, exactly as for a hit act: the tackle's damage, its party, its
+// hit direction, its hit-stop and its multi-hit cooldown all come from the same authored props both
+// clients loaded.
+//
+// WHAT TRAVELS: action + index + the kind "TACKLE", on the EXISTING hitActs batch -- no new message
+// and no new batch key. Its end travels on hitActStops: this one is load-bearing rather than
+// symmetry, because the tackle's window is NOT the step's duration. The step ends when
+// `context.timer <= 0`, but the Tackle object outlives it (turtle `attackSpin` is authored with
+// `duration: 0`, and either way a tackle stays live until something calls `attacker.clearTackle()`
+// -- the next setTackle, a config/state apply, STOP_TACKLE, burying, resetting), which is precisely
+// what `keepTackle` exists for. So the owner's own end is the only thing that can end the peer's.
+//
+// The four seams, both halves, in one place:
+//   owner, start    ACTION_STEP.TACKLE.prototype.start, wrapped once (same shape as the HIT_* step
+//                   wrappers above, and installed from the same place). The wrapper does nothing to
+//                   the call: it runs the engine's own start and then reads the Tackle it left on
+//                   the entity, which is the object whose contact test the peer will re-create.
+//   owner, stop     AttackerCmp.prototype.clearTackle, wrapped once. It is the ONLY teardown of a
+//                   tackle (every path above ends there -- see the callers in attacker-cmp.js:117,
+//                   :148, :212 and combat-act-steps.js:409/:459), so it is the one place an end
+//                   cannot be missed.
+//   peer,  start    applyRemoteTackle: resolve the same step from the enemy's own sheet, build the
+//                   same Tackle the owner's step would have built (`setTackle(step.attackInfo)`, plus
+//                   the two flags TackleStep copies onto it), and register a per-frame driver.
+//   peer,  tick     driveRemoteTackles: for each live tackle, ask the engine's own collision map for
+//                   everything overlapping the enemy's own main coll (PhysicsQuery's rectangle query
+//                   -- the very call HIT_CIRCLE resolves through), keep the local player, and hand
+//                   each to AttackerCmp.onCollision. The engine's own Tackle.hit does the rest:
+//                   hit test, party filter, damage, hit-stop, and the cooldown that stops a tackle
+//                   from hitting the same body every frame.
+//
+// Nothing here enables the AI, restarts the action, moves the enemy or touches FX: a Tackle is a
+// passive object on the entity, and the only thing this module does with it is ask the engine whether
+// it touches the player.
+
+// The AttackerCmp of an enemy, the same read ./fx-sync.js uses to find an enemy's damager
+// (`ent.enemy.combatant.attacker`, combatant-cmp.js:233) -- the combatant is the enemy's own, and it
+// is where the Tackle lives.
+function attackerOf(ent) {
+	return ent?.enemy?.combatant?.attacker ?? ent?.combatant?.attacker ?? null;
+}
+
+// Live tackles an owner's stream has put on OUR copy of an enemy, by the owner's act id, plus the
+// entity and attacker they belong to so the per-frame driver can use them without re-deriving
+// anything. This is a module-level map rather than the per-entity one (PUPPET_HIT_ACTS) because a
+// tackle is not a CombatAct and cannot be cancelled the same way: the per-entity map still carries an
+// entry (so ./enemy-puppet.js's clearPuppetHitActs keeps releasing it without knowing what it is),
+// and its `cancel` is a closure that clears BOTH -- see registerRemoteTackle.
+const remoteTackles = new Map();
+
+// One tackle an enemy we simulate has just started: tag it so its end can be reported, and queue its
+// identity for the frame. `describeHitAct` does the identity work (the same canonical walk), and the
+// anchor question that guards a hit act does not arise: a tackle's geometry is the enemy's own
+// collision, so it is self-relative by construction.
+function captureTackle(step, ctx, ent, enemyId) {
+	const tackle = attackerOf(ent)?.tackle ?? null;
+	if (!tackle)
+		return;
+	const ref = describeHitAct(step, ctx, ent);
+	if (!ref)
+		return;
+	const tag = { id: ++hitActSyncId, enemy: enemyId };
+	tackle.__ttHitAct = tag;
+	enemyQueues.hitActs.push({ id: tag.id, enemy: enemyId, action: ref.action, idx: ref.idx, kind: "TACKLE" });
+	if (debugEnabled())
+		debugLog(`enemy ${enemyId}: tackle (#${tag.id}) of ${ref.action}[${ref.idx}] forwarded`);
+}
+
+// One tackle an owner has finished with, reported from AttackerCmp.clearTackle. The tag is dropped
+// first so a second teardown of the same tackle (clearTackle is called by setTackle, by reset, by
+// bury and by the step itself, and the engine's own setTackle calls it unconditionally before making
+// a new one) cannot report a stop twice.
+function reportTackleStop(tackle) {
+	const tag = tackle?.__ttHitAct;
+	if (!tag)
+		return;
+	tackle.__ttHitAct = null;
+	enemyQueues.hitActStops.push({ id: tag.id, enemy: tag.enemy });
+	if (debugEnabled())
+		debugLog(`enemy ${tag.enemy}: tackle #${tag.id} ended`);
+}
+
+// Build the owner's tackle on OUR copy of the enemy, and remember it for the per-frame driver. The
+// step's own props are the whole mechanism, and they are identical here (same game data): attackInfo
+// carries the damage/party/knockback, `cancelOnHit` ends the tackle at its first hit, `orthoDirFactor`
+// decides the hit direction, `freeze` the hit-stop. Exactly what TackleStep.start does with them
+// (combat-act-steps.js:325-327), so the contact test that follows behaves as the owner's does.
+//
+// Fail-soft and bounded, like the hit-act replay: an unresolvable step, an entity without an attacker
+// or a build without setTackle all end in "nothing happens on this client".
+function applyRemoteTackle(ent, entry) {
+	const core = ent?.core;
+	const attacker = attackerOf(ent);
+	if (!core || !attacker || typeof attacker.setTackle !== "function")
+		return;
+	const step = resolveHitActStep(ent, entry);
+	if (!step)
+		return;
+	const id = entry.id;
+	let tackle = null;
+	try { tackle = attacker.setTackle(step.attackInfo); }
+	catch (e) {
+		if (debugEnabled())
+			debugLog(`tackle of ${entry.action} was not replayed: ${e?.message ?? e}`);
+		return;
+	}
+	if (!tackle)
+		return;
+	// The two the step copies onto the tackle itself, so the peer's contact test reacts the way the
+	// owner's does: it ends at the first hit, and the victim flies along the same axis.
+	tackle.cancelOnHit = step.cancelOnHit === true;
+	if (Number.isFinite(step.orthoDirFactor))
+		tackle.orthoDirFactor = step.orthoDirFactor;
+	if (Number.isFinite(step.freeze))
+		tackle.freeze.init(step.freeze);
+
+	// The stop path and the puppet's release path both call `cancel()` on what they find in the
+	// per-entity map, so this is the whole interface they need: drop the driver entry and clear the
+	// tackle, but only while it is still the one we made (a later tackle of the same enemy replaces
+	// it, and clearing the replacement would cancel an attack the owner is still running).
+	const handle = {
+		cancel: () => {
+			remoteTackles.delete(id);
+			if (attacker.tackle === tackle)
+				attacker.clearTackle();
+		},
+	};
+	remoteTackles.set(id, { ent, attacker, tackle, handle });
+	remoteHitActsOf(ent).set(id, handle);
+	if (debugEnabled())
+		debugLog(`enemy ${entry.enemy}: tackle (#${id}) of ${entry.action}[${entry.idx}] replayed on our copy`);
+}
+
+// The peer's contact test, run every frame for every tackle an owner's stream has started on OUR
+// copy of an enemy -- the half of the replay that the owner's step gets for free from the physics
+// engine and a pinned puppet does not.
+//
+// The query is the engine's own: the enemy's main coll box, handed to the same rectangle lookup
+// HIT_CIRCLE resolves through (PhysicsQuery.getCollsInRectangleC -> g_gState.physics.collMap.getColls,
+// physics.js:133-158 -- a grid walk over every coll whose box, expanded by its own hitPadding,
+// overlaps; entity-collision.js:326-339), with the tackle's own hit list passed as the ignore list so
+// its 1.0s repeat cooldown is honoured by the broadphase itself. Straight from `CollMap.getColls` is
+// used rather than the PhysicsQuery wrapper because it is the same call one level down and needs no
+// export the modloader may not have mapped.
+//
+// Only the LOCAL player is taken from the result. That is not a convenience: it is the victim-side
+// model, and it is also what keeps this cheap and harmless -- a puppet's tackle can never hit
+// another enemy (the party filter would refuse it anyway), never a peer's ghost (no combatant), and
+// never the enemy itself.
+//
+// The rest is the engine's: AttackerCmp.onCollision -> Tackle.hit does the hit test, the party check,
+// the damage, the hit-stop and the cooldown bookkeeping. Nothing is applied twice: the cooldown keeps
+// one hit per coll per second, and each client resolves only its own player.
+function driveRemoteTackles() {
+	if (remoteTackles.size === 0)
+		return;
+	const localPlayer = terra.export.g_player?.entity ?? null;
+	const collMap = terra.export.g_gState?.physics?.collMap ?? null;
+	if (!localPlayer || !collMap || typeof collMap.getColls !== "function") {
+		// Without the local player or the world's collision map there is nothing to test against and
+		// nothing to clean up: the owner's stop (or the puppet's release) still ends every entry.
+		return;
+	}
+	const colls = [];
+	for (const [id, entry] of remoteTackles) {
+		const { ent, attacker, tackle } = entry;
+		// The tackle is gone (a state change, a bury, the owner's stop not yet applied), the entity is
+		// gone, or the engine has already cleared it: nothing left to drive.
+		if (!ent?.core || ent.core.isKilled?.() || attacker?.tackle !== tackle) {
+			remoteTackles.delete(id);
+			continue;
+		}
+		const mainColl = ent.move?.mainColl ?? ent.core.colls?.[0] ?? null;
+		if (!mainColl)
+			continue;
+		colls.length = 0;
+		try {
+			collMap.getColls(colls, mainColl.pos.x, mainColl.pos.y, mainColl.pos.z,
+				mainColl.size.x, mainColl.size.y, mainColl.size.z,
+				ent.core, null, tackle.hitForce?.hitColls ?? null);
+		}
+		catch (e) { continue; }
+		for (const coll of colls) {
+			if (coll?.core?.ent !== localPlayer)
+				continue;
+			// The engine's own contact entry point, with the direction it never reads (the tackle
+			// computes its hit point from the overlap) and `passive` false, which is the side of
+			// onCollision's own condition that does not require the enemy to be standing still.
+			try { attacker.onCollision(mainColl, coll, tackleDirArg(), false); }
+			catch (e) { /* a hit the engine refused: nothing to undo */ }
+		}
+	}
+}
+
+// The `collDir` AttackerCmp.onCollision hands to Tackle.hit, which does not read it (it derives the
+// hit point from the coll overlap, attacker-cmp.js:84). One shared Vec2 for every call, built on
+// first use rather than at module load, because a build without the export must not stop this module
+// from loading (and this runs inside the frame's collision pass, so it is not allocated per call).
+let remoteTackleDir = undefined;
+function tackleDirArg() {
+	if (remoteTackleDir === undefined)
+		remoteTackleDir = terra.export.Vec2 ? new terra.export.Vec2() : null;
+	return remoteTackleDir;
 }
 
 // ──────────── damage numbers for a forwarded hit (owner capture / peer replay) ────────────
@@ -3463,7 +3746,9 @@ class EnemySync {
 		// the rest seam (ensureRespawnPatch), Phase 5b's reward gate (ensureRewardPatch), the
 		// damage-number capture for a forwarded hit (ensureHitNumberPatch, which wraps dealDamage) and
 		// the hit-act seams (ensureHitActPatches: the HIT_* step starts an enemy's attack is captured
-		// from, and the CombatAct.cancel that reports its end) -- are installed once, and this hook is
+		// from, the CombatAct.cancel that reports its end, and the TACKLE pair that does the same for
+		// the one attack that has no act -- the step that starts it and AttackerCmp.clearTackle, the
+		// only call that ends it) -- are installed once, and this hook is
 		// where it happens because it runs before this frame's entity updates: an enemy can die, and
 		// another can attack, in any frame, whether or not this module has driven anything yet, so the
 		// map-start install the puppet patches use would not cover a flag switched on mid-map.
@@ -3475,6 +3760,10 @@ class EnemySync {
 		ensureHitNumberPatch();
 		ensureHitActPatches();
 		applyPeerState(syncEnemies());
+		// The tackles an owner's stream started on the enemies we hold have no physics of their own to
+		// land (see the tackle section), so they are tested here, on the frame path, after the peer
+		// state has put the enemy where its owner says it is.
+		driveRemoteTackles();
 	}
 
 	onPostUpdate() {

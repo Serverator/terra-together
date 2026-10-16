@@ -111,7 +111,11 @@
  *                                            own player; hitActStops is that act ending (a hit act
  *                                            with duration -1 repeats until its action ends, which
  *                                            nothing on the recipient would ever do). See the
- *                                            hit-act section in src/client/enemies.js. The
+ *                                            hit-act section in src/client/enemies.js; one of the
+ *                                            kinds is the TACKLE step, which is not an act at all
+ *                                            and is replayed by rebuilding the engine's own contact
+ *                                            object from the same step (the tackle section there).
+ *                                            The
  *                                            projectile and enemy-fx entries also carry a little of
  *                                            what the mirror cannot re-derive on its own: a
  *                                            projectile names the player its shot was aimed at and

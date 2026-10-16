@@ -153,19 +153,23 @@ export const enemyQueues = {
 	// carries it as one more batch, and filled by ./enemies.js itself rather than by fx-sync.js:
 	// the capture point is the owner's damage pipeline, not an fx spawn.
 	hitNumbers: [],
-	// Melee/splash hit acts an owned enemy has just STARTED this frame: `{ id, action, idx, kind }`,
-	// the identity of one authored hit step (a HIT_CIRCLE / HIT_SWEEP / HIT_LINE of one of that
-	// enemy's own actions) which the peer re-runs on ITS copy of the enemy, so the hitbox resolves
-	// against that peer's own world and can only ever land on that peer's own player. Same story as
-	// hitNumbers: this is not an fx, so no fx slot can carry it, and it is filled by the engine's own
-	// action-step seam in ./enemies.js rather than by fx-sync.js (see the hit-act section there).
-	// One-shot, and one entry per act.
+	// Melee/splash attacks an owned enemy has just STARTED this frame: `{ id, enemy, action, idx,
+	// kind }`, the identity of one authored step of one of that enemy's own actions, which the peer
+	// resolves on ITS copy of the enemy, so the hit is resolved against that peer's own world and can
+	// only ever land on that peer's own player. Same story as hitNumbers: this is not an fx, so no fx
+	// slot can carry it, and it is filled by the engine's own step seams in ./enemies.js rather than
+	// by fx-sync.js (see the hit-act and tackle sections there). `kind` is a HIT_CIRCLE / HIT_SWEEP /
+	// HIT_LINE (replayed as that act) or the TACKLE step, which is not an act at all and is replayed
+	// by rebuilding the engine's own contact object from the same step. One-shot, one entry per
+	// attack.
 	hitActs: [],
-	// Those acts ENDING: `{ id }`. A hit act with a negative duration repeats until its action ends
-	// (or a STOP_COMBAT_ACTS step), which on the peer nothing would ever do -- the peer never runs
-	// the action, only the act -- so the owner's own stop is the only thing that can end the peer's
-	// copy. Finite acts self-terminate on both ends and are sent for symmetry (the peer's registry
-	// of live acts is then never stale).
+	// Those attacks ENDING: `{ id, enemy }`. A hit act with a negative duration repeats until its
+	// action ends (or a STOP_COMBAT_ACTS step), which on the peer nothing would ever do -- the peer
+	// never runs the action, only the act -- so the owner's own stop is the only thing that can end
+	// the peer's copy; a tackle needs it for a stronger reason still, because its window is not even
+	// the step's duration (turtle `attackSpin` is authored with `duration: 0` and runs until
+	// clearTackle). Finite acts self-terminate on both ends and are sent for symmetry (the peer's
+	// registry of live acts is then never stale).
 	hitActStops: [],
 };
 
