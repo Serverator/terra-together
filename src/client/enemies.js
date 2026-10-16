@@ -105,7 +105,8 @@
  *     guard lifted for an enemy's own shot.
  * Public surface: ENEMY_SYNC_OPTION, ENGAGE_RADIUS, ENGAGEMENT_TTL_MS, KILL_REWARD_RADIUS,
  *   enemyStableId, isEnemySyncEnabled, onEnemyOwner, onEnemyState, onEnemyHandoff, onEnemyDespawn,
- *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerName, isEngaged, engagedPlayers, EnemySync
+ *   onEnemyRespawn, onEnemyHit, isOwner, getEnemyOwnerId, getEnemyOwnerName, isEngaged,
+ *   engagedPlayers, EnemySync
  * Engine touchpoints: terra.addAddon (../main.js registers EnemySync at onGameMapStart /
  *   onPreUpdate / onPostUpdate 35010), terra.export g_options / g_gState.entities /
  *   g_game.map.active.path / g_scene.isRunning / g_player (the local player's position, for the
@@ -3360,6 +3361,18 @@ export function isOwner(enemyId) {
 		return false;
 	const localId = localPlayerId();
 	return localId !== null && owner === localId;
+}
+
+// The assigned owner's playerId, as the string the wire carries, or null when there is no
+// assignment to report (feature off, offline, not yet assigned, enemy unknown). This is the
+// identity behind getEnemyOwnerName: a name can be missing for a peer that never set a username
+// (the server relays PROFILE verbatim, an empty one included, and the display layer sanitises it
+// away), and a caller that has the id can still say who the owner IS instead of falling back to a
+// guess -- see ownerLine in ../debug/enemy-debug.js.
+export function getEnemyOwnerId(enemyId) {
+	if (!isEnemySyncEnabled())
+		return null;
+	return registry.get(enemyId)?.owner ?? null;
 }
 
 // The display name of the assigned owner, or null when there is no assignment to name

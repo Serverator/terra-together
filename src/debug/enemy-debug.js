@@ -38,7 +38,7 @@ import { createLabel, headLabelPos, anchorLabel, placeLabelAbove, hideLabel } fr
 // Enemy identity (enemyStableId, re-exported at the bottom so this module's surface is
 // unchanged) and the server-assigned owner. Identity lives in one place: ../client/enemies.js
 // builds the ids this overlay labels and the registry that turns them into owners.
-import { enemyStableId, getEnemyOwnerName } from "../client/enemies.js";
+import { enemyStableId, getEnemyOwnerId, getEnemyOwnerName } from "../client/enemies.js";
 
 // Option key (declared in src/config/settings.js, read here) and the console flag name.
 export const ENEMY_DEBUG_OPTION = "tt-enemy-debug";
@@ -83,15 +83,17 @@ function cleanText(value) {
 
 // ─────────────────────────── enemy owner (SWAP-POINT) ───────────────────────────
 //
-// Enemy simulation ownership is not implemented yet, so what follows is the FALLBACK policy,
-// used only for enemies whose server-assigned owner is not known (no connection, or no
-// assignment yet -- see getEnemyOwnerName() in ../client/enemies.js, which the label reads
-// first). ALL of that fallback lives in enemyOwnerLabel() and the helpers between it and the
-// identity helper that used to sit here (now enemyStableId() in ../client/enemies.js). The
-// point of that shape is that it is a pure function of state every client already has: no
-// client tells another who owns what, they agree because they run the same arithmetic over the
-// same inputs. When the real (server-arbitrated) scheme lands, only this fallback stops being
-// used.
+// Enemy simulation ownership is server-arbitrated now (../client/enemies.js, fed by the
+// server's enemy_owner), so what follows is the FALLBACK policy: the display used ONLY for an
+// enemy this client cannot name an assigned owner for (no connection, no assignment yet, or an
+// owner whose username never reached us -- see getEnemyOwnerName() in ../client/enemies.js,
+// which the label reads first, and ownerLine() below, which marks this fallback so it is never
+// read as the assignment). ALL of that fallback lives in enemyOwnerLabel() and the helpers
+// between it and the identity helper that used to sit here (now enemyStableId() in
+// ../client/enemies.js). The point of that shape is that it is a pure function of state every
+// client already has: no client tells another who owns what, they agree because they run the
+// same arithmetic over the same inputs -- which is exactly why it can disagree with the
+// server's split and must not be mistaken for it.
 //
 // Contract, in the order the invariants build on each other:
 //   1. enemyStableId() (../client/enemies.js) gives the same enemy the same id on every client.
@@ -226,17 +228,40 @@ function getLiveEnemy(core) {
 // height constant and the lines still, frame to frame.
 //
 // Both enemy fields can legitimately be null. The owner and the id never are: the owner is the
-// server's assignment whenever we know it (offline / not yet assigned falls back to the local
-// rendezvous label below), so with the feature on this reads the same answer the enemy-sync
-// module acts on, and enemyStableId() always returns a string.
+// server's assignment whenever this client can NAME it, and only when it cannot does the local
+// rendezvous estimate below stand in -- marked, because the two are not the same claim (see
+// ownerLine), and enemyStableId() always returns a string.
 function buildLabel(core, enemy) {
 	const id = enemyStableId(core);
-	const owner = getEnemyOwnerName(id) ?? enemyOwnerLabel(id);
+	const owner = ownerLine(id);
 	const state = cleanText(enemy.currentState?.name) ?? "-";
 	const action = cleanText(core.ent?.actor?.actionState?.sequence?.name) ?? "-";
 	// The id goes in VERBATIM, never through cleanText(): the whole point of the line is that
 	// it is byte-for-byte the string the sync exchanges, so the two clients' labels match.
 	return `${owner}\n${id}\n${state}\n${action}`;
+}
+
+// The owner line, and the whole point of the marker on it. This runs on the observer's side of a
+// two-screen check, so the line must never look like an agreement it did not get:
+//   * getEnemyOwnerId() is the server's assignment as THIS client knows it, i.e. which player is
+//     simulating the enemy (and the same answer ../client/enemies.js acts on: an enemy this client
+//     is shown, rather than running, is one it accepted a peer's state for, which only the
+//     assignment's owner can send -- enemies.js currentOwner/onEnemyState). That is the authority.
+//   * The NAME for that id can still be missing: a peer that never set a tt-username sends a null
+//     profile, the server relays it verbatim (server.js MSG.PROFILE) and cleanText() drops it, so
+//     getEnemyOwnerName() answers null for an owner whose identity is perfectly well known. Naming
+//     it by its id tag is then the honest line, and the one that matches the other screen.
+//   * Only when the client has NO assignment at all does the local rendezvous estimate stand in,
+//     and it is marked: it is a different policy (this file's own arithmetic), free to disagree
+//     with the server's split -- in a two-player room it names the local player about half the
+//     time -- so an unmarked fallback reads as "this client owns the enemy" when the client may be
+//     simulating nothing of the sort. "(est)" says the line is a guess made here; the id line
+//     below it is what to compare across screens.
+function ownerLine(enemyId) {
+	const ownerId = getEnemyOwnerId(enemyId);
+	if (ownerId === null)
+		return enemyOwnerLabel(enemyId) + " (est)";
+	return getEnemyOwnerName(enemyId) ?? peerDisplayName(Number(ownerId), ownerId);
 }
 
 // One TextGui per live enemy, positioned over its head each frame.
